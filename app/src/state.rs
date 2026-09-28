@@ -56,6 +56,11 @@ pub struct Note {
     /// 线本地 X（RPE 单位，线宽 ±675）
     pub lane_x: f32,
     pub kind: NoteKind,
+    /// 音符自身的**流速倍率**（文档字段 `speed`，默认 1.0）。
+    ///
+    /// RPE 规范：它乘在"音符离判定线的距离"上 —— 不改到达时刻（打击时刻由 `time` 定），
+    /// 只改这一路上落多远，所以演奏区要按它缩放纵向位置。
+    pub speed: f32,
     /// 假音符：无判定、不计分、不计物量（本格式的核心特性之一，编辑器要能一眼看出来）
     pub is_fake: bool,
 }
@@ -71,7 +76,7 @@ impl Note {
 }
 
 /// 五条事件轨道的枚举（顺序与 `doc::TRACKS` 一致）
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum TrackId {
     MoveX = 0,
     MoveY = 1,
@@ -124,6 +129,8 @@ impl TrackId {
 pub struct TrackView {
     /// 事件本体（拍域，直接来自 doc；求值走 `perf::eval_events`，缓动才不会被近似掉）
     pub events: Vec<Event>,
+    /// 与 `events` **一一对应**的文档出处（多层文档里靠它才删得对/改得对）
+    pub origins: Vec<crate::doc::EventRef>,
     /// 采样折线 (秒, 值)，供时间轴画曲线
     pub curve: Vec<[f32; 2]>,
     /// 折线值域（画曲线时纵向归一）
@@ -134,6 +141,10 @@ pub struct TrackView {
 impl TrackView {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+    /// 第 i 个事件在文档里的出处（越界给 `None`：视图下标可能比文档旧一帧）
+    pub fn origin(&self, i: usize) -> Option<crate::doc::EventRef> {
+        self.origins.get(i).copied()
     }
     /// 事件在拍域的覆盖范围（时间轴画事件条）
     pub fn span_sec(&self, tmap: &TimeMap) -> (f64, f64) {
@@ -287,6 +298,7 @@ pub fn notes_of(doc: &Document, index: usize, tmap: &TimeMap) -> Vec<Note> {
             time: tmap.sec(n.start.to_f64()),
             end: tmap.sec(n.end_beat().to_f64()),
             lane_x: n.lane_x,
+            speed: n.speed,
             is_fake: n.is_fake,
             kind: match n.kind {
                 DocKind::Tap => NoteKind::Tap,
@@ -307,10 +319,11 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
     };
     let mut out: [TrackView; 5] = Default::default();
     for (k, id) in TrackId::ALL.iter().enumerate() {
-        let events = crate::perf::track_events(src, id.key());
-        if events.is_empty() {
+        let indexed = crate::perf::track_events_indexed(src, id.key());
+        if indexed.is_empty() {
             continue;
         }
+        let (origins, events): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
         let curve = sample_track(&events, tmap, 4);
         let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
         for p in &curve {
@@ -319,6 +332,7 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
         }
         out[k] = TrackView {
             events,
+            origins,
             curve,
             min: if min.is_finite() { min } else { 0.0 },
             max: if max.is_finite() { max } else { 0.0 },
@@ -618,6 +632,155 @@ impl PendingEvent {
     }
 }
 
+/// 选区里装的是哪一类（框选时由**拖动起始点**落在哪个半区决定，用户定的规则）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelKind {
+    Notes,
+    Events,
+}
+
+/// **选中的事件**（视图坐标）：轨道 + 该轨道**合并视图**里的下标。
+///
+/// 合并下标只用来在视图里定位；要发命令时回文档地址（`doc::EventRef`）由
+/// [`TrackView::origin`] 换算 —— 两者不是一回事，见 `doc::EventRef`。
+pub type EventSel = (TrackId, usize);
+
+/// **选区**（视图状态：不进文档、不进撤销栈、不影响保存）。
+///
+/// 两条纪律，都是用户定的：
+/// 1. **同时只有一类**（音符 xor 事件）。框选按**起始点**落在哪个半区来定选哪一类；
+///    Ctrl+左键点到另一半区时把旧的清掉。于是 Del 不需要猜"该删哪个"。
+/// 2. `EditorState::selected_note()` / `selected_event()` 是这里的**锚**（最后碰过的那一个）：
+///    检查器、判定线树、时间轴都只认锚 —— 多选因此没有把它们连锁改成 `Vec`。
+///
+/// 锚与集合的一致性由本类型独占维护：外面只能通过 [`EditorState`] 上的方法改选区，
+/// 不存在"改了集合忘了改锚"这条路。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Selection {
+    notes: std::collections::BTreeSet<usize>,
+    events: std::collections::BTreeSet<EventSel>,
+    anchor_note: Option<usize>,
+    anchor_event: Option<EventSel>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.events.is_empty()
+    }
+    /// 选区大小（音符或事件，两者不会同时非空）
+    pub fn len(&self) -> usize {
+        self.notes.len().max(self.events.len())
+    }
+    pub fn has_note(&self, i: usize) -> bool {
+        self.notes.contains(&i)
+    }
+    pub fn has_event(&self, track: TrackId, i: usize) -> bool {
+        self.events.contains(&(track, i))
+    }
+    pub fn has_any_event(&self) -> bool {
+        !self.events.is_empty()
+    }
+    /// 选中的音符下标（升序）
+    pub fn notes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.notes.iter().copied()
+    }
+    /// 选中的事件（按轨道、再按下标）
+    pub fn events(&self) -> impl Iterator<Item = EventSel> + '_ {
+        self.events.iter().copied()
+    }
+    pub fn notes_set(&self) -> &std::collections::BTreeSet<usize> {
+        &self.notes
+    }
+    /// 锚（最后碰过的那一个音符）
+    pub fn anchor_note(&self) -> Option<usize> {
+        self.anchor_note
+    }
+    /// 锚（最后碰过的那一条事件）
+    pub fn anchor_event(&self) -> Option<EventSel> {
+        self.anchor_event
+    }
+
+    /// 用一批音符**替换**整个选区（框选音符；空集 = 清空）。锚取最小的那个。
+    ///
+    /// **不碰事件那一类的锚**：选区同时只有一类，但"检查器显示哪一条事件"是另一件事 ——
+    /// 点了音符就把事件编辑器收起来，是用户没要求的退化（老的界面两边同时显示）。
+    pub fn set_notes(&mut self, notes: impl IntoIterator<Item = usize>) {
+        self.events.clear();
+        self.notes = notes.into_iter().collect();
+        if self.anchor_note.is_none_or(|a| !self.notes.contains(&a)) {
+            self.anchor_note = self.notes.iter().next().copied();
+        }
+    }
+    /// 用一批事件**替换**整个选区（框选事件；空集 = 清空）。锚取排序最小的那个。
+    pub fn set_events(&mut self, events: impl IntoIterator<Item = EventSel>) {
+        self.notes.clear();
+        self.events = events.into_iter().collect();
+        if self.anchor_event.is_none_or(|a| !self.events.contains(&a)) {
+            self.anchor_event = self.events.iter().next().copied();
+        }
+    }
+    /// 单选一个音符（点选：清空后只剩它）
+    pub fn select_note(&mut self, i: usize) {
+        self.set_notes([i]);
+    }
+    /// 单选一条事件
+    pub fn select_event(&mut self, track: TrackId, i: usize) {
+        self.set_events([(track, i)]);
+    }
+    /// Ctrl+左键：在"选中 / 未选中"之间**切换**。
+    /// 点到另一半区时把旧的清掉（选区同时只有一类）—— 与框选同一条规则。
+    pub fn toggle_note(&mut self, i: usize) {
+        self.events.clear();
+        if !self.notes.remove(&i) {
+            self.notes.insert(i);
+            self.anchor_note = Some(i);
+        } else if self.anchor_note == Some(i) {
+            self.anchor_note = self.notes.iter().next().copied();
+        }
+    }
+    pub fn toggle_event(&mut self, track: TrackId, i: usize) {
+        self.notes.clear();
+        let key = (track, i);
+        if !self.events.remove(&key) {
+            self.events.insert(key);
+            self.anchor_event = Some(key);
+        } else if self.anchor_event == Some(key) {
+            self.anchor_event = self.events.iter().next().copied();
+        }
+    }
+    /// 清空选区（点空白处、Esc、换线、加载新谱面都走这里）
+    pub fn clear(&mut self) {
+        self.notes.clear();
+        self.events.clear();
+        self.anchor_note = None;
+        self.anchor_event = None;
+    }
+    /// 收敛到"文档里还在"的那些（删掉/换线之后视图下标会过期）。
+    ///
+    /// 判据是 [`Self::keep`] 的**存在性**（`keep(i)` = 下标 i 还有意义），不是"在不在选区里"——
+    /// 锚可以不在选区里（它是"每一类最后碰过的那一个"，供检查器显示）。
+    /// 锚真的没了才退到集合里的第一个：检查器永远显示一个**存在**的东西。
+    pub fn retain(
+        &mut self,
+        mut keep_note: impl FnMut(usize) -> bool,
+        mut keep_event: impl FnMut(EventSel) -> bool,
+    ) {
+        self.notes.retain(|i| keep_note(*i));
+        self.events.retain(|k| keep_event(*k));
+        if self.anchor_note.is_some_and(|a| !keep_note(a)) {
+            self.anchor_note = self.notes.iter().next().copied();
+        }
+        if self.anchor_event.is_some_and(|a| !keep_event(a)) {
+            self.anchor_event = self.events.iter().next().copied();
+        }
+    }
+    /// 只清掉事件那一半（换轨道时用：轨道变了，旧下标就没意义了）
+    pub fn clear_events(&mut self) {
+        self.events.clear();
+        self.anchor_event = None;
+    }
+}
+
 /// 编辑器视图状态（与文档无关的部分）
 pub struct EditorState {
     pub chart: Chart,
@@ -628,16 +791,20 @@ pub struct EditorState {
     pub selected_line: usize,
     /// 选中的事件轨道
     pub selected_track: TrackId,
-    /// 选中的事件下标（该轨道内）
-    pub selected_event: Option<usize>,
-    /// 选中的音符（该线内的时间序下标）
-    pub selected_note: Option<usize>,
+    /// **多选集合**（含锚）。读写一律走本结构的方法：集合与锚必须一起变。
+    sel: Selection,
     /// 按 R 之后正在跟随鼠标的 hold（`None` = 没有待放置的长条）。
     /// **视图状态**：Esc 取消、鼠标改长度都在这一层，不进文档。
     pub pending_hold: Option<PendingHold>,
     /// 在事件区按键之后正在跟随鼠标的事件块草稿（与 hold **互斥**：同时只放一个东西）
     pub pending_event: Option<PendingEvent>,
-    /// 演奏区垂直可视范围（秒）：以播放头为基准往后看 `lookahead` 秒
+    /// 演奏区**实例构建窗口**（秒）：以播放头为基准往后看 `lookahead` 秒的**音符**才会被送进
+    /// 渲染管线。
+    ///
+    /// 注意它**不等于"看得见的时间"**：音符落在哪由 RPE 的 floor position 决定
+    /// （`perf::speed_travel`）—— 流速 10（RPE 默认 = 1×）时音符 0.375 秒就走完半个窗口，
+    /// 所以真正看得见的那一段比这个窗口短得多。这个值是**超集**：多出来的实例由渲染侧
+    /// "整条都在窗口上方就跳过"那一道判据挡掉。
     pub lookahead: f64,
     /// 是否绘制**窗口边界框**（RPE 的 ±675 × ±450，即 1350×900）
     pub show_boundary: bool,
@@ -684,8 +851,7 @@ impl EditorState {
             speed: 1.0,
             selected_line: 0,
             selected_track: TrackId::Alpha,
-            selected_event: None,
-            selected_note: None,
+            sel: Selection::default(),
             pending_hold: None,
             pending_event: None,
             lookahead: 2.0,
@@ -730,6 +896,90 @@ impl EditorState {
     /// 于是"时间轴为什么这么短"一眼能看出是不是**音乐没装上**（那正是最常见的原因）。
     pub fn music_len(&self) -> Option<f64> {
         self.music_len
+    }
+
+    // ---------------------------------------------------------------- 选区
+    //
+    // 读写**只走这几个方法**：集合与锚必须一起变，所以字段是私有的。
+    // `selected_note` / `selected_event` 这两个名字仍然是"锚"的口径 —— 老调用点
+    // （检查器、判定线树、时间轴、渲染）都只关心"当前是哪一条"，语义没变。
+
+    /// 选区（只读）
+    pub fn selection(&self) -> &Selection {
+        &self.sel
+    }
+
+    /// 锚音符（检查器/树/时间轴高亮的那一个）
+    pub fn selected_note(&self) -> Option<usize> {
+        self.sel.anchor_note()
+    }
+
+    /// 锚事件（**当前轨道**里的下标）
+    pub fn selected_event(&self) -> Option<usize> {
+        self.sel.anchor_event().map(|(_, i)| i)
+    }
+
+    /// 锚事件的**完整坐标**（轨道 + 下标）——组拖动要按它认"手指按住的是谁"
+    pub fn selected_event_ref(&self) -> Option<EventSel> {
+        self.sel.anchor_event()
+    }
+
+    /// 某个音符是否在选区里
+    pub fn is_note_selected(&self, i: usize) -> bool {
+        self.sel.has_note(i)
+    }
+    /// 某条事件是否在选区里
+    pub fn is_event_selected(&self, track: TrackId, i: usize) -> bool {
+        self.sel.has_event(track, i)
+    }
+    /// 把选区替换成"只有这一个音符"（点选）
+    pub fn select_note(&mut self, i: usize) {
+        self.sel.select_note(i);
+    }
+    /// 把选区替换成"这一批音符"（框选）；空集即清空
+    pub fn select_notes(&mut self, notes: impl IntoIterator<Item = usize>) {
+        self.sel.set_notes(notes);
+    }
+    /// 把选区替换成"只有这一条事件"（点选）
+    pub fn select_event(&mut self, track: TrackId, i: usize) {
+        self.sel.select_event(track, i);
+    }
+    /// 把选区替换成"这一批事件"（框选）；空集即清空
+    pub fn select_events(&mut self, events: impl IntoIterator<Item = EventSel>) {
+        self.sel.set_events(events);
+    }
+    /// Ctrl+左键：切换单个音符/单条事件的选中状态
+    pub fn toggle_note_selection(&mut self, i: usize) {
+        self.sel.toggle_note(i);
+    }
+    pub fn toggle_event_selection(&mut self, track: TrackId, i: usize) {
+        self.sel.toggle_event(track, i);
+    }
+    /// 清空选区
+    pub fn clear_selection(&mut self) {
+        self.sel.clear();
+    }
+    /// 换轨道：事件那一半的旧下标就没意义了
+    pub fn clear_event_selection(&mut self) {
+        self.sel.clear_events();
+    }
+    /// 视图下标过期时收敛（删了音符/事件、换了线）
+    pub fn retain_selection(
+        &mut self,
+        keep_note: impl FnMut(usize) -> bool,
+        keep_event: impl FnMut(EventSel) -> bool,
+    ) {
+        self.sel.retain(keep_note, keep_event);
+    }
+    /// 现在选中的是音符还是事件（框选起始点半区的口径也是它）
+    pub fn selection_kind(&self) -> Option<SelKind> {
+        if self.sel.has_any_event() {
+            Some(SelKind::Events)
+        } else if !self.sel.notes_set().is_empty() {
+            Some(SelKind::Notes)
+        } else {
+            None
+        }
     }
 
     /// **时间轴总长（拍）**：`max(乐曲时长, 最后一个 note/事件) + 10 拍`（用户给定的公式）。
@@ -1261,6 +1511,75 @@ mod tests {
         st.advance(None);
         assert_eq!(st.playhead, total, "推到时间轴末端（= 音乐 + 留白）");
         assert!(!st.playing, "到末端就停");
+    }
+
+    /// **选区**：同时只有一类（框选/点选换类时旧的清掉），但**锚保留** ——
+    /// 检查器要同时显示"上次点的音符"和"上次点的事件"（老界面就是这样，没理由退化）。
+    #[test]
+    fn selection_is_single_kind_but_anchors_persist() {
+        let mut st = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        assert!(st.selection().is_empty() && st.selection_kind().is_none());
+
+        st.select_note(3);
+        assert_eq!(st.selection_kind(), Some(SelKind::Notes));
+        assert_eq!(st.selected_note(), Some(3));
+        assert_eq!(st.selection().len(), 1);
+
+        // 加一个事件：音符那一半被清掉，锚留着（检查器两边都还能显示）
+        st.select_event(TrackId::MoveX, 2);
+        assert_eq!(st.selection_kind(), Some(SelKind::Events));
+        assert_eq!(st.selected_event(), Some(2));
+        assert!(!st.is_note_selected(3), "选区只有一类：事件替换了音符");
+        assert_eq!(st.selected_note(), Some(3), "但锚还在");
+
+        // Ctrl 切换：加进第二条事件 → 两条；再切一次 → 只剩一条
+        st.toggle_event_selection(TrackId::MoveX, 5);
+        assert_eq!(st.selection().len(), 2);
+        assert_eq!(st.selected_event(), Some(5), "锚 = 最后碰过的那一个");
+        st.toggle_event_selection(TrackId::MoveX, 5);
+        assert_eq!(st.selection().len(), 1);
+        assert_eq!(st.selected_event(), Some(2), "锚被切掉后落到集合里还在的那个");
+
+        // 框选替换：整批换掉，锚取最小的
+        st.select_events([(TrackId::Alpha, 1), (TrackId::Alpha, 7)]);
+        assert_eq!(st.selection().len(), 2);
+        assert_eq!(st.selected_event(), Some(1));
+
+        // 换类：事件那一半清空，音符锚仍在
+        st.select_note(4);
+        assert!(st.selection().events().next().is_none());
+        assert_eq!(st.selection().len(), 1);
+        assert_eq!(st.selected_note(), Some(4));
+
+        // 清空：锚也一起清（"点空白"就是要什么都没选）
+        st.clear_selection();
+        assert!(st.selection().is_empty());
+        assert_eq!(st.selected_note(), None);
+        assert_eq!(st.selected_event(), None);
+    }
+
+    /// 视图下标过期时的收敛：**整批**剔掉，不是只清锚（否则 Del 会删错东西）
+    #[test]
+    fn a_stale_selection_is_pruned_as_a_whole() {
+        let mut st = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        // 音符那一半：文档只剩 3 个音符（视图下标 0..=2）
+        st.select_notes([1, 2, 9]);
+        st.retain_selection(|i| i < 3, |(t, i)| t == TrackId::Alpha && i < 2);
+        assert_eq!(st.selection().notes().collect::<Vec<_>>(), vec![1, 2], "越界的 9 被剔掉");
+        assert_eq!(st.selected_note(), Some(1), "锚不在集合里了就退到最小的那个");
+        // 事件那一半：只剩 2 条事件（0..=1）
+        st.select_events([(TrackId::Alpha, 1), (TrackId::Alpha, 7)]);
+        st.retain_selection(|i| i < 3, |(t, i)| t == TrackId::Alpha && i < 2);
+        assert_eq!(
+            st.selection().events().collect::<Vec<_>>(),
+            vec![(TrackId::Alpha, 1)],
+            "越界的 7 被剔掉"
+        );
+        // 锚越界（它不在集合里也算）：整批剔完之后锚没了就落到集合里第一个
+        st.select_event(TrackId::Alpha, 7);
+        assert_eq!(st.selected_event(), Some(7));
+        st.retain_selection(|i| i < 3, |(t, i)| t == TrackId::Alpha && i < 2);
+        assert_eq!(st.selected_event(), None, "锚越界 ⇒ 集合空 ⇒ 锚也没了");
     }
 
     #[test]

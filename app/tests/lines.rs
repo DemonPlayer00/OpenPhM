@@ -43,9 +43,16 @@ fn two_line_doc(rotate_to: f64) -> Document {
                 "linear",
             ));
         }
-        // 每条线两个音符：lane_x 分别为 -300 / +300
+        // 每条线两个音符：lane_x 分别为 -300 / +300。
+        //
+        // **拍位是按 RPE 的下落速度定的**（流速 10 = 1× = 1200 单位/秒，见
+        // `perf::SPEED_UNITS_PER_SEC`）：BPM 180 ⇒ 一拍 1/3 秒。
+        // · 0.5 拍 = 0.167 s ⇒ 离判定线 200 单位 —— 在 ±450 的窗口里，**会被画出来**；
+        // · 3 拍 = 1.0 s ⇒ 离判定线 1200 单位 —— 远在窗口外，实例会被裁掉。
+        // 于是"窗口里只有每线一个音符"这条前提在新公式下依然成立（下面几条断言都吃它）。
         for (k, lane) in [-300.0_f32, 300.0].iter().enumerate() {
-            let mut n = DocNote::new(DocKind::Tap, Beat::new(4 * (k as i64 + 1), 1), *lane);
+            let start = if k == 0 { Beat::new(1, 2) } else { Beat::new(3, 1) };
+            let mut n = DocNote::new(DocKind::Tap, start, *lane);
             n.end = None;
             l.notes.push(n);
         }
@@ -88,10 +95,11 @@ fn notes_follow_line_rotation_and_translation() {
 
     let mut inst = Vec::new();
     build_instances(&st, &mut inst);
-    // 前瞻 2.0s 只覆盖每线的第 1 个音符（1.333s；第 2 个在 2.667s）⇒ 2 本体 + 2 音符 = 4
+    // 每线只有第 1 个音符落在可见窗口里（第 2 个远在窗口上方，见 `two_line_doc`）
+    // ⇒ 2 条线本体 + 2 个可见子音符 = 4
     assert_eq!(inst.len(), 4, "实例数 = 2 条线本体 + 2 个可见子音符");
 
-    // L1 的音符在可见窗口内（time = 4/4 拍 = 0.333s, 8/4 拍 = 0.667s，前瞻 2s 覆盖）
+    // L1 的音符在可见窗口内（0.5 拍 = 0.167s ⇒ 离判定线 200 单位）
     let rotated: Vec<_> = inst
         .iter()
         .filter(|i| (i.angle().to_degrees() - 90.0).abs() < 1e-3)
@@ -169,6 +177,92 @@ fn alpha_zero_line_is_not_emitted() {
     // 只剩 L0 的 2 个实例（本体 + 1 个可见子音符）
     assert_eq!(inst.len(), 2, "alpha=0 的线与它的子音符都不该上报实例");
 }
+/// **下落速度必须与 RPE 一致**（用户要求"保持和RPE一致流速"）。
+///
+/// RPE 规范：1 单位流速 = 120 RPE y 单位/秒，判定线默认流速 10 ⇒ 1× = 1200 单位/秒，
+/// 也就是 0.75 秒划过整个 900 高的窗口。这条直接量**画出来的实例**在哪 ——
+/// 公式对不对不该只活在注释里。
+#[test]
+fn notes_fall_at_the_rpe_speed() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0, // 一拍 0.5 秒，手算方便
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    // 流速恒为 10（RPE 新建判定线的默认值 = 1×）
+    l.layers[0].track_mut("speed").unwrap().push(Event::new(
+        Beat::zero(),
+        Beat::new(64, 1),
+        json!(10.0),
+        json!(10.0),
+        "linear",
+    ));
+    // 0.2 / 0.6 / 1.0 拍 ⇒ 0.1 / 0.3 / 0.5 秒后打击（120 BPM：一拍 0.5 秒）
+    for b in [(1, 5), (3, 5), (1, 1)] {
+        l.notes.push(DocNote::new(DocKind::Tap, Beat::new(b.0, b.1), 0.0));
+    }
+    doc.judge_lines.push(l);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    // 只上报"还在窗口里"的：0.1 s → 120 单位 ✓；0.3 s → 360 ✓；0.5 s → 600 ⇒ 已出窗口
+    assert_eq!(inst.len(), 1 + 2, "1 条线本体 + 2 个可见音符（第 3 个已飞出窗口）");
+    let mut ys: Vec<f32> = inst[1..].iter().map(|i| i.center()[1]).collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!((ys[0] - 120.0).abs() < 1e-3, "0.1 秒后打击的音符应在 120 单位处，实际 {}", ys[0]);
+    assert!((ys[1] - 360.0).abs() < 1e-3, "0.3 秒 ⇒ 360 单位，实际 {}", ys[1]);
+    // 逐条对上：0.1 s × 10（流速）× 120 = 120 单位/秒
+    for (k, dt) in [0.1_f64, 0.3].iter().enumerate() {
+        let want = (dt * 10.0 * opm_app::perf::SPEED_UNITS_PER_SEC) as f32;
+        assert!((ys[k] - want).abs() < 1e-3, "dt={dt}: {want} vs {}", ys[k]);
+    }
+    // 把流速改成 20 ⇒ 同样的时刻跑两倍远：0.1 s 应在 240，0.3 s 已出窗口
+    let l = &mut doc.judge_lines[0];
+    let sp = l.layers[0].track_mut("speed").unwrap();
+    sp[0].start_value = json!(20.0);
+    sp[0].end_value = json!(20.0);
+    let mut st2 = EditorState::new(chart_from_doc(&doc));
+    st2.selected_line = usize::MAX;
+    let mut inst2 = Vec::new();
+    build_instances(&st2, &mut inst2);
+    assert_eq!(inst2.len(), 2, "流速翻倍 ⇒ 只剩最近那个还在窗口里");
+    assert!((inst2[1].center()[1] - 240.0).abs() < 1e-3, "{}", inst2[1].center()[1]);
+}
+
+/// 音符自带的 `speed` 乘在**离判定线的距离**上（RPE 规范：不改到达时刻，只改落多远）
+#[test]
+fn a_note_speed_multiplies_its_distance() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    l.layers[0].track_mut("speed").unwrap().push(Event::new(
+        Beat::zero(),
+        Beat::new(64, 1),
+        json!(10.0),
+        json!(10.0),
+        "linear",
+    ));
+    let mut n = DocNote::new(DocKind::Tap, Beat::new(1, 2), 0.0); // 0.5 拍 = 0.25 s
+    n.speed = 3.0;
+    l.notes.push(n);
+    doc.judge_lines.push(l);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    // 0.25 s × 1200 单位/秒 × 3 = 900 —— 已经出窗口了（这正是"乘距离"的直接后果）
+    assert_eq!(inst.len(), 1, "speed=3 的音符 0.25 秒就跑出窗口了");
+}
+
 #[test]
 fn track_and_curve_are_cached_per_line() {
     let doc = two_line_doc(45.0);

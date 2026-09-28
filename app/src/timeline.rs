@@ -290,7 +290,7 @@ pub fn draw(
         for (i, n) in line.notes.iter().enumerate() {
             let y = rect.min.y + rect.height() * 0.74;
             let (x0, x1) = (geom.x_of(n.time), geom.x_of(n.end.max(n.time)));
-            let col = if Some(i) == st.selected_note {
+            let col = if st.is_note_selected(i) {
                 egui::Color32::WHITE
             } else {
                 let c = n.kind.color();

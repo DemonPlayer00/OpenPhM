@@ -81,6 +81,20 @@ opm-ctl --attach auto --cmd '{"op":"undo"}'      # 一步回到拖拽前
 事务内每条改动**都会广播**（订阅者实时更新），撤销只占**一步**；`abort` 会回滚文档。
 拍建议写成有理数 `[n,d]`（`1/4` 网格就是 `[k,4]`），避免浮点误差写进文档。
 
+**GUI 的多选编辑就是这套事务的另一个调用方**（逻辑在库内 `opm_app::edit`，可单测、可复用）：
+
+| 库内函数 | 干什么 |
+|---|---|
+| `edit::GrabIntent` + `edit::grab_selection` | 按下那一刻**冻结**选区里每一条的原点（成员、原点、手指位置）。拖拽期间文档每帧都在变，从文档反推"原来在哪"会让位移逐帧累积 |
+| `edit::grab_delta` | 一次拖动的位移：锚先吸附到网格，再夹住（负拍 / 可见窗口；事件还要过"最近合法位置"） |
+| `edit::move_grab_commands` | 位移 → 命令序列（音符 `set_note`、事件 `set_event`，都用冻结原点算**绝对**位置） |
+| `edit::nearest_free_delta` | 事件整块平移的**最近合法位置**（kdenlive 式）：请求的位移若与未选中的邻居重叠，就退到补集里离请求最近的点 —— 拖得够远就越过障碍落到空档里；铺满的轨道上就是原地 |
+| `edit::event_items_overlap` / `edit::event_drag_disabled` | **卷进重叠的事件禁止移动**的判据（两两比较，相接不算重叠） |
+| `edit::delete_selection_commands` | **Del** 的一整批：`begin` + 删除 + `commit`（一个撤销步）。**同一张表内按下标降序发** —— 顺序错了会删错东西 |
+
+想从脚本/agent 复现"多选 + 整组平移"，等价写法是 `{"op":"select","notes":[…]}` 之后
+逐帧发 `set_note`（本编辑器 GUI 走的就是这个）。
+
 ### 播放控制（视图命令，不进 EditCore）
 
 播放头/播放状态是**视图状态**，不属于文档、也不该进撤销栈 —— 所以它们不走 EditCore，而是走独立队列：
@@ -107,6 +121,7 @@ opm-ctl --attach auto --cmd '{"op":"view"}' --json | tail -1     # 观察效果
 | `{"op":"audio_offset","ms":F}` | 手动校准偏移（听到的与游标算出来的差多少） |
 | `{"op":"view"}` 里的 `conflicts` | 当前**事件重叠**处数（加载时全量检测、之后每次改动增量检测） |
 | `{"op":"select","line":L,"track":"alpha","note":N,"event":M}` | **选中**（视图状态）：把界面指到某个对象，便于截图/检查 |
+| `{"op":"select","notes":[0,2,5]}` / `{"op":"select","events":[["alpha",0],["moveX",3]]}` | **多选**（视图状态，整批替换选区）：音符用**视图下标**（该线内按时间序），事件用 `[轨道名, 该轨道合并视图里的下标]`。认不出的轨道名会被丢掉（不整条命令失败）。**选区同时只有一类**（音符 xor 事件），两个都给时以 `notes` 为准 |
 | `{"op":"view"}` 里的 `window_offset_x` | 当前音符区窗口 X 偏移（0 = 显示官方窗口 ±675） |
 | `{"op":"view"}` | `ui_stats` 的别名：读 `playing` / `playhead_sec` / `playhead_beat` / `audio_*` / `overlay_*` |
 
@@ -228,8 +243,13 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"set_event","line":0,"track":"alpha","index":0,"set":{"endValue":0.5}}` | |
 | `{"op":"del_event","line":0,"track":"speed","index":0}` | |
 | `{"op":"split_event","line":0,"track":"moveX","index":0,"atBeat":[2,1]}` | 在中点按线性插值切分（有缓动时先近似，随后用 `set_event` 修正） |
-| `{"op":"set_track_constant","line":0,"track":"speed","value":10}` | **一步满足轨道不变量**：清空该轨并铺一条覆盖全谱的恒定事件 |
+| `{"op":"set_track_constant","line":0,"track":"speed","value":10}` | **一步满足轨道不变量**：清空该轨并铺一条覆盖全谱的恒定事件。**流速的默认/基准值是 10**（RPE 口径：1 单位流速 = 120 RPE y 单位/秒 ⇒ 10 = 1× = 1200 单位/秒 = 0.75 秒划过 900 高的窗口）；**整条轨道没有流速事件时预览也按 10 走** |
 | `{"op":"normalize"}` | 排序 / 补空隙 / 裁重叠 / 首事件回退到 ≤0 / 末事件延到谱末之后 |
+
+⚠️ **事件索引是"图层内下标"，而 GUI 的编辑区用的是"合并视图下标"** —— 两者只有在单图层时相同。
+视图把一条线的五个图层合并成一条时间线并按起拍排序（求值要的就是这个），所以多层文档里
+`del_event`/`set_event` 的 `layer` 必须写对：视图侧靠 `doc::EventRef`（第几层 + 该层下标）回去。
+写脚本时建议显式带 `layer`。
 
 ### 元信息与只读
 
@@ -318,6 +338,10 @@ opm-ctl --file chart.opm.json render --at 4.0 --no-boundary --out plain.png     
   ⚠️ **不要用整数**：官方格式与 RPE 的整数映射**互不相同**（`spec/note-types.json`），传整数必然踩坑。`doc::NoteKind` 内部保留了 `to_official()` / `to_rpe()` 两套映射，只在 codec 边界使用。
 - **索引语义**：`line` 是 `judgeLines` 数组下标；`index` 是该线 `notes`（或该轨 `events`）数组下标。
   **`del_*` 之后后续元素下标会前移** —— 批量删除建议按 index **从大到小**执行，或每步 `dump` 重新定位。
+  GUI 的 Del 就是这么做的（`edit::delete_selection_commands`，有单测钉住降序）。
+- **流速（`speed` 轨道）的值域**：默认/基准 **10** = 1×（RPE 口径：1 单位 = 120 RPE y 单位/秒，
+  于是 10 = 1200 单位/秒 = 0.75 秒划过 900 高的窗口）。音符自身的 `speed` 字段是**另一个东西**，
+  默认 **1.0**，乘在"离判定线的距离"上（不改到达时刻）。详见 README「下落速度（流速）：与 RPE 一致」。
 
 ---
 

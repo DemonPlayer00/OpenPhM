@@ -13,42 +13,41 @@
 
 use serde_json::{json, Value};
 
-use crate::doc::NoteKind;
+use crate::doc::{EventRef, NoteKind};
 use crate::perf;
-use crate::state::{EditorState, TrackId};
+use crate::state::{EditorState, EventSel, SelKind, TrackId};
 
-/// 拖动中的音符 → `set_note`。
+/// 拖动中的音符 → `set_note`（**按冻结的原点算绝对位置**）。
 ///
-/// `index` 是**视图内**的第几个音符（时间序），`doc_index` 才是文档里的下标 ——
-/// 命令要的是后者。Hold 跟着一起挪：**保持时长不变**（起点的吸附结果决定终点）。
-pub fn note_drag_command(
+/// 组拖动与单拖共用同一条：`start_beat` 是"按下那一刻的位置 + 位移"，
+/// `hold_beats` 是按下那一刻的时长（拍）——**都不从当前文档反推**：
+/// 拖拽期间文档每帧都在变，每帧反推一次会让偏移逐帧累积（越拖越偏）。
+pub fn note_move_command(
     st: &EditorState,
-    index: usize,
     doc_index: usize,
     lane_x: f32,
-    beat: f64,
+    start_beat: f64,
+    hold_beats: Option<f64>,
 ) -> Value {
-    let line_doc = st.selected_doc_line();
-    let mut set = json!({ "laneX": lane_x, "startBeat": st.beat_json(beat) });
-    if let Some(n) = st.selected().and_then(|l| l.notes.get(index)) {
-        let dur = n.end - n.time;
-        if dur > 1e-6 {
-            // 终点的拍 = 起点拍 + 原时长（按当前时间映射换算），于是时长在拖动中不变
-            let end_beat =
-                beat + st.chart.tmap.beat(n.end) - st.chart.tmap.beat(n.time);
-            set["endBeat"] = json!(st.beat_json(end_beat));
-        }
+    let mut set = json!({ "laneX": lane_x, "startBeat": st.beat_json(start_beat) });
+    if let Some(d) = hold_beats {
+        // 终点的拍 = 起点 + 原时长（吸附结果决定起点）⇒ 时长在拖动中不变
+        set["endBeat"] = json!(st.beat_json(start_beat + d.max(1e-3)));
     }
-    json!({ "op": "set_note", "line": line_doc, "index": doc_index, "set": set })
+    json!({ "op": "set_note", "line": st.selected_doc_line(), "index": doc_index, "set": set })
 }
 
 /// 拖事件块的头/尾 → `resize_event`。
 ///
 /// 语义是"**只改这一个事件**"（早先会同步邻块，用户明确否掉了）；由此产生的空隙/重叠由
 /// 重叠检测报出来（那份检测现在归 `EditCore`）。
+///
+/// `at` 是**文档地址**（图层 + 该图层里的下标）：视图把五个图层合并成一条时间线，
+/// 合并下标直接当图层下标用会改到另一条事件（详见 `doc::EventRef`）。
 pub fn event_resize_command(
     st: &EditorState,
-    index: usize,
+    track: TrackId,
+    at: EventRef,
     edge: crate::state::EventEdge,
     beat: f64,
 ) -> Value {
@@ -59,12 +58,439 @@ pub fn event_resize_command(
     json!({
         "op": "resize_event",
         "line": st.selected_doc_line(),
-        "layer": 0,
-        "track": st.selected_track.key(),
-        "index": index,
+        "layer": at.layer,
+        "track": track.key(),
+        "index": at.index,
         "edge": edge,
         "toBeat": st.beat_json(beat),
     })
+}
+
+/// 组拖动中的一条事件 → `set_event`：整块挪到 `[start, end]`（时长不变）。
+pub fn event_move_command(
+    st: &EditorState,
+    track: TrackId,
+    at: EventRef,
+    start: f64,
+    end: f64,
+) -> Value {
+    json!({
+        "op": "set_event",
+        "line": st.selected_doc_line(),
+        "layer": at.layer,
+        "track": track.key(),
+        "index": at.index,
+        "set": {
+            "startBeat": st.beat_json(start),
+            "endBeat": st.beat_json(end.max(start + 1e-3)),
+        },
+    })
+}
+
+// ---------------------------------------------------------------- 组拖动
+
+/// 一个被拖的音符的**冻结原点**
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteGrab {
+    /// 视图下标（认锚要用它；也是"这一条还在不在选区里"的凭据）
+    pub view_index: usize,
+    pub doc_index: usize,
+    pub lane_x: f32,
+    pub start_beat: f64,
+    /// hold 的时长（拍）；非 hold 为 `None`（跟着走的就是"起点 + 时长"）
+    pub hold_beats: Option<f64>,
+}
+
+/// 一条被拖的事件的**冻结原点**
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventGrab {
+    pub track: TrackId,
+    pub at: EventRef,
+    /// 视图下标 —— 拖拽期间用它把"未选中的邻居"认出来（钉子/障碍就是那些）
+    pub view_index: usize,
+    pub start_beat: f64,
+    pub end_beat: f64,
+}
+
+/// **抓手的冻结原点**：按下左键那一刻，把选区里每一条的位置记下来。
+///
+/// 为什么必须冻结：拖拽期间每帧都发命令、文档每帧都在变。若每帧从当前文档重算
+/// "它原来在哪"，位移就会累积 —— 表现为"拖一下就跑得比鼠标快"。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grab {
+    pub kind: SelKind,
+    /// 手指按住的是哪一个（吸附只按它算，其余的保持相对偏移）
+    pub anchor_lane: f32,
+    pub anchor_beat: f64,
+    /// 按下时指针的位置（laneX / 拍）——位移 = 当前指针 − 它
+    pub press_lane: f32,
+    pub press_beat: f64,
+    pub notes: Vec<NoteGrab>,
+    pub events: Vec<EventGrab>,
+}
+
+impl Grab {
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.events.is_empty()
+    }
+    /// 选区里最靠前的起点（负拍保护要用它）
+    pub fn min_start_beat(&self) -> f64 {
+        self.notes
+            .iter()
+            .map(|n| n.start_beat)
+            .chain(self.events.iter().map(|e| e.start_beat))
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// 组拖动开始时的**意图**：拖谁、手指按在哪。
+///
+/// 为什么不让 `grab_selection` 自己去读选区：面板这一帧看到的状态是**上一帧**的，
+/// 而"手指按在一个没选中的东西上"这件事必须先把它变成选区再拖（否则会把别的一起带走）——
+/// 所以"拖谁"由调用方明确给出来，不在库里猜。
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrabIntent {
+    /// 要拖的音符（视图下标）；与 `events` 互斥（选区同时只有一类）
+    pub notes: Vec<usize>,
+    pub events: Vec<EventSel>,
+    /// 手指按住的那一个：吸附只按它算，其余的保持相对偏移
+    pub anchor_note: Option<usize>,
+    pub anchor_event: Option<EventSel>,
+    /// 按下时指针的位置（laneX / 拍）
+    pub press_lane: f32,
+    pub press_beat: f64,
+}
+
+impl GrabIntent {
+    /// 拖**整个选区**（手指按在选区里的某一条上）
+    pub fn selection(st: &EditorState, press_lane: f32, press_beat: f64) -> Self {
+        Self {
+            notes: st.selection().notes().collect(),
+            events: st.selection().events().collect(),
+            anchor_note: st.selected_note(),
+            anchor_event: st.selected_event_ref(),
+            press_lane,
+            press_beat,
+        }
+    }
+    /// 只拖**一个音符**（手指按在选区之外的东西上：先把选区换成它）
+    pub fn one_note(i: usize, press_lane: f32, press_beat: f64) -> Self {
+        Self {
+            notes: vec![i],
+            events: Vec::new(),
+            anchor_note: Some(i),
+            anchor_event: None,
+            press_lane,
+            press_beat,
+        }
+    }
+    /// 只拖**一条事件**
+    pub fn one_event(track: TrackId, i: usize, press_lane: f32, press_beat: f64) -> Self {
+        Self {
+            notes: Vec::new(),
+            events: vec![(track, i)],
+            anchor_note: None,
+            anchor_event: Some((track, i)),
+            press_lane,
+            press_beat,
+        }
+    }
+}
+
+/// 按下左键：把**意图里的那些**冻结成抓手。
+///
+/// 为什么必须冻结：拖拽期间每帧都发命令、文档每帧都在变。若每帧从当前文档重算
+/// "它原来在哪"，位移就会累积 —— 表现为"拖一下就跑得比鼠标还快"。
+pub fn grab_selection(st: &EditorState, intent: &GrabIntent) -> Option<Grab> {
+    let line = st.selected()?;
+    let mut notes = Vec::new();
+    for i in &intent.notes {
+        let Some(n) = line.notes.get(*i) else { continue };
+        let start_beat = st.chart.tmap.beat(n.time);
+        let hold_beats = (n.end - n.time).abs();
+        notes.push(NoteGrab {
+            view_index: *i,
+            doc_index: n.doc_index,
+            lane_x: n.lane_x,
+            start_beat,
+            hold_beats: (hold_beats > 1e-6)
+                .then(|| st.chart.tmap.beat(n.end) - st.chart.tmap.beat(n.time)),
+        });
+    }
+    let mut events = Vec::new();
+    for (track, i) in &intent.events {
+        let tv = line.track(*track);
+        let (Some(e), Some(at)) = (tv.events.get(*i), tv.origin(*i)) else {
+            continue;
+        };
+        events.push(EventGrab {
+            track: *track,
+            at,
+            view_index: *i,
+            start_beat: e.start.to_f64(),
+            end_beat: e.end.to_f64(),
+        });
+    }
+    let kind = match (notes.is_empty(), events.is_empty()) {
+        (false, true) => SelKind::Notes,
+        (true, false) => SelKind::Events,
+        _ => return None, // 空抓手，或"两类都有"（选区同时只有一类，不该发生）
+    };
+    let anchor_note = intent
+        .anchor_note
+        .and_then(|a| notes.iter().find(|n| n.view_index == a));
+    let anchor_event = intent
+        .anchor_event
+        .and_then(|a| events.iter().find(|e| (e.track, e.view_index) == a));
+    let (anchor_lane, anchor_beat) = match kind {
+        SelKind::Notes => anchor_note
+            .or(notes.first())
+            .map(|n| (n.lane_x, n.start_beat))
+            .unwrap_or((intent.press_lane, intent.press_beat)),
+        // 事件没有横向自由度：横向那一半只是占位（`grab_delta` 不会用它）
+        SelKind::Events => anchor_event
+            .or(events.first())
+            .map(|e| (intent.press_lane, e.start_beat))
+            .unwrap_or((intent.press_lane, intent.press_beat)),
+    };
+    Some(Grab {
+        kind,
+        anchor_lane,
+        anchor_beat,
+        press_lane: intent.press_lane,
+        press_beat: intent.press_beat,
+        notes,
+        events,
+    })
+}
+
+/// **最近合法位置**：请求的平移量 `want` 若会让选中块与未选中的邻居重叠，
+/// 就退到"离请求最近的那个合法位置"。
+///
+/// 规则由用户定（仿 kdenlive 时间轴拖动）：**不硬夹在邻居边界上** ——
+/// 轨道上只要还有一块够大的空隙，把指针拖得足够远就**跨过障碍落到那块空隙里**；
+/// 轨道整条铺满时唯一的合法位置就是原地（Δ=0），这也是"夹住"的字面结果。
+///
+/// 相接（块尾 == 邻居头）算合法：不产生重叠就不算侵犯。
+///
+/// `selected` / `blocked` 都是 `(起拍, 止拍)`；`floor` 是最小允许位移（照惯例是
+/// `-min_start`，即不许挪到负拍）。
+pub fn nearest_free_delta(
+    selected: &[(f64, f64)],
+    blocked: &[(f64, f64)],
+    want: f64,
+    floor: f64,
+) -> f64 {
+    if selected.is_empty() {
+        return want.max(floor);
+    }
+    // ① "会重叠"的位移区间：选中块 s 与障碍 u 重叠 ⇔ s.end+Δ > u.start 且 s.start+Δ < u.end
+    let mut bad: Vec<(f64, f64)> = vec![(f64::NEG_INFINITY, floor)];
+    for &(s, e) in selected {
+        for &(bs, be) in blocked {
+            bad.push((bs - e, be - s));
+        }
+    }
+    // ② 合并**只并真正重叠的**（`a < last.1`，不是 `<=`）：
+    //    禁区都是**开区间**（相接不算重叠），所以 "(…,4)" 与 "(4,…)" 之间的那一个点 4
+    //    是合法的 —— 把它并掉就等于"贴着邻居也不许停"，用户要的"贴住"就没了。
+    bad.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(bad.len());
+    for (a, b) in bad {
+        match merged.last_mut() {
+            Some(last) if a < last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    // ③ 合法区间 = 补集；每个区间里取离 want 最近的点（就是夹进区间）
+    let mut best: Option<(f64, f64)> = None; // (候选值, 与 want 的距离)
+    let mut cursor = floor;
+    let consider = |lo: f64, hi: f64, best: &mut Option<(f64, f64)>| {
+        if hi < lo {
+            return;
+        }
+        let v = want.clamp(lo, hi);
+        let d = (v - want).abs();
+        if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+            *best = Some((v, d));
+        }
+    };
+    for &(a, b) in &merged {
+        // `>=`：禁区是开区间，(cursor, a) 与 [cursor, a] 都合法 ——
+        // 退化成一个点（cursor == a）时正是"贴住邻居"那一个位置，不能漏
+        if a >= cursor {
+            consider(cursor, a, &mut best);
+        }
+        cursor = cursor.max(b);
+    }
+    consider(cursor, f64::INFINITY, &mut best);
+    best.map(|(v, _)| v).unwrap_or(want)
+}
+
+/// 组拖动的一步：给定抓手与"请求的位移"，算出**吸附 + 夹子之后**真正该用的位移。
+///
+/// 三件事，顺序不能换：
+/// 1. 抓手（锚）先按网格吸附 —— 于是写回文档的拍仍是格点上的有理数；
+/// 2. 不许挪到负拍（整组一起夹，保持相对间隔）；
+/// 3. 事件再过 [`nearest_free_delta`]（音符之间没有"占位"这回事，不必过）。
+pub fn grab_delta(st: &EditorState, grab: &Grab, cur_lane: f32, cur_beat: f64) -> (f32, f64) {
+    let want_lane = grab.anchor_lane + (cur_lane - grab.press_lane);
+    let want_beat = grab.anchor_beat + (cur_beat - grab.press_beat);
+    let mut d_lane = st.snap_lane(want_lane) - grab.anchor_lane;
+    let mut d_beat = st.snap_beat(want_beat) - grab.anchor_beat;
+    // 负拍：整组一起夹（逐条夹会把相对间隔压扁）
+    let floor = -grab.min_start_beat();
+    d_beat = d_beat.max(floor);
+    if grab.kind == SelKind::Events {
+        // 障碍 = 同一条轨道上**没被选中**的那些事件
+        let mut blocked: Vec<(f64, f64)> = Vec::new();
+        if let Some(l) = st.selected() {
+            let mut tracks: Vec<TrackId> = grab.events.iter().map(|g| g.track).collect();
+            tracks.sort_by_key(|t| *t as usize);
+            tracks.dedup();
+            for t in tracks {
+                for (i, e) in l.track(t).events.iter().enumerate() {
+                    if grab.events.iter().any(|g| g.track == t && g.view_index == i) {
+                        continue;
+                    }
+                    blocked.push((e.start.to_f64(), e.end.to_f64()));
+                }
+            }
+        }
+        let selected: Vec<(f64, f64)> = grab
+            .events
+            .iter()
+            .map(|e| (e.start_beat, e.end_beat))
+            .collect();
+        d_beat = nearest_free_delta(&selected, &blocked, d_beat, floor);
+    }
+    if grab.kind == SelKind::Notes {
+        // 音符横向没有"占位"冲突，但整组也要留在**看得见的窗口**里：
+        // 逐条夹会把相对间隔压扁，所以按整组的极值夹**位移**。
+        let lo = grab.notes.iter().map(|n| n.lane_x).fold(f32::INFINITY, f32::min);
+        let hi = grab.notes.iter().map(|n| n.lane_x).fold(f32::NEG_INFINITY, f32::max);
+        let (win_lo, win_hi) = st.window_lane_range();
+        // 选区比窗口还宽时（窗口外编辑、或偏移改变）没有可移动的余地 —— 区间会反过来，
+        // 直接 clamp 会 panic（本项目在 clamp 上踩过），所以先判区间是否成立。
+        if lo.is_finite() && hi.is_finite() && win_lo - lo <= win_hi - hi {
+            d_lane = d_lane.clamp(win_lo - lo, win_hi - hi);
+        }
+    }
+    (d_lane, d_beat)
+}
+
+/// 组拖动的一步：按冻结原点 + 位移算出**命令序列**（每条一个 `set_note` / `set_event`）。
+pub fn move_grab_commands(st: &EditorState, grab: &Grab, d_lane: f32, d_beat: f64) -> Vec<Value> {
+    let mut out = Vec::with_capacity(grab.notes.len() + grab.events.len());
+    for n in &grab.notes {
+        out.push(note_move_command(
+            st,
+            n.doc_index,
+            n.lane_x + d_lane,
+            n.start_beat + d_beat,
+            n.hold_beats,
+        ));
+    }
+    for e in &grab.events {
+        out.push(event_move_command(
+            st,
+            e.track,
+            e.at,
+            e.start_beat + d_beat,
+            e.end_beat + d_beat,
+        ));
+    }
+    out
+}
+
+/// 这些事件里有没有**卷入重叠**的？
+///
+/// 判据是**两两比较**，不是"排序后看相邻的一对"：[0,10) / [1,2) / [3,4) 按起点排下来，
+/// 相邻的是 (0,1) 与 (1,2) —— 第三块和第二块不重叠、和**第一块**才重叠，只查相邻会漏。
+/// **相接不算重叠**（一块的尾巴正好是另一块的头，是规范允许的"紧接"）。
+pub fn event_items_overlap(st: &EditorState, items: &[EventSel]) -> bool {
+    let Some(line) = st.selected() else {
+        return false;
+    };
+    for (track, i) in items {
+        let tv = line.track(*track);
+        let Some(a) = tv.events.get(*i) else { continue };
+        let (a0, a1) = (a.start.to_f64(), a.end.to_f64());
+        for (j, b) in tv.events.iter().enumerate() {
+            if j == *i {
+                continue;
+            }
+            let (b0, b1) = (b.start.to_f64(), b.end.to_f64());
+            if a0 < b1 && b0 < a1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 当前**选区**里的事件有没有卷入重叠（拖动被禁用的判据）
+pub fn selection_has_event_overlap(st: &EditorState) -> bool {
+    let items: Vec<EventSel> = st.selection().events().collect();
+    event_items_overlap(st, &items)
+}
+
+/// **选中了卷入重叠的事件 ⇒ 禁止移动**（用户要求）。
+///
+/// 为什么直接拒绝而不是"尽力挪到最近合法位置"：重叠意味着这条轨道已经不是"一块接一块"的
+/// 结构，那套推理（在"会重叠的位移"的补集里取最近点）整个失去意义 —— 想挪开 A 与 B 的重叠，
+/// 正确做法是拖它们的**头/尾把手**改时间（那条路仍然可用），或者到冲突浏览器里点过去处理。
+/// 猜一个位置只会把"已经坏了"的状态变得更难解释。
+pub fn event_drag_disabled(st: &EditorState, items: &[EventSel]) -> bool {
+    !items.is_empty() && event_items_overlap(st, items)
+}
+
+// ---------------------------------------------------------------- 删除
+
+/// Del：把当前选区删干净 —— **一个撤销步**（begin + 删除 + commit）。
+///
+/// 顺序是正确性的一部分：`del_note` / `del_event` 都是 `remove(index)`，
+/// 删掉第 3 条之后原来的第 4 条就变成第 3 条 ⇒ **同一张表里必须按下标降序发**。
+/// 音符一张表（该线的 `notes`）；事件按 `(图层, 轨道)` 分表，各表内部降序。
+///
+/// 空选区返回空（调用方据此不发命令）。
+pub fn delete_selection_commands(st: &EditorState) -> Vec<Value> {
+    let Some(line) = st.selected() else {
+        return Vec::new();
+    };
+    let mut doc_notes: Vec<usize> = st
+        .selection()
+        .notes()
+        .filter_map(|i| line.notes.get(i).map(|n| n.doc_index))
+        .collect();
+    let mut events: Vec<(TrackId, EventRef)> = st
+        .selection()
+        .events()
+        .filter_map(|(t, i)| line.track(t).origin(i).map(|at| (t, at)))
+        .collect();
+    if doc_notes.is_empty() && events.is_empty() {
+        return Vec::new();
+    }
+    let line_doc = st.selected_doc_line();
+    let mut out = vec![begin_command(DELETE_LABEL)];
+    doc_notes.sort_unstable_by(|a, b| b.cmp(a));
+    doc_notes.dedup();
+    for index in doc_notes {
+        out.push(json!({ "op": "del_note", "line": line_doc, "index": index }));
+    }
+    events.sort_by(|a, b| {
+        (a.0 as usize, a.1.layer, a.1.index).cmp(&(b.0 as usize, b.1.layer, b.1.index))
+    });
+    events.dedup();
+    events.reverse(); // 同一张表内降序（跨表顺序无所谓，分组只为可读）
+    for (track, at) in events {
+        out.push(json!({
+            "op": "del_event", "line": line_doc,
+            "layer": at.layer, "track": track.key(), "index": at.index,
+        }));
+    }
+    out.push(commit_command());
+    out
 }
 
 /// 放置一个音符 → `add_note`（双击空白处、或按 Q/W/E/R 快速放置都走这里）。
@@ -160,14 +586,14 @@ pub fn new_event_value(st: &EditorState, track: TrackId, beat: f64) -> f64 {
         .unwrap_or_else(|| track_neutral_value(track))
 }
 
-/// 事件：删除
-pub fn del_event_command(line: usize, track: &str, index: usize) -> Value {
-    json!({ "op": "del_event", "line": line, "layer": 0, "track": track, "index": index })
+/// 事件：删除（**按文档地址**：图层 + 该图层里的下标）
+pub fn del_event_command(line: usize, track: &str, at: EventRef) -> Value {
+    json!({ "op": "del_event", "line": line, "layer": at.layer, "track": track, "index": at.index })
 }
 
 /// 事件：改值/缓动（`set` 只放**真的变了**的字段；空 `set` 由调用方跳过，别发空命令）
-pub fn set_event_command(line: usize, track: &str, index: usize, set: Value) -> Value {
-    json!({ "op": "set_event", "line": line, "layer": 0, "track": track, "index": index, "set": set })
+pub fn set_event_command(line: usize, track: &str, at: EventRef, set: Value) -> Value {
+    json!({ "op": "set_event", "line": line, "layer": at.layer, "track": track, "index": at.index, "set": set })
 }
 
 /// 音符：改字段（`set` 里放文档字段名；拍用 `beat_json`/`milli_beat` 的有理数）
@@ -185,9 +611,22 @@ pub fn commit_command() -> Value {
     json!({ "op": "commit" })
 }
 
-/// 拖动音符时的事务标签 / 拖事件头尾时的事务标签（两处各写一遍容易写歪）
+/// 事务标签（写两遍容易写歪；它们会原样出现在撤销提示里，所以写人话）
 pub const DRAG_NOTE_LABEL: &str = "拖动音符";
 pub const DRAG_EVENT_LABEL: &str = "调整事件时间";
+/// 多选整体平移
+pub const MOVE_NOTES_LABEL: &str = "移动选中音符";
+pub const MOVE_EVENTS_LABEL: &str = "移动选中事件";
+/// Del 一次删掉整个选区（**一个撤销步**）
+pub const DELETE_LABEL: &str = "删除选中";
+
+/// 选区是音符还是事件 → 该用哪个事务标签
+pub fn move_label(kind: SelKind) -> &'static str {
+    match kind {
+        SelKind::Notes => MOVE_NOTES_LABEL,
+        SelKind::Events => MOVE_EVENTS_LABEL,
+    }
+}
 
 /// 当前选中的轨道（属性编辑器与事件条都靠它）——只是把 `EditorState` 的字段读出来，
 /// 放在这里是为了让"选中了什么"与"发什么命令"挨着，读代码时不用来回跳。
@@ -225,7 +664,7 @@ mod tests {
     fn dragging_a_tap_sets_position_only() {
         let (_c, mut st) = sample();
         st.selected_line = 0;
-        let cmd = note_drag_command(&st, 0, 0, 250.0, 2.0);
+        let cmd = note_move_command(&st, 0, 250.0, 2.0, None);
         assert_eq!(cmd["op"], json!("set_note"));
         assert_eq!(cmd["line"], json!(0));
         assert_eq!(cmd["index"], json!(0), "命令用的是**文档里**的下标");
@@ -234,13 +673,12 @@ mod tests {
         assert!(cmd["set"].get("endBeat").is_none(), "tap 不该被塞一个 endBeat");
     }
 
-    /// 拖动 **hold**：终点跟着走、**时长不变**（这是用户会立刻看出来的行为）
+    /// 拖动 **hold**：终点跟着走、**时长不变**（时长由调用方在按下那一刻冻结）
     #[test]
     fn dragging_a_hold_keeps_its_duration() {
         let (_c, mut st) = sample();
         st.selected_line = 0;
-        // 文档里第二个音符是 hold：视图下标 1
-        let cmd = note_drag_command(&st, 1, 1, -100.0, 10.0);
+        let cmd = note_move_command(&st, 1, -100.0, 10.0, Some(4.0));
         let set = &cmd["set"];
         let start = st.beat_json(10.0);
         let end = st.beat_json(14.0); // 起点 10 拍 + 原时长 4 拍
@@ -250,25 +688,26 @@ mod tests {
         assert!(start[1] > 0 && end[1] > 0);
     }
 
-    /// 拖事件头/尾：edge 映射成 "start"/"end"，轨道用**当前选中**的轨道
+    /// 拖事件头/尾：edge 映射成 "start"/"end"，图层/下标来自**文档地址**
     #[test]
-    fn resizing_an_event_maps_edge_and_track() {
+    fn resizing_an_event_maps_edge_track_and_layer() {
+        use crate::doc::EventRef;
         use crate::state::EventEdge;
         let (_c, mut st) = sample();
         st.selected_line = 0;
-        st.selected_track = TrackId::MoveX;
-        let cmd = event_resize_command(&st, 0, EventEdge::End, 6.0);
+        let cmd = event_resize_command(&st, TrackId::MoveX, EventRef::new(0, 0), EventEdge::End, 6.0);
         assert_eq!(cmd["op"], json!("resize_event"));
         assert_eq!(cmd["track"], json!("moveX"));
         assert_eq!(cmd["edge"], json!("end"));
         assert_eq!(cmd["layer"], json!(0));
         assert_eq!(cmd["toBeat"], json!(st.beat_json(6.0)));
 
-        st.selected_track = TrackId::Alpha;
-        let cmd = event_resize_command(&st, 2, EventEdge::Start, 1.0);
-        assert_eq!(cmd["track"], json!("alpha"), "轨道跟着选中项走");
+        // 轨道与图层都跟着**文档地址**走（不是写死的 0/当前轨道）
+        let cmd = event_resize_command(&st, TrackId::Alpha, EventRef::new(2, 3), EventEdge::Start, 1.0);
+        assert_eq!(cmd["track"], json!("alpha"));
+        assert_eq!(cmd["layer"], json!(2), "多层文档里图层必须是真图层");
         assert_eq!(cmd["edge"], json!("start"));
-        assert_eq!(cmd["index"], json!(2));
+        assert_eq!(cmd["index"], json!(3));
     }
 
     /// 双击放置：落在**已吸附**的 laneX/拍 上，默认 tap
@@ -360,6 +799,223 @@ mod tests {
         assert_eq!(c.doc().judge_lines[0].layers[0].track("alpha").unwrap().len(), 1);
     }
 
+    /// **一组音符整体平移**：相对偏移不变（这是"统一拖动位置"的全部意义），hold 保持自己的时长
+    #[test]
+    fn moving_a_group_keeps_relative_offsets_and_hold_lengths() {
+        let (mut c, mut st) = sample();
+        st.selected_line = 0;
+        // 视图序：[0] = 1 拍的 tap，[1] = 4 拍的 hold（长 4 拍）
+        st.select_notes([0, 1]);
+        let grab = grab_selection(&st, &GrabIntent::selection(&st, 0.0, 0.0)).expect("抓手");
+        assert_eq!(grab.notes.len(), 2);
+        assert_eq!(grab.kind, SelKind::Notes);
+        let cmds = move_grab_commands(&st, &grab, 200.0, 2.0);
+        assert_eq!(cmds.len(), 2);
+        // tap：起点 1 → 3，横向 100 + Δ200 = 300（参数是**位移**，不是绝对位置）
+        assert_eq!(cmds[0]["set"]["startBeat"], json!(st.beat_json(3.0)));
+        assert_eq!(cmds[0]["set"]["laneX"], json!(300.0));
+        // hold：起点 4 → 6、终点 8 → 10（时长仍是 4 拍）
+        assert_eq!(cmds[1]["set"]["startBeat"], json!(st.beat_json(6.0)));
+        assert_eq!(cmds[1]["set"]["endBeat"], json!(st.beat_json(10.0)));
+
+        // 端到端：整组真的动了，且相对间隔（3 拍）没变
+        for cmd in cmds {
+            exec_ok(&mut c, cmd);
+        }
+        let notes = &c.doc().judge_lines[0].notes;
+        assert_eq!(notes[0].start.to_f64(), 3.0);
+        assert_eq!(notes[1].start.to_f64(), 6.0);
+        assert_eq!(notes[1].end_beat().to_f64(), 10.0);
+    }
+
+    /// 组拖动的位移：**锚吸附**（写回文档的拍仍是格点），负拍整组一起夹（不压扁相对间隔）
+    #[test]
+    fn grab_delta_snaps_the_anchor_and_clamps_the_whole_group() {
+        let (_c, mut st) = sample();
+        st.selected_line = 0;
+        st.select_notes([0, 1]);
+        // 按下时指针在 (0, 1)，抓手原点 = 选区锚（最小的那个 = tap，起点 1 拍 / lane 0）
+        let grab = grab_selection(&st, &GrabIntent::selection(&st, 0.0, 1.0)).expect("抓手");
+        // 往左下拖：锚**跟着指针走**（按下时指针在 lane 0 / 拍 1，锚也在那儿）
+        // ⇒ 目标 = 锚原点 + (指针现在 − 按下时指针)，再吸附
+        let (d_lane, d_beat) = grab_delta(&st, &grab, -37.0, 0.4);
+        let want_lane = st.snap_lane(grab.anchor_lane + (-37.0 - grab.press_lane)) - grab.anchor_lane;
+        let want_beat = st.snap_beat(grab.anchor_beat + (0.4 - grab.press_beat)) - grab.anchor_beat;
+        assert!((d_lane - want_lane).abs() < 1e-6, "{d_lane} vs {want_lane}");
+        assert!((d_beat - want_beat).abs() < 1e-9, "{d_beat} vs {want_beat}");
+        // 锚落回**格点**（写回文档的拍/坐标必须是格点上的有理数）
+        let step = st.grid.h_step_rpe();
+        let k = (grab.anchor_lane + d_lane + 675.0) / step;
+        assert!((k - k.round()).abs() < 1e-3, "横向应落在格点上，k={k}");
+        // 拖到很大的负拍：整组夹在"最小起点 = 0"，而不是各自夹（那样相对间隔会被压扁）
+        let (_, d_beat) = grab_delta(&st, &grab, 0.0, -100.0);
+        assert!((d_beat + 1.0).abs() < 1e-9, "应整组退到起点 0，实际 Δ={d_beat}");
+    }
+
+    /// **事件的"最近合法位置"**（用户选定：仿 kdenlive）——
+    /// 铺满的轨道上拖不动；指针拖得够远、越过了障碍，就**跳到障碍另一侧的空档里**
+    #[test]
+    fn event_group_move_jumps_across_an_obstacle_when_there_is_room() {
+        // 选中 [0,4)，障碍 [4,8)：Δ ∈ (0,8) 会重叠 ⇒ 合法的是 Δ=0（贴住）与 Δ≥8（整个跨过去）
+        let selected = [(0.0, 4.0)];
+        let blocked = [(4.0, 8.0)];
+        assert_eq!(nearest_free_delta(&selected, &blocked, 0.0, 0.0), 0.0, "原地合法");
+        assert_eq!(nearest_free_delta(&selected, &blocked, 0.5, 0.0), 0.0, "贴着邻居停住");
+        assert_eq!(nearest_free_delta(&selected, &blocked, 3.0, 0.0), 0.0, "近的一侧是原地");
+        assert_eq!(nearest_free_delta(&selected, &blocked, 6.0, 0.0), 8.0, "远的一侧更近 ⇒ 跨过去");
+        assert_eq!(nearest_free_delta(&selected, &blocked, 20.0, 0.0), 20.0, "另一侧空着随便走");
+        // 底下不许到负拍
+        assert_eq!(nearest_free_delta(&selected, &blocked, -5.0, -2.0), -2.0);
+        // 有空档：障碍在 [6,8)，选中块 [0,2) ⇒ Δ ∈ (4,8) 不行，[0,4] 随便走
+        let selected = [(0.0, 2.0)];
+        let blocked = [(6.0, 8.0)];
+        assert_eq!(nearest_free_delta(&selected, &blocked, 3.0, 0.0), 3.0);
+        assert_eq!(nearest_free_delta(&selected, &blocked, 5.0, 0.0), 4.0, "最多贴到邻居边界");
+        assert_eq!(nearest_free_delta(&selected, &blocked, 7.9, 0.0), 8.0, "越过去");
+        // 没有障碍 / 空选区：原样（只受地板限制）
+        assert_eq!(nearest_free_delta(&selected, &[], 5.0, 0.0), 5.0);
+        assert_eq!(nearest_free_delta(&[], &blocked, 5.0, 0.0), 5.0);
+    }
+
+    /// 事件组平移**端到端**：整块挪走、时长不变；铺满时挪不动（不制造重叠）
+    #[test]
+    fn moving_an_event_group_does_not_create_overlaps() {
+        let (mut c, _st) = sample();
+        // 再加一条 [4,8) 的 moveX 事件 ⇒ 轨道铺满 [0,8)
+        exec_ok(&mut c, json!({"op":"add_event","line":0,"layer":0,"track":"moveX",
+                               "startBeat":[4,1],"endBeat":[8,1],"startValue":100.0,"endValue":0.0}));
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.select_event(TrackId::MoveX, 0);
+        let grab = grab_selection(&st, &GrabIntent::selection(&st, 0.0, 0.0)).expect("抓手");
+        assert_eq!(grab.kind, SelKind::Events);
+        // 请求 +1 拍：会盖住邻居 ⇒ 最近合法位置是原地
+        let (_, d) = grab_delta(&st, &grab, 0.0, 1.0);
+        assert_eq!(d, 0.0, "铺满的轨道上不该挪出重叠来");
+        // 请求 +12 拍：整个跨过邻居之后（没有别的障碍）⇒ 允许
+        let (_, d) = grab_delta(&st, &grab, 0.0, 12.0);
+        assert_eq!(d, 12.0);
+        let cmds = move_grab_commands(&st, &grab, 0.0, d);
+        for cmd in cmds {
+            exec_ok(&mut c, cmd);
+        }
+        let evs = c.doc().judge_lines[0].layers[0].track("moveX").unwrap();
+        let moved = evs.iter().find(|e| e.start.to_f64() == 12.0).expect("整块挪到 12");
+        assert_eq!(moved.end.to_f64(), 16.0, "时长不变");
+        // 没有制造出重叠
+        assert!(c.overlaps().is_empty(), "{:?}", c.overlaps());
+    }
+
+    /// **Del：整批删除 = 一个撤销步**，且同一张表里**按下标降序**发
+    /// （删掉第 3 条之后原来的第 4 条会变成第 3 条 —— 顺序错了就删错东西）
+    #[test]
+    fn deleting_a_selection_is_one_undo_step_in_descending_order() {
+        let mut c = EditCore::new();
+        // 故意按"乱序"插入：文档下标 0/1/2 对应拍 4/2/6 ⇒ 视图序 = [1, 0, 2]
+        for b in [4, 2, 6] {
+            exec_ok(&mut c, json!({"op":"add_note","line":0,"kind":"tap",
+                                   "startBeat":[b,1],"laneX":0.0}));
+        }
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.select_notes([0, 2]); // 视图 0 = 拍 2 = 文档下标 1；视图 2 = 拍 6 = 文档下标 2
+        let cmds = delete_selection_commands(&st);
+        assert_eq!(cmds[0]["op"], json!("begin"), "整批删除是一个撤销步");
+        assert_eq!(cmds[0]["label"], json!(DELETE_LABEL));
+        assert_eq!(cmds.last().unwrap()["op"], json!("commit"));
+        let dels: Vec<i64> = cmds
+            .iter()
+            .filter(|c| c["op"] == json!("del_note"))
+            .map(|c| c["index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(dels, vec![2, 1], "同一张表里必须降序：{cmds:?}");
+        for cmd in &cmds {
+            exec_ok(&mut c, cmd.clone());
+        }
+        let notes = &c.doc().judge_lines[0].notes;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start.to_f64(), 4.0, "留下的应是拍 4 那个");
+        // 一次撤销把两条都带回来
+        exec_ok(&mut c, json!({"op":"undo"}));
+        assert_eq!(c.doc().judge_lines[0].notes.len(), 3);
+    }
+
+    /// **卷入重叠的事件禁止移动**（用户要求）：判据是两两比较（只查相邻会漏第三种情形），
+    /// 相接不算重叠，没选中东西时不禁用。
+    #[test]
+    fn events_involved_in_an_overlap_cannot_be_dragged() {
+        let mut c = EditCore::new();
+        let mut doc = c.doc().clone();
+        let tr = doc.judge_lines[0].layers[0].track_mut("alpha").unwrap();
+        tr.clear();
+        // 相接的一对 + 一块压在第二块上的
+        for (a, b) in [(0.0, 4.0), (4.0, 8.0), (6.0, 10.0)] {
+            tr.push(crate::doc::Event::new(
+                crate::doc::Beat::new((a * 4.0) as i64, 4),
+                crate::doc::Beat::new((b * 4.0) as i64, 4),
+                json!(1.0),
+                json!(1.0),
+                "linear",
+            ));
+        }
+        c.replace_doc(doc);
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        // 视图序按起拍：[0,4) / [4,8) / [6,10)。
+        // 只选第一块 ⇒ 它和谁都不重叠 ⇒ 可以拖
+        st.select_event(TrackId::Alpha, 0);
+        assert!(!selection_has_event_overlap(&st), "相接不算重叠");
+        assert!(!event_drag_disabled(&st, &st.selection().events().collect::<Vec<_>>()));
+        // 只选第二块 ⇒ 它和第二块不重叠、和**第三块**才重叠（只查相邻会漏掉这一对）
+        st.select_event(TrackId::Alpha, 1);
+        assert!(
+            selection_has_event_overlap(&st),
+            "第二块与第三块重叠：两两比较才查得到"
+        );
+        // 选中"重叠的一方"就禁用；没选中东西时不拦
+        st.clear_selection();
+        assert!(!selection_has_event_overlap(&st));
+        assert!(!event_drag_disabled(&st, &[]));
+    }
+
+    /// Del 删事件：按**文档地址**（图层 + 图层内下标）走，多层文档里不会删错
+    #[test]
+    fn deleting_events_uses_the_document_address() {
+        let mut c = EditCore::new();
+        // 两层各一条（`add_event` 只能落在已存在的层上 ⇒ 直接造文档）：
+        // 合并视图序按起拍排 ⇒ 视图 0 = 图层 0 的那条、视图 1 = 图层 1 的那条
+        let mut doc = c.doc().clone();
+        doc.judge_lines[0].layers.push(crate::doc::Layer::default());
+        doc.judge_lines[0].layers[0].track_mut("alpha").unwrap().push(crate::doc::Event::new(
+            crate::doc::Beat::zero(),
+            crate::doc::Beat::new(4, 1),
+            json!(1.0),
+            json!(1.0),
+            "linear",
+        ));
+        doc.judge_lines[0].layers[1].track_mut("alpha").unwrap().push(crate::doc::Event::new(
+            crate::doc::Beat::new(2, 1),
+            crate::doc::Beat::new(6, 1),
+            json!(0.5),
+            json!(0.5),
+            "linear",
+        ));
+        c.replace_doc(doc);
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        // 视图序 = [(layer0,idx0) 起拍 0, (layer1,idx0) 起拍 2]
+        st.select_event(TrackId::Alpha, 1);
+        let cmds = delete_selection_commands(&st);
+        let del = cmds.iter().find(|c| c["op"] == json!("del_event")).expect("应有删除");
+        assert_eq!(del["layer"], json!(1), "合并下标 1 落在**图层 1**，不是图层 0");
+        assert_eq!(del["index"], json!(0), "图层 1 里的第 0 条");
+        for cmd in &cmds {
+            exec_ok(&mut c, cmd.clone());
+        }
+        assert_eq!(c.doc().judge_lines[0].layers[0].track("alpha").unwrap().len(), 1);
+        assert_eq!(c.doc().judge_lines[0].layers[1].track("alpha").unwrap().len(), 0);
+    }
+
     /// 事务：一段拖拽用 begin/commit 包住 ⇒ 撤销一步（标签是人话，会出现在撤销提示里）
     #[test]
     fn a_drag_is_wrapped_in_one_transaction() {
@@ -379,7 +1035,7 @@ mod tests {
         let before = c.doc().judge_lines[0].notes[1].clone();
         let dur_before = before.end_beat().to_f64() - before.start.to_f64();
         exec_ok(&mut c, begin_command(DRAG_NOTE_LABEL));
-        exec_ok(&mut c, note_drag_command(&st, 1, 1, -300.0, 10.0));
+        exec_ok(&mut c, note_move_command(&st, 1, -300.0, 10.0, Some(4.0)));
         exec_ok(&mut c, commit_command());
         let after = &c.doc().judge_lines[0].notes[1];
         assert_eq!(after.lane_x, -300.0);

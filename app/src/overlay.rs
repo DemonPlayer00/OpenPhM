@@ -17,37 +17,59 @@
 //!
 //! 这一层只读 `EditorState`、只产出**动作**（选中），不直接改任何数据 —— 与左侧判定线树同一条规矩。
 
-use opm_app::state::{EditorState, TrackId, RPE_WINDOW_HALF_W, RPE_WINDOW_W};
+use opm_app::state::{EditorState, SelKind, TrackId, RPE_WINDOW_HALF_W, RPE_WINDOW_W};
 // 事件边界规则只有一份实现，住在库内 `state`（好让集成测试能调真身）：这里只再导出，GUI 侧的名字不变。
 pub use opm_app::state::{prefer_edge, EventEdge};
 
 /// 叠加层产出的动作（由调用方施加，见 `main.rs`）
+///
+/// **选区动作分两档**：`Select*` 是"替换整个选区"（点选、框选），`Toggle*` 是
+/// "把某一个在选中/未选中之间切换"（Ctrl+左键）。两者都由调用方落到 `EditorState` 的选区上，
+/// 面板自己不碰状态 —— 与左侧判定线树同一条规矩。
 #[derive(Debug)]
 pub enum OverlayAction {
-    /// 选中当前判定线的第 i 个音符（时间序）
+    /// 选中当前判定线的第 i 个音符（时间序）——**替换**整个选区
     SelectNote(usize),
+    /// 框选：把选区替换成这一批音符（空 = 清空）
+    SelectNotes(Vec<usize>),
+    /// Ctrl+左键：把这个音符在选中/未选中之间切换
+    ToggleNote(usize),
     /// 选中当前轨道（某条轨道列被点击）
     SelectTrack(TrackId),
-    /// 选中当前轨道的第 i 条事件
+    /// 选中第 i 条事件（**当前轨道**）——替换整个选区
     SelectEvent(usize),
+    /// 框选：把选区替换成这一批事件（可跨轨道；空 = 清空）
+    SelectEvents(Vec<(TrackId, usize)>),
+    /// Ctrl+左键：把这条事件在选中/未选中之间切换
+    ToggleEvent(TrackId, usize),
+    /// 点空白/点标尺：清空选区
+    ClearSelection,
     /// 把播放头定位到某一拍
     SeekBeat(f64),
     /// 把播放头**相对**挪动若干拍（滚轮用；相对量避免"取整再取整"的累积误差）
     ScrollBeats(f64),
     /// Ctrl+滚轮：按倍率缩放时间轴（可见拍数 × 倍率，调用方负责夹到允许范围）
     ZoomBeats(f64),
-    /// 开始拖动音符（调用方据此开一个事务，让整段拖拽只占一个撤销步）
-    NoteDragStart,
-    /// 拖动中：目标位置**已经吸附过**（吸附在面板里做，因为它只依赖网格设置）
-    NoteDrag { index: usize, doc_index: usize, lane_x: f32, beat: f64 },
+    /// **组拖动开始**：把选区冻结成抓手（原点定下之后，拖拽期间不再从文档反推）。
+    /// 调用方据此开一个事务，让整段拖拽只占一个撤销步。
+    GrabStart(Box<opm_app::edit::Grab>),
+    /// 拖动中：**已经吸附并夹过**的位移（吸附只依赖网格设置，所以在面板里算）
+    GrabMove { d_lane: f32, d_beat: f64 },
     /// 拖动结束：调用方提交事务
-    NoteDragEnd,
+    GrabEnd,
     /// 双击空白处放置音符（相同吸附规则）
     PlaceNote { lane_x: f32, beat: f64 },
     /// 事件块头/尾拖拽：起点（调用方开事务）
     EventResizeStart,
-    /// 事件块头/尾拖拽中：把 start 或 end 挪到某个拍（已按拍网格吸附）
-    EventResize { index: usize, edge: EventEdge, beat: f64 },
+    /// 事件块头/尾拖拽中：把 start 或 end 挪到某个拍（已按拍网格吸附）。
+    /// 带**文档地址**（图层 + 该图层内下标）—— 视图把五个图层合并成一条时间线，
+    /// 合并下标不能直接当图层下标用（见 `opm_app::doc::EventRef`）。
+    EventResize {
+        track: TrackId,
+        at: opm_app::doc::EventRef,
+        edge: EventEdge,
+        beat: f64,
+    },
     /// 事件块头/尾拖拽结束（调用方提交事务）
     EventResizeEnd,
     /// **快速放置**（Q/W/E/R）：把指针处的音符放下去（位置已吸附；kind = tap/flick/drag/hold）
@@ -410,36 +432,179 @@ pub fn hit_event_part(pointer_y: f32, start_y: f32, end_y: f32, band: f32) -> Ev
     EventPart::None
 }
 
-/// 把"按下时指针下面是什么"记下来：egui 要等指针移动几个像素才认定为拖拽，
-/// 那时指针可能**已经离开 6px 的把手段** —— 用"当前命中"判断会永远拖不起来。
-/// 编码成 (kind, index, edge)：0=音符 1=事件头 2=事件尾 3=其它
-fn press_hit_set(ui: &egui::Ui, v: Option<(u8, usize, u8)>) {
+/// 按下左键时指针下面是什么。
+///
+/// egui 要等指针移动几个像素才认定为拖拽，那时指针可能**已经离开 6px 的把手段** ——
+/// 用"当前命中"判断会永远拖不起来，所以必须在按下那一刻把它记下来。
+///
+/// 事件一律记**文档地址**（图层 + 图层内下标）而不是视图下标：视图把五个图层合并成一条
+/// 时间线并按起拍排序，而拖拽期间时间一直在变 ⇒ 合并下标会重排，
+/// 用它拖着拖着就换了一条事件（见 `opm_app::doc::EventRef`）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PressHit {
+    Note(usize),
+    EventEdge {
+        track: TrackId,
+        at: opm_app::doc::EventRef,
+        view: usize,
+        edge: EventEdge,
+    },
+    EventBody {
+        track: TrackId,
+        view: usize,
+    },
+}
+
+fn press_hit_set(ui: &egui::Ui, v: Option<PressHit>) {
     ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_press_hit"), v));
 }
-fn press_hit_get(ui: &egui::Ui) -> Option<(u8, usize, u8)> {
-    ui.data(|d| d.get_temp::<Option<(u8, usize, u8)>>(egui::Id::new("opm_press_hit")))
+fn press_hit_get(ui: &egui::Ui) -> Option<PressHit> {
+    ui.data(|d| d.get_temp::<Option<PressHit>>(egui::Id::new("opm_press_hit")))
         .flatten()
 }
 
-/// 正在拖的音符（egui 临时内存）。
+/// 正在拖的事件**头/尾把手**：轨道 + 文档地址 + 视图下标 + 哪一头。
 ///
-/// 拖拽一开始就把它记下来，而不是每帧重新做命中测试 —— 指针移动快时会离开音符的命中范围，
-/// 那样拖拽会中途"掉线"。
-fn drag_note_set(ui: &egui::Ui, v: Option<usize>) {
-    ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_note_drag"), v));
-}
-fn drag_note_get(ui: &egui::Ui) -> Option<usize> {
-    ui.data(|d| d.get_temp::<Option<usize>>(egui::Id::new("opm_note_drag")))
-        .flatten()
+/// 拖拽一开始就把它定下来，而不是每帧重新做命中测试 —— 指针移动快时会离开把手段，
+/// 那样拖拽会中途"掉线"。**改的地址用 `at`（文档地址），高亮用 `view`（视图下标）**：
+/// 拖拽期间时间在变、合并下标会重排，后者只用来在画面上找那一块。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeDrag {
+    track: TrackId,
+    at: opm_app::doc::EventRef,
+    view: usize,
+    edge: EventEdge,
 }
 
-/// 事件块正在拖哪一头（egui 临时内存：纯视图瞬态，不进 EditorState）
-fn drag_edge_set(ui: &egui::Ui, v: Option<(usize, EventEdge)>) {
+fn drag_edge_set(ui: &egui::Ui, v: Option<EdgeDrag>) {
     ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_event_drag"), v));
 }
-fn drag_edge_get(ui: &egui::Ui) -> Option<(usize, EventEdge)> {
-    ui.data(|d| d.get_temp::<Option<(usize, EventEdge)>>(egui::Id::new("opm_event_drag")))
+fn drag_edge_get(ui: &egui::Ui) -> Option<EdgeDrag> {
+    ui.data(|d| d.get_temp::<Option<EdgeDrag>>(egui::Id::new("opm_event_drag")))
         .flatten()
+}
+
+/// 正在拖的**组**：按下那一刻冻结的抓手（成员、原点、手指位置）。
+/// 有它就是在拖组 —— 也是"这一帧要不要发 `GrabMove`"的判据。
+fn grab_set(ui: &egui::Ui, v: Option<opm_app::edit::Grab>) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_grab"), v));
+}
+fn grab_get(ui: &egui::Ui) -> Option<opm_app::edit::Grab> {
+    ui.data(|d| d.get_temp::<Option<opm_app::edit::Grab>>(egui::Id::new("opm_grab")))
+        .flatten()
+}
+
+/// 正在拉的**框选**：起点屏幕坐标 + 选哪一类（**起始点定半区**，用户定的规则）
+type BoxSelState = (egui::Pos2, SelKind);
+
+fn box_set(ui: &egui::Ui, v: Option<BoxSelState>) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_box_sel"), v));
+}
+fn box_get(ui: &egui::Ui) -> Option<BoxSelState> {
+    ui.data(|d| d.get_temp::<Option<BoxSelState>>(egui::Id::new("opm_box_sel")))
+        .flatten()
+}
+
+/// 框选命中：**矩形相交**就算选中（碰到就选，与 kdenlive/RPE 的选择框一致）。
+/// 抽成纯函数：只吃"画出来的矩形"，于是不必开窗口就能钉住"选了哪些"。
+pub fn box_hits(rects: &[(usize, egui::Rect)], sel: egui::Rect) -> Vec<usize> {
+    rects
+        .iter()
+        .filter(|(_, r)| sel.intersects(*r))
+        .map(|(i, _)| *i)
+        .collect()
+}
+
+/// **开始组拖动**：冻结抓手 → 把选区调整成"要拖的那些" → 发 `GrabStart`。
+///
+/// 四件事都在这里，是因为它们必须同时成立：
+/// · 手指按在**选区之内** ⇒ 拖整个选区（相对偏移保持不变）；
+/// · 手指按在**选区之外** ⇒ 先把选区换成它一个，再拖它（否则会把别的一起带走）；
+/// · 冻结的原点取自**本帧**的视图状态（下一帧文档就变了）；
+/// · 调用方收到 `GrabStart` 要开事务 —— 整段拖拽只占一个撤销步。
+///
+/// `note` / `event` 是**手指按住的那一个**（由按下时的命中给出），它同时是吸附的原点。
+fn start_grab(
+    ui: &egui::Ui,
+    st: &EditorState,
+    note: Option<usize>,
+    event: Option<(TrackId, usize)>,
+    press_lane: f32,
+    press_beat: f64,
+    actions: &mut Vec<OverlayAction>,
+) {
+    use opm_app::edit::GrabIntent;
+    let in_selection = match (note, event) {
+        (Some(i), _) => st.is_note_selected(i),
+        (_, Some((t, i))) => st.is_event_selected(t, i),
+        _ => false,
+    };
+    let mut intent = if in_selection {
+        GrabIntent::selection(st, press_lane, press_beat)
+    } else {
+        match (note, event) {
+            (Some(i), _) => {
+                actions.push(OverlayAction::SelectNote(i));
+                GrabIntent::one_note(i, press_lane, press_beat)
+            }
+            (_, Some((t, i))) => {
+                actions.push(OverlayAction::SelectTrack(t));
+                actions.push(OverlayAction::SelectEvent(i));
+                GrabIntent::one_event(t, i, press_lane, press_beat)
+            }
+            _ => return,
+        }
+    };
+    // 手指按住的那一个就是吸附的原点 —— 整组平移时"它跟着指针走"，其余保持相对偏移
+    intent.anchor_note = note;
+    intent.anchor_event = event;
+    // **卷进重叠的事件不许移动**（用户要求）：轨道已经不是"一块接一块"的结构，
+    // "挪到最近合法位置"那套推理没有意义 —— 拒绝，并说清楚改怎么走。
+    if opm_app::edit::event_drag_disabled(st, &intent.events) {
+        actions.push(OverlayAction::Notice(
+            "选中的事件里有重叠，拖动已禁用：拖它的头/尾把手改时间，或在冲突浏览器里跳过去".to_owned(),
+        ));
+        return;
+    }
+    // 抓手取不到（这一帧视图里没有它）⇒ 当作没按下去，别开一个拖不动的事务
+    let Some(g) = opm_app::edit::grab_selection(st, &intent) else {
+        return;
+    };
+    grab_set(ui, Some(g.clone()));
+    actions.push(OverlayAction::GrabStart(Box::new(g)));
+}
+
+/// 快速放置键的**落点**：同一个键在两个半区里的含义不一样，而"哪个键在哪个半区做什么"
+/// 正是需求本身（踩过：事件区里按 Q/W/E 也会起一个事件草稿 —— 那是误触）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QuickKey {
+    /// 在音符区放一个音符（tap/flick/drag/hold 由键定）
+    Note(opm_app::doc::NoteKind),
+    /// 在事件区起一个事件块草稿
+    EventDraft,
+    /// 这个键在这个半区里没有意义 —— **什么都不做**
+    Nothing,
+    /// 指针不在任何一个半区里（标尺/轴带上）：说一句话解释为什么没反应
+    Outside,
+}
+
+/// 规则（用户定）：**音符区** Q/W/E/R 四个键各放一种音符；**事件区只有 R** 能用
+/// （起事件块草稿，与音符区的 hold 同一套跟随流程）；其余键在事件区**没有反应**。
+pub fn quick_key_rule(key: egui::Key, in_notes: bool, in_events: bool) -> QuickKey {
+    if in_notes {
+        return match opm_app::keymap::quick_place_kind(key) {
+            Some(kind) => QuickKey::Note(kind),
+            None => QuickKey::Nothing,
+        };
+    }
+    if in_events {
+        return if key == egui::Key::R {
+            QuickKey::EventDraft
+        } else {
+            QuickKey::Nothing
+        };
+    }
+    QuickKey::Outside
 }
 
 /// 滚轮位移 → 拍增量（纯函数，可单测）。
@@ -677,6 +842,29 @@ pub fn draw(
         egui::Color32::from_rgb(165, 175, 215),
     );
 
+    // **选区读数**：多选之后"选了几个"必须一眼可见（Del 与拖动都作用在它上面）。
+    // 与标题同一列右对齐、错开一行，两行都不叠字。
+    if !st.selection().is_empty() {
+        let msg = match st.selection_kind() {
+            Some(SelKind::Notes) => format!(
+                "已选 {} 个音符 · Del 删除 · 拖动整体平移（四向箭头）",
+                st.selection().len()
+            ),
+            Some(SelKind::Events) => format!(
+                "已选 {} 条事件 · Del 删除 · 拖动整块平移（有空档才跨得过去）",
+                st.selection().len()
+            ),
+            None => String::new(),
+        };
+        p.text(
+            egui::pos2(rect.max.x - 4.0, rect.min.y + 12.0),
+            egui::Align2::RIGHT_TOP,
+            msg,
+            egui::FontId::monospace(9.5),
+            egui::Color32::from_rgb(255, 225, 150),
+        );
+    }
+
     // 播放头线（拍位置）
     let y_now = y_of(beat_now);
     if y_now >= body.min.y && y_now <= body.max.y {
@@ -729,6 +917,8 @@ pub fn draw(
         );
     }
     let row_h = 7.0_f32;
+    // 本帧画过的音符矩形：框选命中直接用它 —— "画在哪"与"选得中什么"必须是同一份几何
+    let mut note_rects: Vec<(usize, egui::Rect)> = Vec::new();
     for (i, n) in line.notes.iter().enumerate() {
         let y0 = y_of(n.time_beat(&st.chart.tmap));
         let y1 = y_of(n.end_beat(&st.chart.tmap));
@@ -768,13 +958,23 @@ pub fn draw(
         if !r.is_positive() {
             continue;
         }
-        let selected = Some(i) == st.selected_note;
+        // **选区成员一律描边**（不是只有锚亮）：多选之后"选了几个"必须一眼看得见。
+        // 锚用实线白框、其余成员用稍细的浅框 —— 检查器显示的是锚，视觉上要能分辨。
+        let in_sel = st.is_note_selected(i);
         p.rect_filled(r, 1.0, fill);
-        if selected {
+        if in_sel {
+            let anchor = st.selected_note() == Some(i);
             p.rect_stroke(
                 r.expand(1.0),
                 1.0,
-                egui::Stroke::new(1.2, egui::Color32::WHITE),
+                egui::Stroke::new(
+                    if anchor { 1.4 } else { 1.0 },
+                    if anchor {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(235, 240, 255, 190)
+                    },
+                ),
                 egui::StrokeKind::Outside,
             );
         }
@@ -787,13 +987,15 @@ pub fn draw(
                 egui::StrokeKind::Inside,
             );
         }
+        note_rects.push((i, r));
     }
 
     // ---- 右半：事件区（5 条轨道各一列）----
     let lanes = TrackId::ALL.len();
     let col_w = ev_pane.width() / lanes as f32;
-    // 本帧画过的事件块：(事件下标, 矩形, 起点 y, 终点 y) —— 供把手高亮复用同一决策
-    let mut blocks: Vec<(usize, egui::Rect, f32, f32)> = Vec::new();
+    // 本帧画过的事件块：(轨道, 事件下标, 矩形, 起点 y, 终点 y)
+    // —— 把手高亮、框选、命中都复用同一份几何
+    let mut blocks: Vec<(TrackId, usize, egui::Rect, f32, f32)> = Vec::new();
     for (k, id) in TrackId::ALL.iter().enumerate() {
         let x0 = ev_pane.min.x + k as f32 * col_w;
         let col = TRACK_COLORS[k];
@@ -828,7 +1030,7 @@ pub fn draw(
                 egui::pos2(x0 + inset, y0.min(y1)),
                 egui::pos2(x0 + col_w - inset, y0.max(y1).max(y0.min(y1) + 3.0)),
             );
-            let selected_ev = is_sel && Some(i) == st.selected_event;
+            let selected_ev = st.is_event_selected(*id, i);
             // **整块渐变：起点（下方）→ 终点（上方）走色相**（透明度两端相同）。
             // 早先用的是"暗端乘 0.55 + 降 alpha"，那在深色预览上会糊；色相偏移更清楚，
             // 也不牺牲可见度。用 Mesh 两个顶点色，比"画很多细条"干净，也不随块高变化。
@@ -886,7 +1088,7 @@ pub fn draw(
             // 把手高亮**不在这里画**：头尾相接时两个块各有一条边落在同一条 y 上，
             // 按块各自判定会让两个把手同时亮（看起来像"一次选中了两个"）。
             // 统一放到交互阶段、用**同一个决策**（prefer_edge 的结果）画，见下面的 `blocks`。
-            blocks.push((i, r, y0, y1));
+            blocks.push((*id, i, r, y0, y1));
         }
     }
 
@@ -912,8 +1114,10 @@ pub fn draw(
         Ruler(f64),
         Axis,
         Note(usize),
-        EventEdge(usize, EventEdge),
-        EventBlock(usize),
+        /// 事件：**轨道** + 该轨道**合并视图**里的下标 + 命中哪一部分（头/尾/本体）。
+        /// 带上轨道是因为"选中优先"与"哪一块"都必须限定在这一列里 ——
+        /// 锚的下标与别的轨道毫无关系。
+        Event(TrackId, usize, EventPart),
         Pane,
     }
     let hit = ptr.map(|pos| {
@@ -941,7 +1145,7 @@ pub fn draw(
         let tr = line.track(id);
         // 收集**所有**候选，再按规则挑 —— 头尾相接时会有两个事件同时命中同一条 y
         let mut near: Vec<(usize, EventEdge, f32)> = Vec::new();
-        let mut block_hit: Option<(usize, f32)> = None;
+        let mut block_hit: Option<usize> = None;
         for (i, e) in tr.events.iter().enumerate() {
             let y0 = y_of(st.chart.tmap.beat(st.chart.tmap.sec(e.start.to_f64())));
             let y1 = y_of(st.chart.tmap.beat(st.chart.tmap.sec(e.end.to_f64())));
@@ -950,14 +1154,15 @@ pub fn draw(
                 EventPart::Start => near.push((i, EventEdge::Start, (pos.y - y0).abs())),
                 EventPart::End => near.push((i, EventEdge::End, (pos.y - y1).abs())),
                 EventPart::Body => {
-                    if block_hit.map(|(_, bd)| 0.0 < bd).unwrap_or(true) {
-                        block_hit = Some((i, 0.0));
+                    if block_hit.is_none() {
+                        block_hit = Some(i);
                     }
                 }
                 EventPart::None => {}
             }
         }
-        // 只保留最近的一批（同一条边界上会有一对），再按"选中优先 → 否则选尾巴"决定
+        // 只保留最近的一批（同一条边界上会有一对），再按"选中优先 → 否则选尾巴"决定。
+        // "选中优先"必须是**这一列上**的选中项：锚若落在别的轨道上，它的下标与本列候选无关。
         if let Some(best) = near.iter().map(|(_, _, d)| *d).fold(None, |m: Option<f32>, d| {
             Some(m.map(|x| x.min(d)).unwrap_or(d))
         }) {
@@ -966,12 +1171,21 @@ pub fn draw(
                 .filter(|(_, _, d)| (*d - best).abs() < 0.75) // 同一 y 上的都算相接
                 .map(|(i, e, _)| (*i, *e))
                 .collect();
-            if let Some((i, edge)) = prefer_edge(&cands, st.selected_event) {
-                return Hit::EventEdge(i, edge);
+            let sel_here = cands
+                .iter()
+                .find(|(i, _)| st.is_event_selected(id, *i))
+                .map(|(i, _)| *i);
+            if let Some((i, edge)) = prefer_edge(&cands, sel_here) {
+                let part = if edge == EventEdge::Start {
+                    EventPart::Start
+                } else {
+                    EventPart::End
+                };
+                return Hit::Event(id, i, part);
             }
         }
         block_hit
-            .map(|(i, _)| Hit::EventBlock(i))
+            .map(|i| Hit::Event(id, i, EventPart::Body))
             .unwrap_or(Hit::Pane)
     });
 
@@ -985,12 +1199,30 @@ pub fn draw(
     if !resp.drag_started()
         && !resp.dragged()
         && drag_edge_get(ui).is_none()
-        && drag_note_get(ui).is_none()
+        && grab_get(ui).is_none()
     {
         let code = match &hit {
-            Some(Hit::Note(i)) => Some((0u8, *i, 0u8)),
-            Some(Hit::EventEdge(i, EventEdge::Start)) => Some((1u8, *i, 0u8)),
-            Some(Hit::EventEdge(i, EventEdge::End)) => Some((2u8, *i, 0u8)),
+            Some(Hit::Note(i)) => Some(PressHit::Note(*i)),
+            Some(Hit::Event(track, i, part @ (EventPart::Start | EventPart::End))) => {
+                let edge = if *part == EventPart::Start {
+                    EventEdge::Start
+                } else {
+                    EventEdge::End
+                };
+                // 冻结**文档地址**：拖拽期间时间在变 ⇒ 合并下标会重排
+                line.track(*track)
+                    .origin(*i)
+                    .map(|at| PressHit::EventEdge {
+                        track: *track,
+                        at,
+                        view: *i,
+                        edge,
+                    })
+            }
+            Some(Hit::Event(track, i, _)) => Some(PressHit::EventBody {
+                track: *track,
+                view: *i,
+            }),
             _ => None,
         };
         press_hit_set(ui, code);
@@ -998,12 +1230,21 @@ pub fn draw(
 
     // ---- 把手高亮：**只亮一个**（与拖拽同一个决策，见 handle_to_highlight）----
     let hover_edge = match &hit {
-        Some(Hit::EventEdge(i, edge)) => Some((*i, *edge)),
+        Some(Hit::Event(_, i, EventPart::Start)) => Some((*i, EventEdge::Start)),
+        Some(Hit::Event(_, i, EventPart::End)) => Some((*i, EventEdge::End)),
         _ => None,
     };
-    let highlight = handle_to_highlight(drag_edge_get(ui), hover_edge);
+    let highlight = handle_to_highlight(drag_edge_get(ui).map(|d| (d.view, d.edge)), hover_edge);
     if let Some((i, edge)) = highlight {
-        if let Some((_, r, _, _)) = blocks.iter().find(|(bi, _, _, _)| *bi == i) {
+        // 亮的是**哪一列**上的那一条：光有下标不够（5 条轨道都有下标 i）
+        let hl_track = drag_edge_get(ui).map(|d| d.track).or(match &hit {
+            Some(Hit::Event(t, _, _)) => Some(*t),
+            _ => None,
+        });
+        if let Some((_, _, r, _, _)) = blocks
+            .iter()
+            .find(|(bt, bi, _, _, _)| Some(*bt) == hl_track && *bi == i)
+        {
             let p = ui.painter_at(rect);
             // 与待放置的 hold 用**同一个** `TimeHandle`（判定/绘制同源）
             TimeHandle::from_span(r.min.x, r.max.x, r.bottom(), r.top())
@@ -1011,11 +1252,37 @@ pub fn draw(
         }
     }
 
-    // 光标形状：事件头/尾 = **双头箭头**（ResizeVertical，上下双向）；音符 = 抓手
+    // ---- 光标形状 ----
+    //
+    // 用户要求：**多选**的音符上是四向箭头（X 与拍都能动）、事件上是上下双头箭头
+    // （事件只有时间一个轴）—— 光标说的就是"拖起来会怎么动"。
+    // 单选/未选中时保持原来的口径：音符 = 抓手，事件头尾 = 双头箭头。
+    let multi = st.selection().len() > 1;
+    // 拖这个事件会不会被"重叠"挡住？选中了就看整个选区，没选中就看它一个 —— 同一份判据
+    let blocked_event_drag = |track: TrackId, i: usize| -> bool {
+        let items: Vec<opm_app::state::EventSel> = if st.is_event_selected(track, i) {
+            st.selection().events().collect()
+        } else {
+            vec![(track, i)]
+        };
+        opm_app::edit::event_drag_disabled(st, &items)
+    };
     match &hit {
-        Some(Hit::EventEdge(_, _)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+        // 重叠事件的**块体**：光标直接说"不许拖"（按下去也只会被拒，不该先给一个可以拖的暗示）。
+        // 头/尾把手**不在此列** —— 拖把手改时间正是修重叠的那条路，它仍然好用。
+        Some(Hit::Event(t, i, EventPart::Body)) if blocked_event_drag(*t, *i) => {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+        }
+        Some(Hit::Note(i)) if multi && st.is_note_selected(*i) => {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+        }
+        Some(Hit::Event(t, i, EventPart::Body)) if multi && st.is_event_selected(*t, *i) => {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        // 事件块本体也能整块平移（只有时间一个轴）⇒ 与把手同一个光标
+        Some(Hit::Event(_, _, _)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
         Some(Hit::Note(_)) => {
-            let dragging = resp.dragged();
+            let dragging = grab_get(ui).is_some();
             ui.ctx().set_cursor_icon(if dragging {
                 egui::CursorIcon::Grabbing
             } else {
@@ -1047,29 +1314,31 @@ pub fn draw(
             if !key_pressed_once(ui, key) {
                 continue;
             }
-            // 指针在**音符区** ⇒ 放音符（hold 走跟随）；在**事件区** ⇒ 起事件块草稿
-            match ptr {
-                Some(pos) if pointer_in_notes(pos) => {
-                    if let Some(kind) = opm_app::keymap::quick_place_kind(key) {
-                        actions.push(OverlayAction::QuickPlace {
-                            kind,
-                            lane_x: st.snap_lane(lane_of_x(pos.x)),
-                            beat: st.snap_beat(beat_of(pos.y)).max(0.0),
-                        });
-                    }
+            let in_notes = ptr.map(pointer_in_notes).unwrap_or(false);
+            let in_events = ptr.and_then(event_col_of).is_some();
+            match quick_key_rule(key, in_notes, in_events) {
+                QuickKey::Note(kind) => {
+                    let pos = ptr.expect("in_notes 只可能来自指针");
+                    actions.push(OverlayAction::QuickPlace {
+                        kind,
+                        lane_x: st.snap_lane(lane_of_x(pos.x)),
+                        beat: st.snap_beat(beat_of(pos.y)).max(0.0),
+                    });
                 }
-                Some(pos) => match event_col_of(pos) {
-                    Some((track, _)) => actions.push(OverlayAction::StartEventDraft {
+                QuickKey::EventDraft => {
+                    let pos = ptr.expect("in_events 只可能来自指针");
+                    let (track, _) = event_col_of(pos).expect("in_events 只可能来自指针");
+                    actions.push(OverlayAction::StartEventDraft {
                         track,
                         beat: st.snap_beat(beat_of(pos.y)).max(0.0),
-                    }),
-                    // 指针不在音符区也不在事件区（标尺上）：**说清楚为什么没反应**
-                    None => actions.push(OverlayAction::Notice(
-                        "快速放置要把指针放在音符区或事件区里，再按 Q/W/E/R".to_owned(),
-                    )),
-                },
-                None => actions.push(OverlayAction::Notice(
-                    "快速放置要把指针放在音符区或事件区里，再按 Q/W/E/R".to_owned(),
+                    });
+                }
+                // **事件区里按 Q/W/E：什么都不做**（用户要求）。
+                // 它们只对音符有意义，先前这里会拿它们去起事件草稿 —— 那是误触。
+                QuickKey::Nothing => {}
+                // 指针不在两个半区里（标尺上/轴带上）：**说清楚为什么没反应**
+                QuickKey::Outside => actions.push(OverlayAction::Notice(
+                    "快速放置：音符区用 Q/W/E/R，事件区只有 R（指针要放在半区里）".to_owned(),
                 )),
             }
         }
@@ -1181,58 +1450,111 @@ pub fn draw(
         }
     }
 
-    // 拖拽与点选：互不嵌套
-    // 拖拽：分三段处理，且**位置更新在"开始的那一帧"也要发**。
+    // ---- 框选 / 组拖动 / 点选：互不嵌套 ----
+    //
+    // 三段各自判"这一帧有没有在拖"，优先级就是下面的顺序：
+    // **Shift+左键 = 框选**（显式意图，最先判）→ **拖动**（把手 / 整组）→ **点选**。
     //
     // 这一条是踩出来的：egui 把"刚判定为拖拽"的那一帧标记为 `drag_started`（`dragged` 同时为真），
     // 早先写成 `if drag_started {..} else if dragged {..}` ⇒ 那一帧被跳过，于是
     // "按下→小幅移动→松开"这类**快速拖拽一次位置更新都发不出去**（看上去就是拖不动）。
+    let shift = ui.input(|i| i.modifiers.shift);
+    let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+
     if resp.drag_started() {
-        // 用**按下时**的命中（不是当前命中）：拖拽阈值会让指针先移开那 6px 的把手段
-        match press_hit_get(ui) {
-            Some((1, i, _)) | Some((2, i, _)) => {
-                let edge = if matches!(press_hit_get(ui), Some((1, ..))) {
-                    EventEdge::Start
-                } else {
-                    EventEdge::End
-                };
-                let k = (((ptr.map(|p| p.x).unwrap_or(ev_pane.min.x) - ev_pane.min.x) / col_w)
-                    .floor() as usize)
-                    .min(lanes - 1);
-                actions.push(OverlayAction::SelectTrack(TrackId::ALL[k]));
-                actions.push(OverlayAction::SelectEvent(i));
-                actions.push(OverlayAction::EventResizeStart);
-                drag_edge_set(ui, Some((i, edge)));
+        // **按下时**的指针位置（不是"刚判定为拖拽"那一刻的）：egui 要等指针移开几个像素才
+        // 认定拖拽，那时指针已经跑了；`press_origin` 给的就是按下去的那一点 ——
+        // 框选的起始半区、抓手的原点都必须取它，否则"起始点定半区"会按错半区、
+        // 被拖的东西也会凭空跳一个拖拽阈值的距离。
+        let press = ui
+            .input(|i| i.pointer.press_origin())
+            .or(resp.interact_pointer_pos())
+            .or(hover_pos);
+        // 框选的**起始点定半区**（用户要求：框跨过两区时以起始点判断选哪一类）。
+        // 半区在这一刻定下来，之后往哪拖都不改。
+        let box_kind = press.and_then(|pos| {
+            if pointer_in_notes(pos) {
+                Some(SelKind::Notes)
+            } else if event_col_of(pos).is_some() {
+                Some(SelKind::Events)
+            } else {
+                None // 标尺/轴带上起手：不框选（那里没有可选的东西）
             }
-            Some((0, i, _)) => {
-                actions.push(OverlayAction::SelectNote(i));
-                actions.push(OverlayAction::NoteDragStart);
-                drag_note_set(ui, Some(i));
+        });
+        if shift {
+            if let (Some(pos), Some(k)) = (press, box_kind) {
+                box_set(ui, Some((pos, k)));
             }
-            _ => {}
+        } else {
+            // 用**按下时**的命中（不是当前命中）：拖拽阈值会让指针先移开那 6px 的把手段
+            match press_hit_get(ui) {
+                Some(PressHit::EventEdge { track, at, view, edge }) => {
+                    // 选了一组时，压住其中一块的**任何位置**都是"整组平移"
+                    // （用户要求：多选事件上悬停 = 上下双向箭头 = 可以统一拖动位置）
+                    if st.is_event_selected(track, view) && st.selection().len() > 1 {
+                        if let Some(q) = press {
+                            let (lane, beat) = (lane_of_x(q.x), beat_of(q.y));
+                            start_grab(ui, st, None, Some((track, view)), lane, beat, actions);
+                        }
+                    } else {
+                        actions.push(OverlayAction::SelectTrack(track));
+                        actions.push(OverlayAction::SelectEvent(view));
+                        actions.push(OverlayAction::EventResizeStart);
+                        drag_edge_set(ui, Some(EdgeDrag { track, at, view, edge }));
+                    }
+                }
+                Some(PressHit::Note(i)) => {
+                    if let Some(q) = press {
+                        start_grab(ui, st, Some(i), None, lane_of_x(q.x), beat_of(q.y), actions);
+                    }
+                }
+                Some(PressHit::EventBody { track, view }) => {
+                    if let Some(q) = press {
+                        start_grab(
+                            ui,
+                            st,
+                            None,
+                            Some((track, view)),
+                            lane_of_x(q.x),
+                            beat_of(q.y),
+                            actions,
+                        );
+                    }
+                }
+                None => {}
+            }
         }
     }
     if resp.drag_started() || resp.dragged() {
-        if let Some((i, edge)) = drag_edge_get(ui) {
+        if let Some(d) = drag_edge_get(ui) {
             if let Some(pos) = ptr {
                 // 头/尾按**拍网格**吸附（它调的就是时间）
                 actions.push(OverlayAction::EventResize {
-                    index: i,
-                    edge,
+                    track: d.track,
+                    at: d.at,
+                    edge: d.edge,
                     beat: st.snap_beat(beat_of(pos.y)).max(0.0),
                 });
             }
-        } else if let Some(i) = drag_note_get(ui) {
-            if let (Some(pos), Some(n)) = (ptr, line.notes.get(i)) {
-                let lane = lane_of_x(pos.x); // 逆映射带上窗口偏移（否则平移后"拖到哪 = 吸到哪"会错位）
-                // 音符**总是**落在两轴网格的交叉点（横向 laneX、纵向拍都吸附）
-                actions.push(OverlayAction::NoteDrag {
-                    index: i,
-                    doc_index: n.doc_index,
-                    lane_x: st.snap_lane(lane),
-                    beat: st.snap_beat(beat_of(pos.y)).max(0.0),
-                });
+        } else if let Some(g) = grab_get(ui) {
+            if let Some(pos) = ptr {
+                // 吸附与"最近合法位置"都在库里（`edit::grab_delta`，纯函数有单测）；
+                // 面板只负责把"指针在哪"换算成 laneX/拍。
+                let (d_lane, d_beat) =
+                    opm_app::edit::grab_delta(st, &g, lane_of_x(pos.x), beat_of(pos.y));
+                actions.push(OverlayAction::GrabMove { d_lane, d_beat });
             }
+        }
+        // 框选：把框画出来（`drag_started` 那一帧也要画，否则第一帧看不到框）
+        if let (Some((start, kind)), Some(cur)) = (box_get(ui), ptr) {
+            let b = egui::Rect::from_two_pos(start, cur);
+            let col = match kind {
+                SelKind::Notes => egui::Color32::from_rgb(150, 190, 255),
+                SelKind::Events => egui::Color32::from_rgb(255, 200, 120),
+            };
+            let p = ui.painter_at(rect);
+            p.rect_filled(b, 0.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24));
+            p.rect_stroke(b, 0.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Inside);
         }
     } else if resp.drag_stopped() {
         press_hit_set(ui, None);
@@ -1240,9 +1562,28 @@ pub fn draw(
             actions.push(OverlayAction::EventResizeEnd);
             drag_edge_set(ui, None);
         }
-        if drag_note_get(ui).is_some() {
-            actions.push(OverlayAction::NoteDragEnd);
-            drag_note_set(ui, None);
+        if grab_get(ui).is_some() {
+            actions.push(OverlayAction::GrabEnd);
+            grab_set(ui, None);
+        }
+        if let Some((start, kind)) = box_get(ui) {
+            // 框选落地：**只按起始点定下的那一类**算命中（另一类的矩形根本不看）
+            let b = egui::Rect::from_two_pos(start, ptr.unwrap_or(start));
+            match kind {
+                SelKind::Notes => {
+                    actions.push(OverlayAction::SelectNotes(box_hits(&note_rects, b)));
+                }
+                SelKind::Events => {
+                    let rects: Vec<(usize, egui::Rect)> =
+                        blocks.iter().enumerate().map(|(n, b)| (n, b.2)).collect();
+                    let picked: Vec<(TrackId, usize)> = box_hits(&rects, b)
+                        .into_iter()
+                        .map(|n| (blocks[n].0, blocks[n].1))
+                        .collect();
+                    actions.push(OverlayAction::SelectEvents(picked));
+                }
+            }
+            box_set(ui, None);
         }
     } else if resp.double_clicked() {
         if let Some(Hit::Pane) = hit {
@@ -1257,18 +1598,30 @@ pub fn draw(
             }
         }
     } else if resp.clicked() && !st.drafting() {
-        // 草稿期间不点选（那时候左键是"放下"）—— 见 `drafting` 那一段
-        match hit {
-            Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
-            Some(Hit::Note(i)) => actions.push(OverlayAction::SelectNote(i)),
-            Some(Hit::EventEdge(i, _)) | Some(Hit::EventBlock(i)) => {
-                if let Some(pos) = ptr {
-                    let k = (((pos.x - ev_pane.min.x) / col_w).floor() as usize).min(lanes - 1);
-                    actions.push(OverlayAction::SelectTrack(TrackId::ALL[k]));
+        // 草稿期间不点选（那时候左键是"放下"）—— 见 `drafting` 那一段。
+        // **Shift+单击什么都不做**：Shift+拖动是框选，而"没拖动起来"的那一下
+        // 不该顺手把选区清掉（那是用户看得见的数据丢失感）。
+        if !shift {
+            match hit {
+                // 标尺只挪播放头：它和选区没关系，点它不该把选区清掉
+                Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
+                // Ctrl+左键：在"选中 / 未选中"之间切换（用户要求）
+                Some(Hit::Note(i)) => actions.push(if ctrl {
+                    OverlayAction::ToggleNote(i)
+                } else {
+                    OverlayAction::SelectNote(i)
+                }),
+                Some(Hit::Event(t, i, _)) => {
+                    if ctrl {
+                        actions.push(OverlayAction::ToggleEvent(t, i));
+                    } else {
+                        actions.push(OverlayAction::SelectTrack(t));
+                        actions.push(OverlayAction::SelectEvent(i));
+                    }
                 }
-                actions.push(OverlayAction::SelectEvent(i));
+                // 点空白/轴带：清空选区（多选之后总得有个"全不选"的手势）
+                _ => actions.push(OverlayAction::ClearSelection),
             }
-            _ => {}
         }
     }
 }
@@ -1303,7 +1656,7 @@ mod tests {
         doc.judge_lines.push(l);
         let mut st = EditorState::new(chart_from_doc(&doc));
         st.selected_track = TrackId::Alpha;
-        st.selected_event = Some(0);
+        st.select_event(TrackId::Alpha, 0);
         st
     }
 
@@ -1333,7 +1686,7 @@ mod tests {
     #[test]
     fn hover_on_shared_boundary_hits_single_event() {
         let mut st = state_with_events(); // alpha 轨道：事件 0 = [0,16)、事件 1 = [16,32)（头尾相接）
-        st.selected_event = None;
+        st.clear_event_selection();
         st.selected_track = TrackId::Alpha;
         // **显式钉住缩放**，不要吃默认值：默认可见拍数是个视图偏好（8 拍，用户要求拉长 4 倍之后），
         // 它一变，"beat 16 在屏幕外"就会让这条测试莫名其妙地红 —— 之前就是这么红的。
@@ -1389,7 +1742,7 @@ mod tests {
         // 反例：把事件 1 设为选中，同样的位置应改为抓**事件 1 的头**
         let mut all2: Vec<String> = Vec::new();
         let mut st2 = state_with_events();
-        st2.selected_event = Some(1);
+        st2.select_event(TrackId::Alpha, 1);
         st2.overlay_beats = st.overlay_beats; // 缩放也要一致（坐标是用上面的 y_boundary 算的）
         // **换一个 Context**：egui 的临时内存（拖拽状态）按 Id 存在 Context 里，
         // 复用同一个 Context 会让第一段序列的拖拽状态延续到第二段（测试里踩过）
@@ -1566,6 +1919,419 @@ mod tests {
         assert_eq!(st.window_offset_x, EditorState::WINDOW_OFFSET_MAX);
         st.set_window_offset_x(f32::NAN);
         assert_eq!(st.window_offset_x, 0.0);
+    }
+
+    /// **框选**：矩形相交就算选中；与"画出来的矩形"是同一份几何（纯函数，直接喂矩形）
+    #[test]
+    fn box_hits_are_intersection_based() {
+        let rects = [
+            (0usize, egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(20.0, 20.0))),
+            (1, egui::Rect::from_min_max(egui::pos2(30.0, 30.0), egui::pos2(40.0, 40.0))),
+            (2, egui::Rect::from_min_max(egui::pos2(50.0, 50.0), egui::pos2(60.0, 60.0))),
+        ];
+        // 只碰到第 1 个
+        let b = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(15.0, 15.0));
+        assert_eq!(box_hits(&rects, b), vec![0]);
+        // 框住两个
+        let b = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(45.0, 45.0));
+        assert_eq!(box_hits(&rects, b), vec![0, 1]);
+        // 从左下往右上拉（矩形没规范化时也照样算）
+        let b = egui::Rect::from_two_pos(egui::pos2(65.0, 65.0), egui::pos2(45.0, 45.0));
+        assert_eq!(box_hits(&rects, b), vec![2]);
+        // 空框：什么都不选（"点空白清空"就是它）
+        let b = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(101.0, 101.0));
+        assert!(box_hits(&rects, b).is_empty());
+    }
+
+    /// **快速放置的键位规则**（用户定）：音符区 Q/W/E/R，事件区**只有 R**，别处给提示。
+    /// 这条踩过：事件区里按 Q/W/E 也会起一个事件草稿 —— 那是误触。
+    #[test]
+    fn quick_keys_are_per_pane() {
+        use opm_app::doc::NoteKind;
+        for (key, want) in [
+            (egui::Key::Q, NoteKind::Tap),
+            (egui::Key::W, NoteKind::Flick),
+            (egui::Key::E, NoteKind::Drag),
+            (egui::Key::R, NoteKind::Hold),
+        ] {
+            assert_eq!(
+                quick_key_rule(key, true, false),
+                QuickKey::Note(want),
+                "{key:?} 在音符区应放 {want:?}"
+            );
+        }
+        // 事件区：只有 R
+        assert_eq!(quick_key_rule(egui::Key::R, false, true), QuickKey::EventDraft);
+        for key in [egui::Key::Q, egui::Key::W, egui::Key::E] {
+            assert_eq!(quick_key_rule(key, false, true), QuickKey::Nothing, "{key:?} 应无反应");
+        }
+        // 不在任何半区（标尺/轴带）：说一句话
+        for key in [egui::Key::Q, egui::Key::R] {
+            assert_eq!(quick_key_rule(key, false, false), QuickKey::Outside);
+        }
+    }
+
+    /// **框选**（Shift+左键）：起始点定半区 ⇒ 框跨到另一半也不改选哪一类。
+    /// 用无头 egui 真的走一遍指针事件序列。
+    #[test]
+    fn shift_drag_boxes_the_notes_of_the_half_it_started_in() {
+        let mut st = state_with_events();
+        st.overlay_beats = 32.0;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        // 修饰键状态是 `InputState.modifiers`，**只由 `Event::ModifiersChanged` 更新**
+        // （egui 0.36 的 `RawInput` 没有 modifiers 字段；事件自带的那份不会写进状态）。
+        // 真实运行时由窗口层发这个事件，测试里就得自己喂一次。
+        let shift_mods = egui::Modifiers { shift: true, ..Default::default() };
+        let mut all: Vec<String> = Vec::new();
+        let pass = |events: Vec<egui::Event>, all: &mut Vec<String>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            for a in &acts {
+                all.push(format!("{a:?}"));
+            }
+        };
+        // 起手在**音符区**的左上角，往右下拖到事件区里去（跨过轴带）
+        let from = egui::pos2(30.0, 40.0);
+        let to = egui::pos2(700.0, 380.0);
+        let shift = shift_mods;
+        pass(vec![egui::Event::ModifiersChanged(shift)], &mut all);
+        pass(vec![egui::Event::PointerMoved(from)], &mut all);
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: shift,
+            }],
+            &mut all,
+        );
+        pass(vec![egui::Event::PointerMoved(to)], &mut all);
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: shift,
+            }],
+            &mut all,
+        );
+        assert!(
+            all.iter().any(|a| a.starts_with("SelectNotes(")),
+            "起始点在音符区 ⇒ 只选音符；实际 {all:?}"
+        );
+        assert!(
+            !all.iter().any(|a| a.starts_with("SelectEvents(")),
+            "框跨到事件区也不该改选事件（起始点定半区）；实际 {all:?}"
+        );
+
+        // 反例：起手在事件区 ⇒ 只选事件
+        let ctx2 = egui::Context::default();
+        let mut all2: Vec<String> = Vec::new();
+        let pass2 = |events: Vec<egui::Event>, out: &mut Vec<String>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut o = ctx2.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            o.textures_delta.clear();
+            for a in &acts {
+                out.push(format!("{a:?}"));
+            }
+        };
+        let ev_from = egui::pos2(700.0, 380.0);
+        let ev_to = egui::pos2(30.0, 40.0);
+        pass2(vec![egui::Event::ModifiersChanged(shift)], &mut all2);
+        pass2(vec![egui::Event::PointerMoved(ev_from)], &mut all2);
+        pass2(
+            vec![egui::Event::PointerButton {
+                pos: ev_from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: shift,
+            }],
+            &mut all2,
+        );
+        pass2(vec![egui::Event::PointerMoved(ev_to)], &mut all2);
+        pass2(
+            vec![egui::Event::PointerButton {
+                pos: ev_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: shift,
+            }],
+            &mut all2,
+        );
+        assert!(
+            all2.iter().any(|a| a.starts_with("SelectEvents(")),
+            "起始点在事件区 ⇒ 只选事件；实际 {all2:?}"
+        );
+        assert!(
+            !all2.iter().any(|a| a.starts_with("SelectNotes(")),
+            "不该顺手把音符也选了；实际 {all2:?}"
+        );
+    }
+
+    /// **Ctrl+左键 = 在多选里切换**；不带修饰键 = 替换成它一个。
+    /// 光标也按用户要求分档：多选里的音符 = 四向箭头，事件 = 上下双头箭头。
+    #[test]
+    fn ctrl_click_toggles_and_multi_selection_shows_the_move_cursor() {
+        let mut st = state_with_events();
+        st.overlay_beats = 32.0;
+        // 先造一个多选（音符在这里没有，用事件：alpha 轨道两条）
+        st.select_events([(TrackId::Alpha, 0), (TrackId::Alpha, 1)]);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        let body = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + RULER_H), rect.max);
+        let anchor = st.chart.tmap.beat(st.playhead) - cfg.lead_beats;
+        let axis_max = rect.center().x + AXIS_W * 0.5;
+        let ev_w = (rect.max.x - axis_max) / 5.0;
+        let x = axis_max + ev_w * 3.5; // alpha 列
+        let y = beat_y(body, anchor, st.overlay_beats, 8.0); // 第 0 条事件的块体
+
+        let mut all: Vec<String> = Vec::new();
+        let mut cursors: Vec<egui::CursorIcon> = Vec::new();
+        let ctrl_mods = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        let pass = |events: Vec<egui::Event>,
+                    all: &mut Vec<String>,
+                    cursors: &mut Vec<egui::CursorIcon>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            cursors.push(out.platform_output.cursor_icon);
+            out.textures_delta.clear();
+            for a in &acts {
+                all.push(format!("{a:?}"));
+            }
+        };
+        // 悬停在多选中的一条事件上：光标应是上下双头箭头。
+        // **两帧**：第一帧 egui 才刚知道指针进了这个控件（`hover_pos` 还没有值）。
+        let hover = egui::Event::PointerMoved(egui::pos2(x, y));
+        pass(vec![hover.clone()], &mut all, &mut cursors);
+        pass(vec![hover], &mut all, &mut cursors);
+        assert!(
+            cursors.contains(&egui::CursorIcon::ResizeVertical),
+            "多选事件上应是上下双头箭头；实际 {cursors:?}"
+        );
+        // Ctrl+左键：切换（Debug 形式里带 ToggleEvent）
+        // Ctrl 状态：一次 `ModifiersChanged` 之后一直有效（指针事件自带的那份不写状态）
+        pass(vec![egui::Event::ModifiersChanged(ctrl_mods)], &mut all, &mut cursors);
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: ctrl_mods,
+            }],
+            &mut all,
+            &mut cursors,
+        );
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: ctrl_mods,
+            }],
+            &mut all,
+            &mut cursors,
+        );
+        assert!(
+            all.iter().any(|a| a.starts_with("ToggleEvent(")),
+            "Ctrl+左键应产出 ToggleEvent；实际 {all:?}"
+        );
+    }
+
+    /// **多选整体拖动**：按下多选里的一条 → `GrabStart`（带着冻结的抓手）→ 拖动发 `GrabMove`
+    #[test]
+    fn dragging_a_multi_selection_emits_a_frozen_grab() {
+        let mut st = state_with_events();
+        st.overlay_beats = 32.0;
+        st.select_events([(TrackId::Alpha, 0), (TrackId::Alpha, 1)]);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        let body = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + RULER_H), rect.max);
+        let anchor = st.chart.tmap.beat(st.playhead) - cfg.lead_beats;
+        let axis_max = rect.center().x + AXIS_W * 0.5;
+        let ev_w = (rect.max.x - axis_max) / 5.0;
+        let x = axis_max + ev_w * 3.5;
+        let y = beat_y(body, anchor, st.overlay_beats, 8.0);
+
+        let mut all: Vec<String> = Vec::new();
+        let mut grabbed: Vec<opm_app::edit::Grab> = Vec::new();
+        let pass = |events: Vec<egui::Event>,
+                    all: &mut Vec<String>,
+                    grabbed: &mut Vec<opm_app::edit::Grab>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            for a in &acts {
+                if let OverlayAction::GrabStart(g) = a {
+                    grabbed.push((**g).clone());
+                }
+                all.push(format!("{a:?}"));
+            }
+        };
+        pass(vec![egui::Event::PointerMoved(egui::pos2(x, y))], &mut all, &mut grabbed);
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            &mut all,
+            &mut grabbed,
+        );
+        pass(vec![egui::Event::PointerMoved(egui::pos2(x, y - 20.0))], &mut all, &mut grabbed);
+        assert_eq!(grabbed.len(), 1, "按下多选里的一条应冻结一个抓手：{all:?}");
+        let g = &grabbed[0];
+        assert_eq!(g.kind, SelKind::Events);
+        assert_eq!(g.events.len(), 2, "整组都要在抓手里面");
+        assert!(
+            all.iter().any(|a| a.starts_with("GrabMove")),
+            "拖动中要发位移：{all:?}"
+        );
+        assert!(
+            !all.iter().any(|a| a.starts_with("EventResizeStart")),
+            "多选整体拖动不该被当成拖把手；实际 {all:?}"
+        );
+        // 松开：结束事务
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y - 20.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &mut all,
+            &mut grabbed,
+        );
+        assert!(all.iter().any(|a| a == "GrabEnd"), "松开要结束拖动：{all:?}");
+    }
+
+    /// **卷进重叠的事件不许拖动**（用户要求）：按下不发 `GrabStart`，而是给一句话；
+    /// 光标也直接变成"禁止"。重叠要靠拖头/尾把手或冲突浏览器解决。
+    #[test]
+    fn an_overlapping_event_refuses_to_be_dragged() {
+        // 造一份"有重叠"的文档：alpha [0,16) / [8,24) / [16,32) —— 中间那块与第一块重叠
+        let mut st;
+        {
+            let mut d = Document::default();
+            d.bpm_list = vec![BpmEntry {
+                start: Beat::zero(),
+                bpm: 180.0,
+                foreign: Default::default(),
+            }];
+            d.judge_lines.clear();
+            let mut l = JudgeLine::default();
+            for (a, b) in [(0.0, 16.0), (8.0, 24.0), (16.0, 32.0)] {
+                l.layers[0].track_mut("alpha").unwrap().push(Event::new(
+                    Beat::new(a as i64, 1),
+                    Beat::new(b as i64, 1),
+                    json!(1.0),
+                    json!(1.0),
+                    "linear",
+                ));
+            }
+            d.judge_lines.push(l);
+            st = EditorState::new(chart_from_doc(&d));
+        }
+        st.overlay_beats = 32.0;
+        // 选中中间那块（它和第一块重叠）⇒ 拖动应被禁用
+        st.select_event(TrackId::Alpha, 0);
+        assert!(
+            opm_app::edit::selection_has_event_overlap(&st),
+            "用例本身要真的重叠（[0,16) 与 [8,24)）"
+        );
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        let body = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + RULER_H), rect.max);
+        let anchor = st.chart.tmap.beat(st.playhead) - cfg.lead_beats;
+        let axis_max = rect.center().x + AXIS_W * 0.5;
+        let ev_w = (rect.max.x - axis_max) / 5.0;
+        let x = axis_max + ev_w * 3.5; // alpha 列
+        let y = beat_y(body, anchor, st.overlay_beats, 4.0); // 第一块的块体
+
+        let mut all: Vec<String> = Vec::new();
+        let mut cursors: Vec<egui::CursorIcon> = Vec::new();
+        let pass = |events: Vec<egui::Event>,
+                    all: &mut Vec<String>,
+                    cursors: &mut Vec<egui::CursorIcon>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            cursors.push(out.platform_output.cursor_icon);
+            out.textures_delta.clear();
+            for a in &acts {
+                all.push(format!("{a:?}"));
+            }
+        };
+        let hover = egui::Event::PointerMoved(egui::pos2(x, y));
+        pass(vec![hover.clone()], &mut all, &mut cursors);
+        pass(vec![hover], &mut all, &mut cursors);
+        assert!(
+            cursors.contains(&egui::CursorIcon::NotAllowed),
+            "重叠事件上应是「禁止」光标；实际 {cursors:?}"
+        );
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            &mut all,
+            &mut cursors,
+        );
+        pass(
+            vec![egui::Event::PointerMoved(egui::pos2(x, y - 20.0))],
+            &mut all,
+            &mut cursors,
+        );
+        assert!(
+            !all.iter().any(|a| a.starts_with("GrabStart")),
+            "重叠事件不该开始拖动：{all:?}"
+        );
+        assert!(
+            all.iter().any(|a| a.starts_with("Notice") && a.contains("重叠")),
+            "要说明为什么不动：{all:?}"
+        );
     }
 
     /// **标注精度随缩放变化**（用户要求"时间轴数字标注应对应产生不同精度"）。
@@ -1794,14 +2560,22 @@ mod tests {
             );
         }
 
-        // 指针在**事件区**：起一个事件块草稿（用户要求：事件区按键跟 hold 一样能造东西）
-        let out = press(outside, egui::Key::Q);
+        // 指针在**事件区**：**只有 R** 起事件块草稿。
+        let out = press(outside, egui::Key::R);
         let start = out
             .iter()
             .find(|a| a.starts_with("StartEventDraft"))
-            .unwrap_or_else(|| panic!("事件区按键应起草稿：{out:?}"));
+            .unwrap_or_else(|| panic!("事件区按 R 应起草稿：{out:?}"));
         assert!(start.contains("track: "), "要带上轨道：{start}");
         assert!(!out.iter().any(|a| a.starts_with("QuickPlace")));
+        // **Q/W/E 在事件区没有反应**（用户报的误触：它们只对音符有意义）
+        for k in [egui::Key::Q, egui::Key::W, egui::Key::E] {
+            let out = press(outside, k);
+            assert!(
+                out.is_empty(),
+                "{k:?} 在事件区不该有任何反应，实际 {out:?}"
+            );
+        }
 
         // 指针在标尺上（既不在音符区也不在事件区）：给一句话，而不是什么都不做
         let ruler = egui::pos2(180.0, 5.0);
@@ -1888,13 +2662,19 @@ mod tests {
         // 事件区：左半边是音符区、右半边是事件列（中间还有轴带）⇒ 取靠右的位置
         let ev_pos = egui::pos2(700.0, 360.0);
 
-        // 第 0 帧：指针就位 + 补一个 release（键盘是有状态的）
-        pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::Q, false)], &ctx);
-        let acts = pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::Q, true)], &ctx);
+        // 第 0 帧：指针就位 + 补一个 release（键盘是有状态的）。
+        // 事件区**只认 R**（Q/W/E 在那里没有反应 —— 用户报的误触）。
+        pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::R, false)], &ctx);
+        let acts = pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::R, true)], &ctx);
         assert!(
             acts.iter().any(|a| a.starts_with("StartEventDraft")),
-            "事件区按键应起草稿：{acts:?}"
+            "事件区按 R 应起草稿：{acts:?}"
         );
+        for k in [egui::Key::Q, egui::Key::W, egui::Key::E] {
+            pass(&st, vec![key(k, false)], &ctx);
+            let acts = pass(&st, vec![key(k, true)], &ctx);
+            assert!(acts.is_empty(), "{k:?} 在事件区不该有反应：{acts:?}");
+        }
 
         // 进入草稿状态（调用方本来会这么做）后：移动鼠标 ⇒ 跟随
         st.begin_pending_event(TrackId::MoveX, 2.0);
@@ -2245,6 +3025,7 @@ mod tests {
         // 每帧把 egui 要求的光标也收下来：光标图标没法截图（自截屏只有应用自己的帧缓冲，
         // 系统光标是合成器画的），但 egui 会把它写在 platform_output 里 —— 一样能断言。
         let mut cursors: Vec<egui::CursorIcon> = Vec::new();
+        // 这个闭包**捕获**了 `cursors` 并往里 push ⇒ 必须 `mut`
         let mut pass = |events: Vec<egui::Event>, all: &mut Vec<String>| {
             let mut acts: Vec<OverlayAction> = Vec::new();
             let raw = egui::RawInput {
@@ -2266,7 +3047,8 @@ mod tests {
                         format!("EventResize({edge:?},{beat:.3})")
                     }
                     OverlayAction::EventResizeEnd => "EventResizeEnd".to_owned(),
-                    OverlayAction::NoteDragStart => "NoteDragStart".to_owned(),
+                    OverlayAction::GrabStart(_) => "GrabStart".to_owned(),
+                    OverlayAction::GrabEnd => "GrabEnd".to_owned(),
                     OverlayAction::SelectEvent(i) => format!("SelectEvent({i})"),
                     OverlayAction::SelectTrack(t) => format!("SelectTrack({})", t.key()),
                     OverlayAction::SelectNote(i) => format!("SelectNote({i})"),

@@ -208,6 +208,36 @@ impl Trace {
     }
 }
 
+/// `OPM_KEY_AUTO` 的一小片语法：`[ctrl+][shift+]键名` → `(修饰键, egui::Key)`。
+///
+/// 只认够用的那几个（这是自动化钩子，不是键盘映射表）：`ctrl` / `shift` / `alt` 前缀，
+/// 键名走 `egui::Key` 的名字（`Delete`、`Z`、`A`…大小写都收）。
+fn parse_key_spec(spec: &str) -> (egui::Modifiers, Option<egui::Key>) {
+    let mut mods = egui::Modifiers::NONE;
+    let mut name = spec.trim();
+    loop {
+        let low = name.to_ascii_lowercase();
+        if let Some(rest) = low.strip_prefix("ctrl+") {
+            mods.ctrl = true;
+            mods.command = true;
+            name = &name[name.len() - rest.len()..];
+        } else if let Some(rest) = low.strip_prefix("shift+") {
+            mods.shift = true;
+            name = &name[name.len() - rest.len()..];
+        } else if let Some(rest) = low.strip_prefix("alt+") {
+            mods.alt = true;
+            name = &name[name.len() - rest.len()..];
+        } else {
+            break;
+        }
+    }
+    let key = egui::Key::ALL
+        .iter()
+        .find(|k| format!("{k:?}").eq_ignore_ascii_case(name.trim()))
+        .copied();
+    (mods, key)
+}
+
 fn main() -> eframe::Result<()> {
     let mut trace = Trace::new(
         std::env::var("OPM_TRACE_STARTUP").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0"),
@@ -923,8 +953,16 @@ struct App {
     save_format: core::SaveFormat,
     h_held: bool,
     overlay_visible: bool,
+    /// `OPM_KEY_AUTO` 的待办：`(第几帧, 按键表)`，`;` 分隔成多组。
+    /// 到点注入一次就取走 —— 按键是"一次"，不是每帧（`30:Delete;60:ctrl+z` 这类序列靠它）。
+    key_auto: Vec<(u32, String)>,
     /// 是否正处在一次拖拽事务中（结束时 commit）
     drag_active: bool,
+    /// 正在拖的**组**（按下那一刻冻结的抓手）。
+    ///
+    /// 拖拽期间文档一直在变（每帧都发命令），所以"原来在哪"不能从文档反推 ——
+    /// 抓手就是那份冻住的原点；结束（`GrabEnd`）就丢掉。
+    grab: Option<opm_app::edit::Grab>,
     /// **事件重叠**列表：加载谱面时全量检测，之后每次改动只重查动过的那条线
     conflicts: Vec<cmd::Overlap>,
     /// 冲突浏览器面板是否展开（有冲突时自动展开）
@@ -1121,7 +1159,23 @@ impl App {
             save_format: core::SaveFormat::Auto,
             h_held: false,
             overlay_visible: ov_enabled,
+            key_auto: std::env::var("OPM_KEY_AUTO")
+                .ok()
+                .map(|s| {
+                    // `[帧号:]按键[,按键]`，多组用 `;` 分隔；不写帧号就是第 1 帧
+                    s.split(';')
+                        .filter(|g| !g.trim().is_empty())
+                        .map(|g| match g.split_once(':') {
+                            Some((n, rest)) if n.trim().parse::<u32>().is_ok() => {
+                                (n.trim().parse().unwrap(), rest.to_owned())
+                            }
+                            _ => (1, g.to_owned()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             drag_active: false,
+            grab: None,
             conflicts,
             show_conflicts,
             meta_name,
@@ -1211,18 +1265,46 @@ impl App {
         for a in acts {
             match a {
                 OverlayAction::SelectNote(i) => {
-                    self.state.selected_note = Some(i);
+                    self.state.select_note(i);
+                    sel_changed = true;
+                }
+                // 框选：整批**替换**选区（空集 = 清空）—— 与点选走同一份状态
+                OverlayAction::SelectNotes(v) => {
+                    self.state.select_notes(v);
+                    sel_changed = true;
+                }
+                // Ctrl+左键：切换单个（跨半区时选区会整体换成那一类，见 `Selection::toggle_*`）
+                OverlayAction::ToggleNote(i) => {
+                    self.state.toggle_note_selection(i);
                     sel_changed = true;
                 }
                 OverlayAction::SelectTrack(id) => {
                     if self.state.selected_track != id {
                         self.state.selected_track = id;
-                        self.state.selected_event = None;
+                        self.state.clear_event_selection();
                         sel_changed = true;
                     }
                 }
                 OverlayAction::SelectEvent(i) => {
-                    self.state.selected_event = Some(i);
+                    self.state.select_event(self.state.selected_track, i);
+                    sel_changed = true;
+                }
+                OverlayAction::SelectEvents(v) => {
+                    // 框选可能横跨几条轨道：先把当前轨道挪到**其中最多的一条**上，
+                    // 检查器才有东西可显示（锚会落到它里面，见 `set_events`）
+                    if let Some((t, _)) = v.first() {
+                        self.state.selected_track = *t;
+                    }
+                    self.state.select_events(v);
+                    sel_changed = true;
+                }
+                OverlayAction::ToggleEvent(t, i) => {
+                    self.state.toggle_event_selection(t, i);
+                    sel_changed = true;
+                }
+                // 点空白：清空选区（选区是视图状态，不动文档、不进撤销栈）
+                OverlayAction::ClearSelection => {
+                    self.state.clear_selection();
                     sel_changed = true;
                 }
                 OverlayAction::SeekBeat(b) => {
@@ -1237,19 +1319,24 @@ impl App {
                     // Ctrl+滚轮：纯视图缩放，**不进文档**（谱面里没有"可见拍数"这个字段）
                     self.state.zoom_by(f);
                 }
-                OverlayAction::NoteDragStart => {
-                    // 整段拖拽 = **一个撤销步**：用事务包住，逐条改动仍然广播（面板实时更新）
+                // ---- 组拖动：整段 = **一个撤销步**（逐条改动仍然广播，面板实时更新）----
+                //
+                // 抓手（`edit::Grab`）是按下那一刻冻结的原点；这一层只把它变成命令 ——
+                // "抓谁、吸附到哪、夹在哪"全在库里（`edit.rs`，有单测）。
+                OverlayAction::GrabStart(g) => {
                     self.drag_active = true;
-                    cmds.push(opm_app::edit::begin_command(opm_app::edit::DRAG_NOTE_LABEL));
+                    self.grab = Some(*g);
+                    let label = opm_app::edit::move_label(self.state.selection_kind().unwrap_or(opm_app::state::SelKind::Notes));
+                    cmds.push(opm_app::edit::begin_command(label));
                 }
-                OverlayAction::NoteDrag { index, doc_index, lane_x, beat } => {
-                    // 命令怎么拼在库里（`opm_app::edit`，有单测）：hold 要保持时长这类规则
-                    // 不该只活在"拖一下看看"里
-                    cmds.push(opm_app::edit::note_drag_command(
-                        &self.state, index, doc_index, lane_x, beat,
-                    ));
+                OverlayAction::GrabMove { d_lane, d_beat } => {
+                    if let Some(g) = self.grab.clone() {
+                        // 音符按住时长、事件保持时长这类规则不该只活在"拖一下看看"里
+                        cmds.extend(opm_app::edit::move_grab_commands(&self.state, &g, d_lane, d_beat));
+                    }
                 }
-                OverlayAction::NoteDragEnd => {
+                OverlayAction::GrabEnd => {
+                    self.grab = None;
                     if self.drag_active {
                         self.drag_active = false;
                         cmds.push(opm_app::edit::commit_command());
@@ -1259,11 +1346,13 @@ impl App {
                     self.drag_active = true;
                     cmds.push(opm_app::edit::begin_command(opm_app::edit::DRAG_EVENT_LABEL));
                 }
-                OverlayAction::EventResize { index, edge, beat } => {
+                OverlayAction::EventResize { track, at, edge, beat } => {
                     cmds.push(opm_app::edit::event_resize_command(
-                        &self.state, index, edge, beat,
+                        &self.state, track, at, edge, beat,
                     ));
                 }
+                // Del 不在这里：它是**全局键**（见 `key_down` 那一段的 `delete_selection`），
+                // 不该依赖"指针正悬在编辑区上"
                 OverlayAction::EventResizeEnd => {
                     if self.drag_active {
                         self.drag_active = false;
@@ -1571,6 +1660,37 @@ impl App {
             // 栈空了：说一句，别让人以为按键没生效（"再按一次也没反应"最容易让人怀疑程序坏了）
             None => self.file_message = Some((true, format!("没有可{}的了", action.verb()))),
         }
+    }
+
+    /// **Del：删掉整个选区**（音符或事件，一次删干净 = 一个撤销步）。
+    ///
+    /// 两件事不在这一层做：
+    /// · **命令怎么拼**（尤其是"同一张表里按下标降序发"这条正确性规则）在 `edit.rs`；
+    /// · **哪些下标还算数**由 `EditCore` 判（越界会明确报错，这里不预筛）。
+    fn delete_selection(&mut self) {
+        let notes = self.state.selection().notes().count();
+        let events = self.state.selection().events().count();
+        if notes + events == 0 {
+            self.file_message = Some((
+                false,
+                "没有选中的音符或事件（先框选，或 Ctrl+左键多选）".to_owned(),
+            ));
+            return;
+        }
+        let cmds = opm_app::edit::delete_selection_commands(&self.state);
+        if cmds.is_empty() {
+            return;
+        }
+        // 删掉的东西已经不存在了：选区当场清空，别留下一堆指不到东西的下标
+        self.state.clear_selection();
+        self.insp = self.build_inspector();
+        self.dispatch(&cmds);
+        let what = match (notes, events) {
+            (0, e) => format!("{e} 条事件"),
+            (n, 0) => format!("{n} 个音符"),
+            (n, e) => format!("{n} 个音符 + {e} 条事件"),
+        };
+        self.file_message = Some((true, format!("已删除 {what}（Ctrl+Z 可撤销）")));
     }
 
     /// **按当前文档/命令行装载音乐，并同步"乐曲时长"**（时间轴总长要用它）。
@@ -2121,7 +2241,7 @@ impl App {
                         }
                     );
                 }
-                control::ViewCmd::Select { line, track, note, event } => {
+                control::ViewCmd::Select { line, track, note, event, notes, events } => {
                     // 选中是视图状态：直接改 EditorState，不碰文档
                     if let Some(li) = line {
                         if let Some(view) = self.state.chart.lines.iter().position(|l| l.index == li) {
@@ -2133,8 +2253,33 @@ impl App {
                             self.state.selected_track = *id;
                         }
                     }
-                    self.state.selected_note = note;
-                    self.state.selected_event = event;
+                    // **多选口径优先**（整批替换）；否则退回单选；都没给就清空。
+                    // 选区同时只有一类 ⇒ 多选的两个列表只会有一个非空（两个都给以 `notes` 为准）。
+                    if let Some(ns) = notes {
+                        self.state.select_notes(ns);
+                    } else if let Some(es) = events {
+                        let picked: Vec<opm_app::state::EventSel> = es
+                            .iter()
+                            .filter_map(|(t, i)| {
+                                opm_app::state::TrackId::ALL
+                                    .iter()
+                                    .find(|id| id.key() == t)
+                                    .map(|id| (*id, *i))
+                            })
+                            .collect();
+                        if let Some((t, _)) = picked.first() {
+                            self.state.selected_track = *t;
+                        }
+                        self.state.select_events(picked);
+                    } else {
+                        match (note, event) {
+                            (Some(n), _) => self.state.select_note(n),
+                            (None, Some(e)) => {
+                                self.state.select_event(self.state.selected_track, e)
+                            }
+                            (None, None) => self.state.clear_selection(),
+                        }
+                    }
                     self.clamp_selection();
                     self.insp = self.build_inspector();
                 }
@@ -2356,7 +2501,10 @@ impl App {
         }
     }
 
-    /// 选中项越界时收敛（线被删掉、音符被删掉）
+    /// 选中项越界时收敛（线被删掉、音符/事件被删掉、换了轨道）。
+    ///
+    /// 多选之后这件事必须**整批**做：集合里任何一个下标过期都要剔除（否则 Del 会删错东西）。
+    /// 只清锚是不够的 —— 锚没了会自动落到集合里还在的第一个，见 `Selection::retain`。
     fn clamp_selection(&mut self) {
         let n = self.state.chart.lines.len();
         if n == 0 {
@@ -2364,26 +2512,17 @@ impl App {
         } else if self.state.selected_line >= n {
             self.state.selected_line = n - 1;
         }
-        let line_notes = self
-            .state
-            .selected()
-            .map(|l| l.notes.len())
-            .unwrap_or(0);
-        if let Some(i) = self.state.selected_note {
-            if i >= line_notes {
-                self.state.selected_note = None;
-            }
-        }
-        let track_events = self
-            .state
-            .selected()
-            .map(|l| l.track(self.state.selected_track).events.len())
-            .unwrap_or(0);
-        if let Some(i) = self.state.selected_event {
-            if i >= track_events {
-                self.state.selected_event = None;
-            }
-        }
+        // 先把"当前这条线上还有哪些下标存在"取出来（借用分开：state 既要读又要改）
+        let track = self.state.selected_track;
+        let (line_notes, track_events) = match self.state.selected() {
+            Some(l) => (l.notes.len(), l.track(track).events.len()),
+            None => (0, 0),
+        };
+        self.state.retain_selection(
+            |i| i < line_notes,
+            // 事件只保留**当前轨道**上的：换轨道之后旧下标指向的是别的轨道
+            move |(t, i)| t == track && i < track_events,
+        );
     }
 
     /// 检查器展示的选中对象：**当前判定线 + 当前轨道 + 当前事件 + 当前音符**（线优先）
@@ -3039,6 +3178,51 @@ impl eframe::App for App {
         // 于是启动页与编辑页共用同一个守卫 —— 关窗不再有"哪一页才有效"的区别。
         self.unsaved_guard(&ctx);
 
+        // ---- 自动化钩子：`OPM_KEY_AUTO=[帧号:]按键[,按键…]` ----
+        //
+        // 例：`OPM_KEY_AUTO=40:Delete`、`OPM_KEY_AUTO=ctrl+z`。
+        //
+        // 为什么需要它：**没人能往 Wayland 窗口注入按键**（xdotool 要 `DISPLAY`），
+        // 而"按键 → 动作"这一段（Del 删选区、Ctrl+Z 撤销）恰恰是最容易接线接错的地方。
+        // 这里把按键塞进 egui 本帧的输入里，于是真的走一遍**和用户按下去完全相同**的路径
+        // （门槛也一样：在文本框里打字时不吃）。帧号前缀是为了等前面的视图命令到位
+        // —— 第 1 帧选区还是空的，那时按 Del 只会说一句"没有选中的东西"。
+        // 与 `OPM_EDIT_AUTO` 同一条纪律：只为拍不出来的中间态/一步操作存在，不改变默认行为。
+        while self
+            .key_auto
+            .first()
+            .is_some_and(|(at, _)| self.frames >= *at)
+        {
+            let (_, spec) = self.key_auto.remove(0);
+            let mut injected = 0usize;
+            for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (mods, key) = parse_key_spec(name);
+                if let Some(key) = key {
+                    ctx.input_mut(|i| {
+                        // 修饰键要**直接写字段**：`InputState::begin_pass` 是从 RawInput 的
+                        // 事件里算出 `modifiers` 的，往 `i.events` 里塞 `ModifiersChanged`
+                        // 已经太晚（那一遍循环早就过去了）—— 实测：塞事件只让 `key_pressed` 为真，
+                        // `modifiers.command` 仍是 false，于是 `ctrl+z` 一声不响地什么也没做。
+                        // 写字段与真实事件的效果完全相同（`begin_pass` 也是这么赋的）。
+                        i.modifiers = mods;
+                        i.events.push(egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: mods,
+                        });
+                    });
+                    injected += 1;
+                } else {
+                    eprintln!("  ⚠️ OPM_KEY_AUTO：认不出 {name:?}（例：Delete / ctrl+z）");
+                }
+            }
+            if injected > 0 {
+                println!("  OPM_KEY_AUTO     : 帧 {} 注入 {injected} 次按键（{spec}）", self.frames);
+            }
+        }
+
         // ---- 「已经有一个会话在运行」：这一份实例什么都不碰，只说明情况 ----
         // 放在最前面（除退出处理之外）：它不该进编辑页、不该碰缓存、也不该跑任何启动期动作。
         if self.busy_who.is_some() {
@@ -3129,6 +3313,15 @@ impl eframe::App for App {
             if let Some(action) = hit {
                 self.apply_edit_action(action);
             }
+        }
+        // **Del：删掉选中的音符/事件**。
+        //
+        // 为什么放在全局这一层而不是编辑区里：它是"作用在选区上"的命令，
+        // 不该要求"指针正好悬在编辑区上"。门槛与 Ctrl+Z 一致（打字/模态期间不吃）。
+        if keymap::shortcut_allowed(typing, modal_open)
+            && ctx.input(keymap::delete_selection_pressed)
+        {
+            self.delete_selection();
         }
         // 按住 H：临时藏掉编辑区（放开即恢复）。同样不能在控制台打字时误触发。
         self.h_held = !typing && !modal_open && ctx.input(|i| i.key_down(egui::Key::H));
@@ -3436,8 +3629,7 @@ impl eframe::App for App {
                 if let Some(id) = state::TrackId::ALL.iter().find(|id| id.key() == j.track) {
                     self.state.selected_track = *id;
                 }
-                self.state.selected_note = None;
-                self.state.selected_event = Some(j.event);
+                self.state.select_event(self.state.selected_track, j.event);
                 let t = self.state.chart.tmap.sec(j.beat);
                 self.seek_to(t);
                 self.insp = self.build_inspector();
@@ -3755,22 +3947,21 @@ impl eframe::App for App {
                 match a {
                     TreeAction::SelectLine(v) => {
                         self.state.selected_line = v;
-                        self.state.selected_event = None;
-                        self.state.selected_note = None;
+                        self.state.clear_selection();
                         sel_changed = true;
                     }
                     TreeAction::SelectTrack(id) => {
                         self.state.selected_track = id;
-                        self.state.selected_event = None;
+                        self.state.clear_event_selection();
                         sel_changed = true;
                     }
                     TreeAction::SelectEvent(i) => {
-                        self.state.selected_event = Some(i);
+                        let track = self.state.selected_track;
+                        self.state.select_event(track, i);
                         sel_changed = true;
                     }
                     TreeAction::SelectNote(i) => {
-                        self.state.selected_note = Some(i);
-                        self.state.selected_event = None;
+                        self.state.select_note(i);
                         if let Some(n) = self.state.selected().and_then(|l| l.notes.get(i)) {
                             seek_to = Some(n.time);
                         }

@@ -120,16 +120,17 @@ pub fn line_tree_ui(
                     }
                 }
                 if ui.small_button("删除选中").clicked() {
-                    if let Some(i) = st.selected_event {
+                    // 文档地址由**合并视图下标**换算回来（多图层文档里两者不是一回事）
+                    if let Some(at) = st.selected_event().and_then(|i| track.origin(i)) {
                         acts.push(TreeAction::Cmd(opm_app::edit::del_event_command(
-                            line_doc, &track_key, i,
+                            line_doc, &track_key, at,
                         )));
                     }
                 }
             });
             let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
             let total = track.events.len();
-            let selected = st.selected_event;
+            let selected = st.selected_event();
             let mut clicked = None;
             egui::ScrollArea::vertical()
                 .id_salt("events_scroll")
@@ -165,7 +166,7 @@ pub fn line_tree_ui(
         .default_open(true)
         .show(ui, |ui| {
             let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-            let selected = st.selected_note;
+            let selected = st.selected_note();
             let mut clicked = None;
             egui::ScrollArea::vertical()
                 .id_salt("notes_scroll")

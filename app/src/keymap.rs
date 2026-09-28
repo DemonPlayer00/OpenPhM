@@ -293,6 +293,14 @@ pub fn edit_shortcut(key: egui::Key, command: bool, shift: bool) -> Option<EditA
     }
 }
 
+/// **Del = 删掉选区**这条也收进库里，理由与上面那条一样：门槛（打字/模态期间不吃）
+/// 与"按的是哪个键"都是需求本身，放在 `bin` 里就只能靠肉眼看。
+///
+/// 只看 `Delete`：`Backspace` 在别的程序里是"退格"，不该在这里偷偷变成删除谱面内容。
+pub fn delete_selection_pressed(i: &egui::InputState) -> bool {
+    i.key_pressed(egui::Key::Delete)
+}
+
 /// 从**这一帧的输入**里取出一次性编辑动作（`ctx.input(keymap::edit_action_from_input)`）。
 ///
 /// 为什么要这一层：按键的原始形态是 egui 的 `InputState`（按键 + 平台修饰键），而"哪个组合算什么"
@@ -319,6 +327,34 @@ mod edit_shortcut_tests {
         assert_eq!(EditAction::Undo.verb(), "撤销");
         assert_eq!(EditAction::Redo.verb(), "重做");
         assert_ne!(EditAction::Undo.result_key(), EditAction::Redo.result_key());
+    }
+
+    /// Del 只认 `Delete`（`Backspace` 不是"删除选中的谱面内容"）
+    #[test]
+    fn only_delete_key_deletes_the_selection() {
+        let ctx = egui::Context::default();
+        let shot = |key: egui::Key| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            };
+            let mut hit = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                hit = ui.input(delete_selection_pressed);
+            });
+            out.textures_delta.clear();
+            hit
+        };
+        assert!(shot(egui::Key::Delete));
+        for k in [egui::Key::Backspace, egui::Key::Escape, egui::Key::Z] {
+            assert!(!shot(k), "{k:?} 不该触发删除");
+        }
     }
 
     /// 边界：没有主修饰键**不算**（裸 Z 不是撤销）；别的键也不算

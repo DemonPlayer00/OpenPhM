@@ -253,15 +253,7 @@ pub fn eval_events(events: &[Event], beat: f64) -> Option<f64> {
     for e in events {
         let (a, b) = (e.start.to_f64(), e.end.to_f64());
         if beat >= a && beat <= b {
-            let span = (b - a).max(1e-9);
-            let t = ((beat - a) / span).clamp(0.0, 1.0);
-            let (v0, v1) = (as_f64(&e.start_value), as_f64(&e.end_value));
-            return Some(match (v0, v1) {
-                (Some(v0), Some(v1)) => v0 + (v1 - v0) * ease(&e.easing, t),
-                (Some(v0), None) => v0,
-                (None, Some(v1)) => v1,
-                (None, None) => 0.0,
-            });
+            return Some(event_value(e, beat));
         }
     }
     // 不在任何事件里 —— **保持**最近一条事件的值，而不是"跳到最后一个事件"。
@@ -270,17 +262,211 @@ pub fn eval_events(events: &[Event], beat: f64) -> Option<f64> {
     // 拍 15 之前会走到下面 `beat >= events[0].start` 的分支，返回**最后一条事件的终值** ——
     // 于是线在空隙里直接跳到终值，正是用户说的"某时间没有事件却移动了判定线"。
     // 正确语义是"保持"：空隙里维持**前一条事件的终值**（首个事件之前则取它的起始值）。
+    held_value(events, beat).or_else(|| as_f64(&events[0].start_value)).or(Some(0.0))
+}
+
+/// 单条事件在拍 `beat` 处的值（按它自己的缓动）。
+///
+/// 从 [`eval_events`] 里抽出来的：流速积分要在**段内**反复求值，
+/// 值怎么算只该有一份实现 —— 两份实现迟早会在某个缓动上分家。
+pub fn event_value(e: &Event, beat: f64) -> f64 {
+    let (a, b) = (e.start.to_f64(), e.end.to_f64());
+    let span = (b - a).max(1e-9);
+    let t = ((beat - a) / span).clamp(0.0, 1.0);
+    let (v0, v1) = (as_f64(&e.start_value), as_f64(&e.end_value));
+    match (v0, v1) {
+        (Some(v0), Some(v1)) => v0 + (v1 - v0) * ease(&e.easing, t),
+        (Some(v0), None) => v0,
+        (None, Some(v1)) => v1,
+        (None, None) => 0.0,
+    }
+}
+
+/// 空隙里"保持"的值：上一条已结束事件的终值（首条之前没有 ⇒ `None`）
+fn held_value(events: &[Event], beat: f64) -> Option<f64> {
     let mut held: Option<f64> = None;
     for e in events {
         if e.end.to_f64() <= beat {
             held = as_f64(&e.end_value).or(held);
         }
     }
-    if let Some(v) = held {
-        return Some(v);
-    }
-    as_f64(&events[0].start_value).or(Some(0.0))
+    held
 }
+
+// ---------------------------------------------------------------- 流速（RPE 的 floor position）
+
+/// **1 单位流速 = 120 RPE y 单位 / 秒**（RPE 规范）。
+///
+/// 出处：RPE 官方手册 —— "实际速度为 10.0 表示音符每秒钟移动 10.0×120 = 1200 像素，
+/// 这意味它会 (450+450)/1200 = **0.75 秒**竖直划过整个屏"。
+/// RPE 的渲染范围就是 1350×900，与本编辑器演奏区的坐标（±675 × ±450）**是同一套**，
+/// 所以 1 单位流速就是 120 单位/秒。
+///
+/// 独立实现 PhiEdit-2573 用同一个常数（`SPEED_RATIO = 120`）；prpr 用 120.23（差 0.19%，
+/// 来源是它把屏幕高比写成 0.83175 而不是 1/1.2）—— 我们按手册取整 120。
+pub const SPEED_UNITS_PER_SEC: f64 = 120.0;
+
+/// 一条**没有流速事件**的线按这个速度走：RPE 新建判定线的默认值 = `10`（= 1× = 1200 单位/秒）。
+///
+/// prpr 对"没有流速事件"的线给 0（音符冻住）—— 那是播放器的选择；编辑器里冻住的预览
+/// 等于什么都看不见，所以这里按 RPE 的**默认值**兜底。这也是用户要的"默认速度 10"。
+pub const SPEED_DEFAULT: f64 = 10.0;
+
+/// 流速的**位置积分** `H(t) = 120 × ∫ v dτ`（RPE y 单位），τ 在秒域，`from_sec → to_sec`。
+///
+/// 为什么是积分而不是"两端平均值 × 时长"：音符的纵向位置本来就是 `H(t_音符) − H(t_此刻)`
+/// （RPE/prpr 的 floor position），而缓动段里 v 一直在变 —— 用端点近似会在长缓动段上跑偏。
+///
+/// 实现：**事件边界**当必须的抽点，段内再等分抽 [`SPEED_SAMPLES_PER_SEGMENT`] 点走梯形法。
+/// 线性段因此是精确的（梯形法对线性就是精确积分），非线性缓动是高精度近似
+/// （prpr 对带缓动的事件同样是数值积分）。
+pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64) -> f64 {
+    if !(to_sec > from_sec) {
+        return 0.0;
+    }
+    if events.is_empty() {
+        // 没有流速事件 ⇒ 按默认 10（= 1×）匀速
+        return (to_sec - from_sec) * SPEED_DEFAULT * SPEED_UNITS_PER_SEC;
+    }
+    let b_from = tmap.beat(from_sec);
+    let idx = events.partition_point(|e| e.end.to_f64() <= b_from);
+    let (_, _, acc) = integrate_until(events, tmap, idx, b_from, 0.0, tmap.beat(to_sec));
+    // 积分出来的 `acc` 是 `∫v dτ`（流速单位 × 秒）；换算成 RPE y 单位只在这两处乘法里发生
+    acc * SPEED_UNITS_PER_SEC
+}
+
+/// 每一段里抽几个点走梯形法。线性段与常值段不需要抽（见 [`integrate_until`]）。
+pub const SPEED_SAMPLES_PER_SEGMENT: usize = 8;
+
+/// **单调流速累加器**：从 `origin_sec` 起一路往后积，摊还 O(1)。
+///
+/// 演奏区每帧要给窗口内每个音符算纵向位置，而音符是**按时间排好序**的 ——
+/// 从播放头逐个音符重新积分是 O(音符 × 事件)，大谱面上这笔钱每帧都要付；
+/// 单调走一遍的总代价只与**这段时间里的流速事件条数**有关，与音符数量无关。
+pub struct SpeedAccum<'a> {
+    events: &'a [Event],
+    tmap: &'a TimeMap,
+    idx: usize,
+    at_beat: f64,
+    acc: f64,
+}
+
+impl<'a> SpeedAccum<'a> {
+    /// 从 `origin_sec` 起算（通常是播放头）
+    pub fn new(events: &'a [Event], tmap: &'a TimeMap, origin_sec: f64) -> Self {
+        let at_beat = tmap.beat(origin_sec);
+        let idx = events.partition_point(|e| e.end.to_f64() <= at_beat);
+        Self { events, tmap, idx, at_beat, acc: 0.0 }
+    }
+
+    /// 积到 `sec`，返回 `H(sec) − H(origin)`（RPE y 单位）。
+    /// **必须不早于上一次**（调用方保证升序：音符本来就是升序的）。
+    pub fn to(&mut self, sec: f64) -> f64 {
+        let b = self.tmap.beat(sec);
+        if b <= self.at_beat {
+            return self.acc * SPEED_UNITS_PER_SEC;
+        }
+        let (idx, at, acc) =
+            integrate_until(self.events, self.tmap, self.idx, self.at_beat, self.acc, b);
+        self.idx = idx;
+        self.at_beat = at;
+        self.acc = acc;
+        acc * SPEED_UNITS_PER_SEC
+    }
+}
+
+/// 一段流速的求值方式：走在某条事件的缓动上，或"保持"某个定值（空隙里 / 首尾之外）
+#[derive(Clone, Copy)]
+enum SpeedSeg<'a> {
+    Eased(&'a Event),
+    Hold(f64),
+}
+
+impl SpeedSeg<'_> {
+    fn at(&self, beat: f64) -> f64 {
+        match self {
+            SpeedSeg::Hold(v) => *v,
+            SpeedSeg::Eased(e) => event_value(e, beat),
+        }
+    }
+}
+
+/// 从 `(idx, at_beat, acc)` 一直积到 `b_to`，返回新的 `(idx, at_beat, acc)`。
+///
+/// 这是流速积分的**唯一**实现：直接查询（[`speed_travel`]）与单调累加（[`SpeedAccum`]）
+/// 共用它，于是"段怎么切、空隙怎么算"只有一处定义。
+fn integrate_until(
+    events: &[Event],
+    tmap: &TimeMap,
+    mut idx: usize,
+    mut at_beat: f64,
+    mut acc: f64,
+    b_to: f64,
+) -> (usize, f64, f64) {
+    while at_beat < b_to {
+        let ev = events.get(idx);
+        let seg = match ev {
+            // 事件覆盖着当前位置：值走它的缓动，段尾就是它的终点
+            Some(e) if e.start.to_f64() <= at_beat => SpeedSeg::Eased(e),
+            // 空隙（或在首条事件之前）：保持"上一条的终值"（首条之前取它的起始值）
+            _ => {
+                let held = held_value(&events[..idx], at_beat)
+                    .or_else(|| ev.and_then(|e| as_f64(&e.start_value)))
+                    .unwrap_or(SPEED_DEFAULT);
+                SpeedSeg::Hold(held)
+            }
+        };
+        // 这一段到哪里为止：事件段到事件终点，空隙段到下一条事件的起点（没有下一条就到底）
+        let seg_end = match (ev, &seg) {
+            (Some(e), SpeedSeg::Eased(_)) => e.end.to_f64(),
+            (Some(e), _) => e.start.to_f64(),
+            (None, _) => b_to,
+        };
+        let stop = seg_end.min(b_to);
+        acc += integrate_seg(tmap, &seg, at_beat, stop);
+        at_beat = stop;
+        if stop >= seg_end - 1e-12 {
+            // 这一段走完了：换下一条事件
+            if ev.is_some() {
+                idx += 1;
+            } else {
+                break; // 末尾之后：`held` 会一直保持，没有下一段了
+            }
+        } else {
+            break; // 到 b_to 了
+        }
+    }
+    (idx, at_beat, acc)
+}
+
+/// 一段（值函数恒定或走单条事件的缓动）的积分：梯形法。
+///
+/// **返回 `∫v dτ`（流速单位 × 秒），不乘 120** —— 换算成 RPE y 单位只在
+/// [`speed_travel`] / [`SpeedAccum::to`] 那两处发生，免得两条路径各乘一次或漏乘。
+///
+/// 秒域长度一律用 `tmap` 换算 —— BPM 变过的时间段里 `(b1−b0)/bpm` 是错的。
+fn integrate_seg(tmap: &TimeMap, seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
+    if !(b_to > b_from) {
+        return 0.0;
+    }
+    // 常值段：一次乘法就够（不必抽点）
+    if let SpeedSeg::Hold(v) = seg {
+        return v * (tmap.sec(b_to) - tmap.sec(b_from));
+    }
+    let n = SPEED_SAMPLES_PER_SEGMENT.max(1);
+    let mut prev_b = b_from;
+    let mut prev_v = seg.at(prev_b);
+    let mut acc = 0.0;
+    for k in 1..=n {
+        let b = b_from + (b_to - b_from) * k as f64 / n as f64;
+        let v = seg.at(b);
+        acc += 0.5 * (prev_v + v) * (tmap.sec(b) - tmap.sec(prev_b));
+        prev_b = b;
+        prev_v = v;
+    }
+    acc
+}
+
 
 /// 判定线的表演状态（由五条轨道在某一时刻求值得到）
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -322,13 +508,23 @@ impl LinePerf {
 
 /// 从判定线取出某条轨道的全部事件（图层 0 优先；多图层时合并为一条时间线）
 pub fn track_events(line: &JudgeLine, track: &str) -> Vec<Event> {
-    let mut out: Vec<Event> = Vec::new();
-    for layer in &line.layers {
-        if let Some(list) = layer.track(track) {
-            out.extend(list.iter().cloned());
+    track_events_indexed(line, track).into_iter().map(|(_, e)| e).collect()
+}
+
+/// 同上，但**每个事件都带上它在文档里的出处**（第几层、该层里的下标）。
+///
+/// 合并顺序就是求值/绘制的顺序；**编辑必须用回来处** —— 合并序号与图层内序号不是一回事，
+/// 详见 [`crate::doc::EventRef`]。合并逻辑只有这一份，`track_events` 是它的投影。
+pub fn track_events_indexed(line: &JudgeLine, track: &str) -> Vec<(crate::doc::EventRef, Event)> {
+    let mut out: Vec<(crate::doc::EventRef, Event)> = Vec::new();
+    for (layer, l) in line.layers.iter().enumerate() {
+        if let Some(list) = l.track(track) {
+            for (i, e) in list.iter().enumerate() {
+                out.push((crate::doc::EventRef::new(layer, i), e.clone()));
+            }
         }
     }
-    out.sort_by(|a, b| a.start.cmp(&b.start));
+    out.sort_by(|a, b| a.1.start.cmp(&b.1.start));
     out
 }
 
@@ -379,4 +575,119 @@ pub fn sample_track(events: &[Event], tmap: &TimeMap, per_event: usize) -> Vec<[
         }
     }
     out
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    use crate::doc::{Beat, BpmEntry};
+    use serde_json::json;
+
+    /// 一份 BPM 120 的时间映射（一拍 0.5 秒，手算方便）
+    fn tmap120() -> TimeMap {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        TimeMap::from_doc(&doc)
+    }
+
+    fn ev(from_beat: f64, to_beat: f64, from: f64, to: f64) -> Event {
+        Event::new(
+            Beat::new((from_beat * 4.0) as i64, 4),
+            Beat::new((to_beat * 4.0) as i64, 4),
+            json!(from),
+            json!(to),
+            "linear",
+        )
+    }
+
+    /// **RPE 手册那条算例**：流速 10 的音符每秒走 1200 单位，0.75 秒划过整个 900 高的窗口。
+    #[test]
+    fn speed_ten_crosses_the_window_in_three_quarters_of_a_second() {
+        let tmap = tmap120();
+        let events = vec![ev(0.0, 16.0, 10.0, 10.0)];
+        let travel = speed_travel(&events, &tmap, 0.0, 0.75);
+        assert!(
+            (travel - 900.0).abs() < 1e-6,
+            "流速 10 走 0.75 秒应正好是 900 单位（= 窗口高度），实际 {travel}"
+        );
+        // 一单位流速 = 120 单位/秒；流速 1 走 0.75 秒只有 90 单位
+        let slow = vec![ev(0.0, 16.0, 1.0, 1.0)];
+        assert!((speed_travel(&slow, &tmap, 0.0, 0.75) - 90.0).abs() < 1e-6);
+        // 与 BPM 无关（流速是"每秒"，不是"每拍"）
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 240.0,
+            foreign: Default::default(),
+        }];
+        let tmap240 = TimeMap::from_doc(&doc);
+        assert!((speed_travel(&events, &tmap240, 0.0, 0.75) - 900.0).abs() < 1e-6);
+    }
+
+    /// 没有流速事件 ⇒ 按 RPE 的**默认值 10**（= 1×）匀速，而不是冻住（那是 prpr 对播放器的选择）
+    #[test]
+    fn an_empty_speed_track_falls_back_to_rpe_default_ten() {
+        let tmap = tmap120();
+        let t = speed_travel(&[], &tmap, 1.0, 2.0);
+        assert!((t - 1200.0).abs() < 1e-6, "1 秒应走 10×120，实际 {t}");
+        assert_eq!(SPEED_DEFAULT, 10.0);
+        assert_eq!(SPEED_UNITS_PER_SEC, 120.0);
+    }
+
+    /// 缓动段走**积分**而不是"两端平均 × 时长"的近似：线性段梯形法精确，
+    /// 于是 0→10 的斜坡在 1 秒里积出 5（平均值）—— 若用"取此刻的瞬时值"就会是 0 或 10。
+    #[test]
+    fn a_ramp_integrates_instead_of_sampling_one_instant() {
+        let tmap = tmap120();
+        // 0 拍到 2 拍（0~1 秒）从 0 线性升到 10
+        let events = vec![ev(0.0, 2.0, 0.0, 10.0)];
+        let t = speed_travel(&events, &tmap, 0.0, 1.0);
+        assert!((t - 5.0 * 120.0).abs() < 1.0, "线性斜坡 1 秒应积出 5（平均），实际 {}", t / 120.0);
+        // 分段：前 1 秒（平均 5）之后的 1 秒是恒定 10
+        let events = vec![ev(0.0, 2.0, 0.0, 10.0), ev(2.0, 4.0, 10.0, 10.0)];
+        let t = speed_travel(&events, &tmap, 0.0, 2.0);
+        assert!((t - (5.0 + 10.0) * 120.0).abs() < 1.0, "实际 {}", t / 120.0);
+    }
+
+    /// 空隙里**保持**前一条的终值（与 `eval_events` 同一条语义），不是跳到最后一条
+    #[test]
+    fn a_gap_holds_the_previous_speed() {
+        let tmap = tmap120();
+        // [0,1) 秒 流速 4；[2,3) 秒 流速 0 ⇒ 1~2 秒的空隙里保持 4
+        let events = vec![ev(0.0, 2.0, 4.0, 4.0), ev(4.0, 6.0, 0.0, 0.0)];
+        let t = speed_travel(&events, &tmap, 1.0, 2.0);
+        assert!((t - 4.0 * 120.0).abs() < 1e-6, "空隙里应保持 4，实际 {}", t / 120.0);
+    }
+
+    /// 单调累加器 = 逐段直接积分（两条路径共用同一份积分实现，结果必须一致）
+    #[test]
+    fn the_monotone_accumulator_agrees_with_direct_integration() {
+        let tmap = tmap120();
+        let events = vec![
+            ev(0.0, 2.0, 10.0, 20.0),
+            ev(2.0, 6.0, 20.0, 20.0),
+            ev(6.0, 10.0, 20.0, 0.0),
+        ];
+        let mut acc = SpeedAccum::new(&events, &tmap, 0.25);
+        for sec in [0.3, 0.9, 1.4, 2.5, 3.0, 3.7, 5.2] {
+            let got = acc.to(sec);
+            let want = speed_travel(&events, &tmap, 0.25, sec);
+            assert!((got - want).abs() < 1e-9, "t={sec}: 累加 {got} ≠ 直积 {want}");
+        }
+        // 倒退调用（不该发生）返回上次的值，而不是负数
+        assert_eq!(acc.to(1.0), acc.to(5.2));
+    }
+
+    /// 反向区间与零长度：一律 0（不返回负数，免得音符被画到判定线下面去）
+    #[test]
+    fn a_reversed_interval_is_zero() {
+        let tmap = tmap120();
+        let events = vec![ev(0.0, 16.0, 10.0, 10.0)];
+        assert_eq!(speed_travel(&events, &tmap, 2.0, 2.0), 0.0);
+        assert_eq!(speed_travel(&events, &tmap, 2.0, 1.0), 0.0);
+    }
 }

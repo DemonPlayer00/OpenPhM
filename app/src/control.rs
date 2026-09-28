@@ -149,11 +149,17 @@ pub enum ViewCmd {
     },
     /// 选中某个对象（视图状态）：让 GUI 指向某条线 / 某个音符 / 某条事件。
     /// agent 用它把界面"指到"要检查的地方（选中不属于文档，所以走视图通道）。
+    ///
+    /// `notes` / `events` 是**多选**口径（`{"notes":[0,2]}`、`{"events":[["alpha",0]]}`）：
+    /// 给了就以它为准整批替换 —— 没有这条路，"框选/多选"的效果就只能靠手点，
+    /// agent 截图复核不了。
     Select {
         line: Option<usize>,
         track: Option<String>,
         note: Option<usize>,
         event: Option<usize>,
+        notes: Option<Vec<usize>>,
+        events: Option<Vec<(String, usize)>>,
     },
     LoadAudio(String),
     SetOffsetMs(f64),
@@ -195,6 +201,24 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
             track: v.get("track").and_then(|x| x.as_str()).map(|x| x.to_owned()),
             note: v.get("note").and_then(|x| x.as_u64()).map(|x| x as usize),
             event: v.get("event").and_then(|x| x.as_u64()).map(|x| x as usize),
+            notes: v.get("notes").and_then(|x| x.as_array()).map(|a| {
+                a.iter().filter_map(|n| n.as_u64()).map(|n| n as usize).collect()
+            }),
+            // `[["alpha", 0], ["alpha", 1]]` —— 轨道名用文档里的键（与事件区列名一致）。
+            // **认不出的轨道名丢掉**：少选一条总好过整条视图命令没反应（agent 手写时最容易写歪这里）。
+            events: v.get("events").and_then(|x| x.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|pair| {
+                        let p = pair.as_array()?;
+                        let track = p.first()?.as_str()?.to_owned();
+                        let index = p.get(1)?.as_u64()? as usize;
+                        Some((track, index))
+                    })
+                    .filter(|(t, _)| {
+                        crate::state::TrackId::ALL.iter().any(|id| id.key() == t)
+                    })
+                    .collect()
+            }),
         }),
         "nudge" => Some(ViewCmd::NudgeBeats(
             v.get("beats").and_then(|x| x.as_f64()).unwrap_or(0.0),

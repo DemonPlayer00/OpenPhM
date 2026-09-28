@@ -6,12 +6,14 @@
 //! 坐标约定（与 `spec/opm-format.md` 第 3 节一致）：
 //!   · RPE 坐标系：x ∈ [-675, 675]，y ∈ [-450, 450]，原点在演奏区中心
 //!   · 等比缩放（letterbox）：scale_px = min(viewport_w / 1350, viewport_h / 900)
-//!   · 时间轴向上：y = (note_time - playhead) / lookahead * 450
+//!   · 时间轴向上：y = RPE 的 floor position 差 × 音符 speed（流速 10 = 1× = 1200 单位/秒）
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::state::{Chart, EditorState, NoteKind};
+use crate::doc::Event;
+use crate::perf;
+use crate::state::{Chart, EditorState, NoteKind, RPE_WINDOW_HALF_H};
 
 pub const RPE_W: f32 = 1350.0;
 pub const RPE_H: f32 = 900.0;
@@ -456,24 +458,45 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
         ));
 
         // ---- 子音符 ----
-        let lookahead = state.lookahead.max(1e-3);
-        // 流速只是**预览约定**：10 为基准，大于 10 时同样时间内落得更远。
-        // 游戏内判定语义由播放器决定（与"变速 hold 交播放器"同一个判断）。
-        let speed_scale = (perf.speed / 10.0).clamp(0.05, 20.0);
+        //
+        // 纵向位置按 **RPE 的 floor position** 算：`(H(t_音符) − H(t_此刻)) × 音符自身 speed`，
+        // 其中 `H = 120 × ∫ v dτ`（v = 流速事件的值，单位流速 = 120 RPE y 单位/秒，见
+        // `perf::SPEED_UNITS_PER_SEC`）。于是**流速 10（RPE 默认值 = 1×）的音符 0.75 秒划过
+        // 整个 900 高的窗口** —— 与 RPE 一致。
+        //
+        // 从前这里是 `(dt / 2s) × 450 × (speed/10)`：既把 1× 定成了 225 单位/秒（RPE 是 1200，
+        // 慢 5.33 倍），又把流速当"此刻的瞬时值"（缓动段里跑偏）。
+        //
+        // 累加器是**单调**的（音符按时间升序）⇒ 总代价只与这段时间里的流速事件条数有关，
+        // 与音符数量无关；逐个音符从播放头重新积分才是 O(音符 × 事件) 那种每帧都要付的钱。
+        let speed_events: &[Event] = &line.tracks[4].events;
+        let mut walk = perf::SpeedAccum::new(speed_events, &state.chart.tmap, state.playhead);
         for idx in state.visible_range_of(li) {
             let note = &line.notes[idx];
-            let dt = note.time - state.playhead;
-            let y_local = (dt / lookahead) as f32 * (RPE_H * 0.5) * speed_scale;
+            // 音符自身的 speed（文档字段，默认 1.0）乘在**离判定线的距离**上：
+            // RPE/prpr 就是这么用的（它不改到达时刻，只改"落多远"）。
+            let spd = (note.speed as f64).abs().max(1e-3);
+            let y_local = (walk.to(note.time) * spd) as f32;
+            let hold_dy = if note.kind == NoteKind::Hold {
+                (perf::speed_travel(speed_events, &state.chart.tmap, note.time, note.end) * spd) as f32
+            } else {
+                0.0
+            };
+            // 整条都在窗口上方很远 ⇒ 不必建实例（GPU 那边本来也会裁掉，省下来的是带宽）
+            let top = y_local.max(y_local + hold_dy);
+            if top > RPE_WINDOW_HALF_H + 60.0 {
+                continue;
+            }
 
             let mut color = note.kind.color();
             color[3] *= perf.alpha;
-            let hold_selected = selected && Some(idx) == state.selected_note;
+            let hold_selected = selected && state.is_note_selected(idx);
             if hold_selected {
                 color = [1.0, 1.0, 1.0, perf.alpha];
             }
 
             if note.kind == NoteKind::Hold {
-                let dy = ((note.end - note.time) / lookahead) as f32 * (RPE_H * 0.5) * speed_scale;
+                let dy = hold_dy;
                 let mid_local = [note.lane_x, y_local + dy * 0.5];
                 let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
                 if hold_selected {

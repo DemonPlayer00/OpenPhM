@@ -122,7 +122,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
     let perf = line.perf(&st.chart.tmap, st.playhead);
     let track = line.track(st.selected_track);
     let event = st
-        .selected_event
+        .selected_event()
         .and_then(|i| track.events.get(i))
         .map(|e| EventView {
             start_beat: e.start.to_f64(),
@@ -134,7 +134,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
             easing: e.easing.clone(),
         });
     let note = st
-        .selected_note
+        .selected_note()
         .and_then(|i| line.notes.get(i))
         .map(|n| NoteView {
             doc_index: n.doc_index,
@@ -147,7 +147,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         });
     // 可编辑字段取自**文档原始数据**（alpha/isFake/speed/widthScale/yOffset 只存在文档里）
     let note_edit = st
-        .selected_note
+        .selected_note()
         .and_then(|i| line.notes.get(i))
         .and_then(|n| {
             doc.judge_lines
@@ -171,7 +171,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         });
     let event_edit = event.as_ref().and_then(|ev| {
         // 事件值可能是非数值（颜色/字符串轨道）：不可编辑数值时就退化为只读
-        let idx = st.selected_event.unwrap_or(0);
+        let idx = st.selected_event().unwrap_or(0);
         let sv = track.events.get(idx).and_then(|e| e.start_value.as_f64());
         let ev2 = track.events.get(idx)?;
         sv.map(|sv| EventEdit {
@@ -260,7 +260,7 @@ mod tests {
         let c = sample();
         let mut st = state_of(&c);
         st.selected_line = 0;
-        st.selected_note = Some(1); // 第二个音符 = hold（那个带 set 的）
+        st.select_note(1); // 第二个音符 = hold（那个带 set 的）
         let insp = inspector_of(&st, c.doc()).expect("有选中的线");
         assert_eq!(insp.line_index, 0);
         assert_eq!(insp.notes, 2);
@@ -288,7 +288,7 @@ mod tests {
         let mut st = state_of(&c);
         st.selected_line = 0;
         st.selected_track = TrackId::Alpha;
-        st.selected_event = Some(0);
+        st.select_event(TrackId::Alpha, 0);
         let insp = inspector_of(&st, c.doc()).expect("有选中的线");
         assert_eq!(insp.track, TrackId::Alpha);
         assert_eq!(insp.track_events, 1);
@@ -299,7 +299,7 @@ mod tests {
 
         // 空轨道：没有事件 ⇒ 没有快照、也没有可编辑字段（而不是给一堆 0）
         st.selected_track = TrackId::Rotate;
-        st.selected_event = Some(0);
+        st.select_event(TrackId::Alpha, 0);
         let insp = inspector_of(&st, c.doc()).expect("有选中的线");
         assert!(insp.event.is_none());
         assert!(insp.event_edit.is_none());
@@ -313,7 +313,7 @@ mod tests {
         let mut st = state_of(&c);
         st.selected_line = 0;
         st.selected_track = TrackId::MoveX;
-        st.selected_event = Some(99); // 越界
+        st.select_event(TrackId::Alpha, 99); // 越界
         let insp = inspector_of(&st, c.doc()).expect("有选中的线");
         assert!(insp.event.is_none() && insp.event_edit.is_none());
         assert_eq!(insp.track_events, 1, "轨道本身还是有 1 条事件");

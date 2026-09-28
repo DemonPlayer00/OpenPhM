@@ -39,6 +39,39 @@ fn document_core_does_not_know_view_commands() {
     assert!(parse_view_cmd(&json!({"op":"view"})).is_none());
 }
 
+/// **多选也能从控制通道指过去**：否则"框选/多选"的效果只能手点，
+/// agent 没法截图复核（选区是视图状态，走的就是这条通道）。
+#[test]
+fn select_accepts_a_multi_selection() {
+    match parse_view_cmd(&json!({"op":"select","notes":[0,2,5]})) {
+        Some(ViewCmd::Select { notes, events, note, event, .. }) => {
+            assert_eq!(notes, Some(vec![0, 2, 5]));
+            assert!(events.is_none() && note.is_none() && event.is_none());
+        }
+        other => panic!("应解析成多选音符：{other:?}"),
+    }
+    match parse_view_cmd(&json!({"op":"select","events":[["alpha",0],["moveX",3],["nope",1]]})) {
+        Some(ViewCmd::Select { events, notes, .. }) => {
+            // 认不出的轨道名丢掉，不整条命令失败（视图命令不该因为一个笔误就没反应）
+            assert_eq!(
+                events,
+                Some(vec![("alpha".to_owned(), 0), ("moveX".to_owned(), 3)])
+            );
+            assert!(notes.is_none());
+        }
+        other => panic!("应解析成多选事件：{other:?}"),
+    }
+    // 单选口径照旧
+    match parse_view_cmd(&json!({"op":"select","note":3,"track":"alpha","event":1})) {
+        Some(ViewCmd::Select { note, event, track, notes, .. }) => {
+            assert_eq!((note, event), (Some(3), Some(1)));
+            assert_eq!(track.as_deref(), Some("alpha"));
+            assert!(notes.is_none());
+        }
+        other => panic!("应解析成单选：{other:?}"),
+    }
+}
+
 #[test]
 fn audio_has_a_document_path_and_a_view_path() {
     let mut core = EditCore::new();
@@ -89,7 +122,7 @@ fn view_state_never_leaks_into_the_document() {
     st.overlay_beats = 7.0;
     st.selected_line = 0;
     st.selected_track = opm_app::state::TrackId::Speed;
-    st.selected_note = Some(0);
+    st.select_note(0);
     st.seek(3.0);
     st.set_playing(true);
 

@@ -122,6 +122,24 @@ impl Event {
     }
 }
 
+/// 一条事件在**文档里的出处**：第几个图层 + 该图层事件表里的下标。
+///
+/// 为什么必须有它：视图把一条线的**五个图层**合并成一条时间线（求值要的就是这个），
+/// 可合并之后的序号与任何单独图层里的序号都不是一回事 —— 拿合并序号去发 `del_event`
+/// 或 `set_event`，在多层文档上删掉/改动的会是**另一条事件**。
+/// 编辑（删、移）一律按这个地址走；只读的求值仍然用合并后的顺序。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventRef {
+    pub layer: usize,
+    pub index: usize,
+}
+
+impl EventRef {
+    pub fn new(layer: usize, index: usize) -> Self {
+        Self { layer, index }
+    }
+}
+
 // ---------------------------------------------------------------- 判定线
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

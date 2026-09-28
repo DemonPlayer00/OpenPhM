@@ -57,7 +57,16 @@ pub fn inspector_ui(
                 ui.separator();
                 ui.label(format!("事件 · {}", v.track.key()));
                 let track_key = v.track.key();
-                let idx = st.selected_event.unwrap_or(0);
+                let idx = st.selected_event().unwrap_or(0);
+                // 命令要的是**文档地址**（图层 + 该图层里的下标），不是合并视图下标：
+                // 合并序号直接当图层下标用会改到另一条事件（见 `doc::EventRef`）。
+                // 只有"视图下标已经越界"（等待下一帧的状态）才会退到这个兜底值 ——
+                // 那时命令本来也会被核心以"越界"拒掉，不会改错东西。
+                let at = st
+                    .selected()
+                    .map(|l| l.track(v.track))
+                    .and_then(|tv| tv.origin(idx))
+                    .unwrap_or(opm_app::doc::EventRef::new(0, idx));
                 let mut changed = false;
                 let mut sb = e.start_beat;
                 let mut eb = e.end_beat;
@@ -92,11 +101,11 @@ pub fn inspector_ui(
                     // 值/缓动走 set_event
                     if (sb - e.start_beat).abs() > 1e-9 {
                         ec.push(opm_app::edit::event_resize_command(
-                            &st, idx, opm_app::state::EventEdge::Start, sb));
+                            &st, v.track, at, opm_app::state::EventEdge::Start, sb));
                     }
                     if (eb - e.end_beat).abs() > 1e-9 {
                         ec.push(opm_app::edit::event_resize_command(
-                            &st, idx, opm_app::state::EventEdge::End, eb));
+                            &st, v.track, at, opm_app::state::EventEdge::End, eb));
                     }
                     let mut set = serde_json::Map::new();
                     if (sv - e.start_value).abs() > 1e-9 {
@@ -110,7 +119,7 @@ pub fn inspector_ui(
                     }
                     if !set.is_empty() {
                         ec.push(opm_app::edit::set_event_command(
-                            line_doc, track_key, idx, serde_json::Value::Object(set)));
+                            line_doc, track_key, at, serde_json::Value::Object(set)));
                     }
                 }
             }
@@ -279,9 +288,9 @@ mod tests {
         }
         let mut st = EditorState::new(state::chart_from_doc(c.doc()));
         st.selected_line = 0;
-        st.selected_note = Some(0);
+        st.select_note(0);
         st.selected_track = state::TrackId::MoveX;
-        st.selected_event = Some(0);
+        st.select_event(state::TrackId::Alpha, 0);
         let insp = view::inspector_of(&st, c.doc()).expect("有选中的线");
         (c, st, insp)
     }

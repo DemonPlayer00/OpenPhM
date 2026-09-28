@@ -39,8 +39,18 @@ impl Filter {
     }
 }
 
-/// 谱面（opm 与 RPE 都是 `.json`，所以只有一个"谱面"过滤器）
-pub const CHART_FILTER: Filter = Filter { label: "谱面", patterns: "*.json" };
+/// 谱面过滤器：**四种落盘的形态都要列出来**。
+///
+/// 通配曾经只有 `*.json`（那时只想着 opm 原生与 RPE 原生），于是"打开谱面"的系统框里
+/// **根本看不见 `.opm` 与 `.pez`** —— 而这两个正是本编辑器自己存出来的打包形态。
+/// 用户报的正是这一条（启动页与编辑页两个「打开谱面」都撞到了）。
+///
+/// `*.json` 排在最后：`*.opm.json` / `*.rpe.json` 也命中它，而打包形态是"一眼能认出来的谱面"，
+/// 排前面更顺手（顺序只影响系统框里的排列，不影响能不能选中）。
+pub const CHART_FILTER: Filter = Filter {
+    label: "谱面",
+    patterns: "*.opm *.pez *.json",
+};
 /// 音频：与 `audio.rs` 那边解码器（symphonia）真正支持的容器对齐
 pub const AUDIO_FILTER: Filter = Filter {
     label: "音频",
@@ -134,9 +144,9 @@ pub fn args(
                     .unwrap_or_else(|| ".".to_owned()),
             );
             if which != Which::Directory {
-                // kdialog 的写法：`标签 (*.a *.b)`
+                // kdialog 的写法：`标签 (*.a *.b)`（**不是** zenity 的 `标签 | *.a`）
                 a.push(filter.spec());
-                a.push("所有文件 | *".to_owned());
+                a.push("所有文件 (*)".to_owned());
             }
             a
         }
@@ -447,6 +457,32 @@ mod tests {
         let a = args("zenity", Which::Directory, Some(dir), CHART_FILTER);
         assert!(a.contains(&"--directory".to_owned()));
         assert!(!a.iter().any(|s| s.starts_with("--file-filter")), "{a:?}");
+    }
+
+    /// **打开谱面要列全四种落盘形态**（用户报的 bug：系统框里只有 json ⇒ 看不见 `.opm`/`.pez`）。
+    ///
+    /// 这条测试盯的是"两个页面的打开按钮用的是同一个过滤器"这个事实：
+    /// 启动页的「打开谱面…」与编辑页的「打开…」都走 `open_via_system`，所以只要这一个常量对，
+    /// 两个入口就都对。此处断言命令行里真的列出了那四个通配。
+    #[test]
+    fn the_chart_filter_lists_every_shape_we_can_save() {
+        assert_eq!(CHART_FILTER.patterns, "*.opm *.pez *.json");
+        for (prog, want) in [
+            ("kdialog", "谱面 (*.opm *.pez *.json)"),
+            ("zenity", "--file-filter=谱面 | *.opm *.pez *.json"),
+        ] {
+            let a = args(prog, Which::Open, None, CHART_FILTER);
+            assert!(a.iter().any(|s| s == want), "{prog} 里应列出全部形态：{a:?}");
+            for ext in ["*.opm", "*.pez", "*.json"] {
+                assert!(a.iter().any(|s| s.contains(ext)), "{prog} 少了 {ext}：{a:?}");
+            }
+        }
+        // kdialog 的"所有文件"是 `标签 (*)`，**不是** zenity 的 `标签 | *`（写错就是一条选不动的行）
+        let a = args("kdialog", Which::Open, None, CHART_FILTER);
+        assert!(a.contains(&"所有文件 (*)".to_owned()), "{a:?}");
+        assert!(!a.iter().any(|s| s == "所有文件 | *"), "kdialog 不吃竖线写法：{a:?}");
+        let a = args("zenity", Which::Open, None, CHART_FILTER);
+        assert!(a.contains(&"--file-filter=所有文件 | *".to_owned()), "{a:?}");
     }
 
     /// 起始位置与建议名
