@@ -133,6 +133,7 @@ fn measure() {
         let mut pump_ms = Vec::new();
         let mut inst_ms = Vec::new();
         let mut stale_all = Vec::new();
+        let mut mid_readout = String::new();
         let mut stale_visible = Vec::new();
         let mut inst_n = 0usize;
         let frames = 240; // 240 Hz 指针拖 1 秒
@@ -170,6 +171,14 @@ fn measure() {
             let t = Instant::now();
             st.pump_floors(EditorState::FLOOR_NOTES_PER_FRAME);
             pump_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+
+            // 底栏读数（用户看的就是这两个数）：**待算 ≤ 总数**，不会出现"要算的比总音符还多"
+            let pending = st.floor_pending();
+            assert!(pending <= notes, "待算 {pending} 超过了总音符 {notes}（去重坏了）");
+            if k == frames / 2 {
+                let (p, t) = st.floor_rebuild().unwrap_or((0, notes));
+                mid_readout = format!("待算 {p} / 共 {t} 颗（本批累计已算 {}）", st.floor_batch_done());
+            }
 
             // ⑤ 渲染：没算准的那些在渲染侧现算
             st.playhead += 1.0 / 240.0;
@@ -234,6 +243,7 @@ fn measure() {
             pct(&mut stale_visible.clone(), 0.5),
             pct(&mut stale_visible, 1.0)
         );
+        println!("底栏读数（拖动中点）：{mid_readout}");
         // 对照：**关掉 pump**（永远不补，全部走现算）—— 这就是"现算那一档"的上界
         let mut inst_nopump = Vec::new();
         for k in 0..frames {

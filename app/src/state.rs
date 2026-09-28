@@ -474,6 +474,9 @@ pub struct Line {
     pub min_speed_abs: f64,
     /// **音符纵向位置**（加载时算好；流速事件改了就把它之后的重算）—— 见 [`FlowCache`]
     pub floors: FlowCache,
+    /// **本帧刚改过流速**（`set_tracks` 置位，`EditorState::pump_floors` 帧末清）——
+    /// 用来跳过"补了也会立刻作废"的那一帧异步重算。见 [`EditorState::pump_floors`]。
+    speed_edited: bool,
 }
 
 impl Line {
@@ -578,6 +581,8 @@ impl Line {
             // （"之后"按**头或尾**算：长 hold 的尾巴可能落在改动之后而头在之前，见
             // `FlowCache::mark_from_sec`）
             Some(beat) => {
+                // 本帧改过流速：这一帧的异步重算注定白算（下一帧又会把这些标脏）
+                self.speed_edited = true;
                 // 只是滑值 ⇒ 表只重算改动点之后的前缀积分；动了起止拍/缓动才全量重建
                 if value_only {
                     self.floors.retune_table(&self.tracks[4].events, tmap, beat);
@@ -717,6 +722,7 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
         max_note_sec,
         min_speed_abs,
         floors: FlowCache::default(),
+        speed_edited: false,
     })
 }
 
@@ -1736,16 +1742,27 @@ impl EditorState {
             .sum()
     }
 
-    /// 底栏提示用：`(这一批已算好, 这一批总数)`；`None` = 没有在跑的活。
+    /// 底栏提示用：`(待算, 总数)`；`None` = 没有在跑的活。
     ///
-    /// "本批"= 从"上一次全部算准"到"下一次全部算准"之间累计的条数（含中途又改流速新增的）：
-    /// 正在拖动流速事件时它会一直涨，那正是它该有的样子（那批活确实一直在变大）。
+    /// **两个数都有界**：待算 ≤ 总数 = 这份谱面的音符总数 ⇒ 它是个真正的进度读数，
+    /// 一眼能看出"还差多少颗、占多少"。
+    ///
+    /// 早先这里给的是 `(本批已算, 本批已算 + 待算)`：拖动流速事件时"本批已算"一直涨，
+    /// 分母于是能超过音符总数（用户实测看到 **19 万 / 5 万** 那种数，第一反应是"重复计数"）。
+    /// 累计量另有 [`Self::floor_batch_done`] —— 它回答"这批活一共花了多少"，
+    /// 与"还有多少没算"是两个问题，别混进同一个分数里。
     pub fn floor_rebuild(&self) -> Option<(usize, usize)> {
         let pending = self.floor_pending();
         if pending == 0 {
             return None;
         }
-        Some((self.floor_done, self.floor_done + pending))
+        Some((pending, self.chart.lines.iter().map(|l| l.notes.len()).sum()))
+    }
+
+    /// 本批（从"上次全部算准"起）**累计**重算了多少条。拖动流速时会**超过音符总数**
+    /// —— 同一批会被反复标脏；所以它是"花了多少工"，不是"还有多少"（只给悬浮说明用）。
+    pub fn floor_batch_done(&self) -> usize {
+        self.floor_done
     }
 
     /// **异步重算一步**：本帧最多算 `budget` 条，返回实际算了几条。
@@ -1770,11 +1787,21 @@ impl EditorState {
                 if left == 0 {
                     break;
                 }
+                // **这条线本帧刚改过流速** ⇒ 现在补出来的位置下一帧会被重新标脏（拖动时每帧都改），
+                // 白算一遍。跳过它，等这轮编辑停下来再补；画面不受影响（没算准的那些在渲染侧现算）。
+                // 这一条把"拖动时每帧白烧 4096 颗的工"整块省掉（见 `tests/drag_bench.rs`）。
+                if l.speed_edited {
+                    continue;
+                }
                 left -= l.pump_floors(playhead, after, left, tmap);
             }
             if left == 0 {
                 break;
             }
+        }
+        // 帧末清标记：一帧只进来一次，两半（`after = true/false`）共用它
+        for l in lines.iter_mut() {
+            l.speed_edited = false;
         }
         let done = budget - left;
         self.floor_done += done;
@@ -2014,6 +2041,52 @@ mod tests {
         }
     }
 
+    /// **待算集合本身不许重复计数**：无论怎么混着 `mark_from` / `mark_one` / `take`，
+    /// 它都得是"升序、互不相邻、无重复"的一串区间 —— 于是 `count()` 就是**真正的待算条数**，
+    /// 不会超过音符总数。
+    ///
+    /// 这条不变量是底栏那个读数的基础：一旦有两个区间叠在一起，`count()` 就会虚高
+    /// （用户看到过"要更新的音符数比总音符数还多"）。
+    #[test]
+    fn the_stale_set_stays_sorted_disjoint_and_bounded() {
+        let n = 500usize;
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = |m: usize| -> usize {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % m.max(1)
+        };
+        let mut s = StaleSet::default();
+        for step in 0..4000 {
+            match rnd(3) {
+                // 整段标脏（`from` 可能越界 —— 真实调用点也会传 len）
+                0 => s.mark_from(rnd(n + 7), n),
+                // 单颗标脏（跨过改动点的长 hold 走这条）
+                1 => s.mark_one(rnd(n)),
+                // 摘一段去算（两半 + 预算）
+                _ => {
+                    let (a, b) = (rnd(n + 1), rnd(n + 1));
+                    s.take(a.min(b)..a.max(b), rnd(40));
+                }
+            }
+            let idx = s.indices();
+            assert!(
+                idx.windows(2).all(|w| w[0] < w[1]),
+                "第 {step} 步：待算下标必须严格升序且不重复，实际 {idx:?}"
+            );
+            assert_eq!(idx.len(), s.count(), "第 {step} 步：`count()` 与去重后的条数不一致");
+            assert!(idx.len() <= n, "第 {step} 步：待算 {} 颗 > 总音符 {n} 颗", idx.len());
+            assert!(idx.iter().all(|i| *i < n), "第 {step} 步：下标越界");
+            for w in s.ranges.windows(2) {
+                assert!(
+                    w[0].end < w[1].start,
+                    "第 {step} 步：两个区间重叠或相邻：{:?} 与 {:?}（相邻会让 `mark_one` 的合并判断失真）",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
     /// **异步重算：预算 + 优先级**（用户口径：先"当前时间轴 → 结尾"，再"开头 → 当前时间轴"）
     #[test]
     fn the_rebuild_goes_from_the_playhead_to_the_end_first() {
@@ -2026,7 +2099,7 @@ mod tests {
         st.chart.lines[0].mark_floors_stale_from(0);
         let total = st.floor_pending();
         assert_eq!(total, 20);
-        assert_eq!(st.floor_rebuild(), Some((0, 20)), "刚开始：0/20");
+        assert_eq!(st.floor_rebuild(), Some((20, 20)), "刚开始：待算 20 / 共 20");
         // 播放头落在 3.5 秒（= 第 7 拍）：音符在 1..20 拍（0.5 … 10.0 秒）
         st.seek(3.5);
         let before: Vec<usize> = (0..20).filter(|i| st.chart.lines[0].floors.is_stale(*i)).collect();
@@ -2036,7 +2109,7 @@ mod tests {
         let left: Vec<usize> = (0..20).filter(|i| st.chart.lines[0].floors.is_stale(*i)).collect();
         // 先算的必须是**播放头之后**那三颗：时间 < 3.5s 的有 6 颗（下标 0..6）⇒ 算掉 6、7、8
         assert_eq!(left, (0..6).chain(9..20).collect::<Vec<_>>(), "实际剩下 {left:?}");
-        assert_eq!(st.floor_rebuild(), Some((3, 20)), "进度：3/20");
+        assert_eq!(st.floor_rebuild(), Some((17, 20)), "补了 3 条：待算 17 / 共 20");
         // 补完为止：每帧 ≤ 预算，总数正好是剩下的
         let mut frames = 0;
         while st.floor_pending() > 0 {
@@ -2064,7 +2137,9 @@ mod tests {
         // 第二笔：从第 4 颗起再改（下标 3）⇒ 并成一个待算集合，总数不变（本来就都待算）
         st.chart.lines[0].mark_floors_stale_from(3);
         assert_eq!(st.floor_pending(), 12 - 3.max(0) - 0, "实际 {}", st.floor_pending());
-        assert_eq!(st.floor_rebuild(), Some((4, 4 + st.floor_pending())));
+        // 底栏读数是**有界**的：待算 9 颗 / 共 12 颗（不是"本批已算 4 + 待算 9 = 13"那种会超过总数的分数）
+        assert_eq!(st.floor_rebuild(), Some((9, 12)), "待算 9 / 共 12");
+        assert!(st.floor_batch_done() >= 4, "累计量另有出口（悬浮说明用）");
         while st.floor_pending() > 0 {
             st.pump_floors(64);
         }

@@ -113,12 +113,14 @@ pub fn status_bar_ui(ui: &mut Ui, v: &mut StatusView) -> StatusAction {
         } else if v.show_conflicts {
             ui.colored_label(Color32::from_rgb(140, 200, 140), "✓ 无事件重叠");
         }
-        if let Some((done, total)) = v.floor_rebuild {
+        if let Some((pending, total)) = v.floor_rebuild {
             ui.separator();
-            ui.colored_label(dialog::HINT, floor_rebuild_text(done, total)).on_hover_text(
-                "流速事件改了之后，它之后的音符位置要重算 —— 这里显示异步补齐的进度。\n\
-                 没补好的音符在预览里照旧是准的（那一颗现算），所以这只是「还在补」的读数，\n\
-                 不影响画面；补完之后这行字自己消失。",
+            ui.colored_label(dialog::HINT, floor_rebuild_text(pending, total)).on_hover_text(
+                "流速事件改了之后，它之后的音符位置要重算 —— 这里显示**还有多少颗没算准**\n\
+                 （分母是这份谱面的音符总数，所以这个分数不会超过 1）。\n\
+                 没补好的音符在预览里照旧是准的（那一颗现算），所以它只说明「还在补」，\n\
+                 不影响画面；补完之后这行字自己消失。\n\
+                 拖动流速事件时这个数会一直动：每改一次都有一批要重算，而同一批会被反复标脏。",
             );
         }
         if let Some((ok, msg)) = &v.notice {
@@ -134,8 +136,9 @@ pub fn status_bar_ui(ui: &mut Ui, v: &mut StatusView) -> StatusAction {
 }
 
 /// 音符位置重算的底栏文本。单列一个函数是为了**能单独测**：这行字是"还在补"的唯一可见证据。
-pub fn floor_rebuild_text(done: usize, total: usize) -> String {
-    format!("⟳ 音符位置重算 {done}/{total}")
+/// 底栏的"还在补"读数：**待算 / 总数**（两个数都有界，不会出现"要算的比总音符还多"）。
+pub fn floor_rebuild_text(pending: usize, total: usize) -> String {
+    format!("⟳ 音符位置重算 待算 {pending} / 共 {total} 颗")
 }
 
 /// 文档标识的保存状态（文案 + 颜色）：三态，**说人话**。
@@ -269,7 +272,10 @@ mod tests {
     }
 
     /// **音符位置重算的进度要出现在底栏**（异步的活不能"悄悄在后台做"）：
-    /// 有活时给 `⟳ 音符位置重算 已算/总数`，没活时（`None`）一个字都不占。
+    /// 有活时给 `⟳ 音符位置重算 待算 N / 共 M 颗`，没活时（`None`）一个字都不占。
+    ///
+    /// 用"待算/总数"而不是"本批已算/本批总数"：后者在拖动流速时会一直涨，
+    /// 分母能超过音符总数（用户实测看到 19 万 / 5 万，第一反应是"重复计数"）。
     #[test]
     fn a_floor_rebuild_in_progress_is_visible() {
         let mut off = 0.0;
@@ -277,13 +283,13 @@ mod tests {
         v.floor_rebuild = Some((1024, 9000));
         let (_act, t) = draw(&mut v);
         let j = t.join("\n");
-        assert!(j.contains("音符位置重算 1024/9000"), "缺进度：{j}");
+        assert!(j.contains("音符位置重算 待算 1024 / 共 9000 颗"), "缺进度：{j}");
         // 没有活的时候不该挂着一行没信息量的字
         v.floor_rebuild = None;
         let (_act, t) = draw(&mut v);
         assert!(!t.join("\n").contains("音符位置重算"), "{t:?}");
         // 文案本身是一条纯函数（数字怎么排只写一处）
-        assert_eq!(floor_rebuild_text(3, 7), "⟳ 音符位置重算 3/7");
+        assert_eq!(floor_rebuild_text(3, 7), "⟳ 音符位置重算 待算 3 / 共 7 颗");
     }
 
     /// 冲突清空之后：红字换成绿字（只在浏览器还开着时显示），且偏移为 0 时不占地方
