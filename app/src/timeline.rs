@@ -52,6 +52,11 @@ pub struct TimelineGeom {
     /// 自适应抽稀之后的拍线步长（秒）与它对应的拍数倍数
     pub step_sec: f64,
     pub mult: u32,
+    /// 公式的两个输入（读数里显示出来 —— "时间轴为什么这么短"通常一眼就看出来了：
+    /// 音乐那项是 `None` 就意味着**没装上音乐**）
+    pub music_sec: Option<f64>,
+    pub content_sec: f64,
+    pub content_beat: f64,
 }
 
 impl TimelineGeom {
@@ -71,6 +76,9 @@ impl TimelineGeom {
         Self {
             rect,
             duration,
+            music_sec: st.music_len(),
+            content_sec: st.chart.tmap.sec(st.content_end_beat),
+            content_beat: st.content_end_beat,
             span_lo: raw_lo.max(0.0),
             span_hi: raw_hi.clamp(0.0, duration),
             span_raw_lo: raw_lo,
@@ -89,6 +97,10 @@ impl TimelineGeom {
     pub fn t_of(&self, x: f32) -> f64 {
         let frac = ((x - self.rect.min.x) / self.rect.width().max(1.0)).clamp(0.0, 1.0);
         frac as f64 * self.duration
+    }
+
+    fn content_end_bits(&self) -> u64 {
+        self.content_sec.to_bits()
     }
 
     /// 拍线：`(横坐标, 是不是整拍大线)`。密度由 `step_sec` 定，**条数有上限**（防病态输入）。
@@ -141,13 +153,24 @@ pub fn readouts(
     let mut out = Vec::new();
 
     // 第 1 行左：总长 + 拍线（挤不下就只留总长）
+    let music = match geom.music_sec {
+        Some(m) => format!("{m:.1}s"),
+        None => "无音乐".to_owned(),
+    };
+    // 三档：把公式的两个输入也写出来 → 只看"总长"是不够的（"为什么这么短"要看输入）
+    let head_verbose = format!(
+        "总长 {:.1}s（音乐 {music} ｜ 内容 {:.1}s / {:.0} 拍）｜ 拍线 1/{}（{:.3}s）",
+        geom.duration, geom.content_sec, geom.content_beat, geom.mult, geom.step_sec
+    );
     let head_full = format!(
-        "总长 {:.1}s ｜ 拍线 1/{}（{:.3}s）",
-        geom.duration, geom.mult, geom.step_sec
+        "总长 {:.1}s（音乐 {music} ｜ 内容 {:.1}s）｜ 拍线 1/{}（{:.3}s）",
+        geom.duration, geom.content_sec, geom.mult, geom.step_sec
     );
     let head_short = format!("总长 {:.1}s", geom.duration);
     // **放不下就不画**：宁可空着，也不画半句被面板边缘裁掉的读数
-    let head = if fits(&head_full) {
+    let head = if fits(&head_verbose) {
+        Some(head_verbose)
+    } else if fits(&head_full) {
         Some(head_full)
     } else if fits(&head_short) {
         Some(head_short)
@@ -207,6 +230,7 @@ pub fn draw(
     lead_beats: f64,
 ) -> TimelineOut {
     let geom = TimelineGeom::new(rect, st, lead_beats);
+    trace_if_changed(&geom);
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 2.0, rgb(BG));
 
@@ -327,6 +351,41 @@ pub fn draw(
     out
 }
 
+/// `OPM_TL_TRACE=1`：**公式的输入与结果一变就打一行**（不是每帧打，避免刷屏）。
+///
+/// 为什么要它：用户报"时间轴状态无改变"时，唯一能分辨的情况是"他那边公式的输入是什么" ——
+/// 比如音乐压根没装上（`无音乐`），那时间轴当然短，而这不是总长公式的问题。
+/// 与 `--trace-startup` 同一类：把"猜"换成"看一行数"。
+fn trace_if_changed(geom: &TimelineGeom) {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<(u64, u64, u64)>>> = OnceLock::new();
+    if std::env::var_os("OPM_TL_TRACE").is_none() {
+        return;
+    }
+    let key = (
+        geom.duration.to_bits(),
+        geom.music_sec.map(f64::to_bits).unwrap_or(u64::MAX),
+        geom.content_end_bits(),
+    );
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+    let mut last = cell.lock().unwrap();
+    if *last == Some(key) {
+        return;
+    }
+    *last = Some(key);
+    eprintln!(
+        "[tl] 总长 {:.3}s = max(音乐 {}, 内容 {:.3}s / {:.1} 拍) + {} 拍",
+        geom.duration,
+        match geom.music_sec {
+            Some(m) => format!("{m:.3}s"),
+            None => "无音乐".to_owned(),
+        },
+        geom.content_sec,
+        geom.content_beat,
+        crate::state::EditorState::TIMELINE_TAIL_BEATS,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,17 +452,21 @@ mod tests {
         let st = EditorState::new(chart_from_doc(&doc_120bpm(&[40])));
         let info = TrackInfo { line: 0, track: "alpha", events: 0 };
 
-        let wide = TimelineGeom::new(rect(900.0), &st, 2.0);
+        let wide = TimelineGeom::new(rect(1100.0), &st, 2.0);
         let rs = readouts(&wide, Some(&info), &measure);
         assert!(rs.iter().any(|r| r.right), "宽轴上右上角那条要画");
         assert!(rs.iter().any(|r| r.row == 1 && r.text.contains("白线")), "宽轴上图例是完整版");
+        // 宽轴上把公式的两个输入也写出来（"为什么这么短"要看输入，不只看结果）
+        let head = rs.iter().find(|r| r.row == 0 && !r.right).unwrap();
+        assert!(head.text.contains("音乐") && head.text.contains("内容"), "{}", head.text);
         for r in &rs {
             assert!(measure(&r.text) <= wide.rect.width(), "放不下：{:?}", r.text);
         }
 
-        let mid = TimelineGeom::new(rect(300.0), &st, 2.0);
+        // 窄到装不下"总长 + 右上角那条"时：先丢右上角（左侧「事件轨道」那行有同样信息）
+        let mid = TimelineGeom::new(rect(200.0), &st, 2.0);
         let rs = readouts(&mid, Some(&info), &measure);
-        assert!(rs.iter().all(|r| !r.right), "中等宽度先丢右上角那条");
+        assert!(rs.iter().all(|r| !r.right), "窄轴上先丢右上角那条：{rs:?}");
         for r in &rs {
             assert!(measure(&r.text) <= mid.rect.width(), "{:?}", r.text);
         }
@@ -417,6 +480,58 @@ mod tests {
         // 挤到连"总长"都放不下时：一条都不画（宁可空着，也不裁半句）
         let none = readouts(&TimelineGeom::new(rect(10.0), &st, 2.0), Some(&info), &measure);
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// 没有音乐时读数要**明说**（"时间轴为什么短"最常见的原因就是音乐没装上）
+    #[test]
+    fn readout_says_so_when_there_is_no_music() {
+        let st = EditorState::new(chart_from_doc(&doc_120bpm(&[40])));
+        let measure = |s: &str| s.chars().count() as f32 * 8.0;
+        let g = TimelineGeom::new(rect(600.0), &st, 2.0);
+        assert_eq!(g.music_sec, None);
+        let rs = readouts(&g, None, &measure);
+        let head = &rs[0].text;
+        assert!(head.contains("无音乐"), "{head}");
+        assert!(head.contains("总长"), "{head}");
+    }
+
+    /// **点击时间轴要能 seek**（重写之后这条最容易被碰坏：`allocate_rect` 的位置变了）
+    #[test]
+    fn clicking_the_timeline_requests_a_seek() {
+        let mut st = EditorState::new(chart_from_doc(&doc_120bpm(&[40]))); // 总长 25s
+        st.overlay_beats = 8.0;
+        let ctx = egui::Context::default();
+        let r = rect(500.0);
+        let raw_click = |x: f32| egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(x, r.center().y)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(x, r.center().y),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(x, r.center().y),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        // 第一帧只做命中注册（egui 的老规矩：frame 0 指针、frame 1 按键），第二帧才算点击
+        let mut out = None;
+        let mut frame = ctx.run_ui(raw_click(r.center().x), |ui| {
+            draw(ui, &st, r, 2.0);
+        });
+        frame.textures_delta.clear();
+        let mut frame2 = ctx.run_ui(raw_click(r.center().x), |ui| {
+            out = draw(ui, &st, r, 2.0).seek;
+        });
+        frame2.textures_delta.clear();
+        let t = out.expect("点在时间轴上应当请求 seek");
+        assert!((t - 12.5).abs() < 0.6, "正中间 ≈ 总长一半（25s/2 = 12.5s），实际 {t}");
     }
 
     /// 黄线/浅色带取的是**编辑区**跨度（与叠加层同一套 anchor），不是播放头那一瞬间
