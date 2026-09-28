@@ -1,7 +1,8 @@
 # OpenPhM 应用骨架（Linux 优先）
 
-制谱器的第一版 UI 骨架。**开发与验证都在 Linux（Wayland/KDE）**；Windows 侧现在**能交叉编译出 exe
-并在 Wine 上跑通**（含无头渲染），见下面「Windows exe（交叉编译）」一节 —— 但**没有在真 Windows 机器上跑过**。
+制谱器的第一版 UI 骨架。**开发与验证都在 Linux（Wayland/KDE）**；Windows 侧能**交叉编译出 exe**
+并在 Wine 上跑通（GUI 窗口、无头渲染、中文显示都验过），见「Windows exe（交叉编译）」一节 ——
+但**没有在真 Windows 机器上跑过**。中文**自带字体**（内嵌思源黑体，不依赖系统字体），见「字体」一节。
 
 ## 启动到底在等什么（`--trace-startup`）
 
@@ -17,7 +18,7 @@ debug 构建，热启动取 5 次中位）实测：
 | winit 事件循环 + 开窗口 + wgpu 实例 + Vulkan loader/ICD | **~720 ms** | **最大块**，波动也最大（实测 430–800 ms） |
 | 设备创建 + surface 配置 + eframe 装配（到 `App::new`） | **~630 ms** | 第二大块 |
 | `App::new` + Playfield 回调资源 | ~0.2 ms | 快 |
-| **中/韩文字体装载** | **~220 ms** | `fc-scan` TTC 约 31 ms + 读 8MB OTF / 19MB TTC + egui 解析字体（`set_fonts` 触发重建） |
+| **中/韩文字体装载** | **~220 ms → 现 ~37 ms** | 改成**内嵌字体**后：不读盘、不起 `fc-match`/`fc-scan`（三个样本 32.8/36.0/36.9 ms，其中还含读 19 MB 系统 TTC 的韩文回退）。见「字体」一节 |
 | **首帧 UI 构建** | **~300 ms** | 首帧字体图集/度量 + 画启动页 |
 | **合计到"启动页画完"** | **~1.9 s**（最好一次约 1.0 s） | 之后还要一帧交给合成器显示 |
 
@@ -601,19 +602,54 @@ cargo build --release --target x86_64-pc-windows-gnu --bins
 `mmdevapi`/`ws2_32` + Universal CRT 的 api-set），**不含 `libgcc`/`libwinpthread`**（自包含）；
 Vulkan 与 D3D12 是运行时动态加载的，所以**要求 Windows 10+**（api-set 与 DXGI 都在那之后）。
 
-实测（本机 Wine，`WINEPREFIX` 放在 `target/wine-test`，构建目录本来就不进仓库）：
+release 体积：**`opm-app.exe` 29.3 MB**（其中内嵌字 8.4 MB，见下）/ **`opm-ctl.exe` 8.5 MB**
+（命令行那个**不留字体**：`include_bytes!` 的字节在那个二进制里没人引用，LTO 直接剔掉了 —— 实测 +0 KB）。
+
+实测（本机 Wine 11.18 staging，**默认前缀 `~/.wine`**，不外建环境）：
 
 | 检查 | 结果 |
 |---|---|
-| `opm-ctl.exe help` / `opm-app.exe --help` | 正常打印用法、退出 0（**GUI 那个二进制也起来了**） |
-| `opm-ctl.exe new --out smoke.opm --demo-notes 20` | 造出 8.6 KB 谱面；**本机 Linux 的 `opm-ctl` 能直接读**（格式互通） |
-| `--file smoke.opm validate --json` / `overlaps` | 正常（校验按契约报出 4 条 ERROR，退出码正确） |
-| `--file smoke.opm render --at 1.0 --out wine-render.png` | **wgpu 无头渲染成功**：320×180 PNG、26 个实例（音符块真的画出来了） |
+| `opm-ctl.exe help` / `opm-app.exe --help` | 正常打印用法、退出 0 |
+| `opm-app.exe --fonts` | 内嵌字体 + 355 字探针**全有字形**（见下节） |
+| `opm-ctl.exe new --out rel2.opm --demo-notes 24` | 造出 9.9 KB 谱面；**本机 Linux 的 `opm-ctl` 能直接读**（格式互通） |
+| `--file rel2.opm validate --json` / `overlaps` | 正常（校验按契约报 ERROR、退出码正确） |
+| `--file rel2.opm render --at 1.5 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例 → `artifacts/windows-exe-wine-render.png` |
+| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动）：中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态** → `artifacts/windows-exe-wine-ui.png` |
 
 **已知缺口（如实说）**：控制通道（`opm-app --control` / `opm-ctl --attach`）是 Unix socket，**Windows 上
 还没有等价实现**（该换命名管道，线协议与所有视图命令都不用改）—— 那里 `spawn_server`/`attach` 直接
-返回"未实现"：GUI 的 `--control` 会打一行提示，不假装启用。另外 GUI **窗口**在 Wine 下没测（这台机器
-只有 Wayland、没有 X11 显示），真 Windows 机器上的运行仍待验证。
+返回"未实现"：GUI 的 `--control` 会打一行提示，不假装启用。真 Windows 机器上的运行仍待验证
+（驱动层、输入法、DPI、`cmd /C start` 那条文件对话框路径都只有真机能定）。
+另：Wine 收尾时**偶尔**以 SIGKILL(137) 结束（同一二进制重跑 3 次：0/0/137），stdout 完整、Linux 侧退出码 0
+—— 记一笔，不追（Wine 不是目标平台）。
+
+## 字体：自带 CJK，不依赖系统字体
+
+`egui` 默认字体**不含 CJK 字形**，不装载就是一片豆腐块。以前这里是 `fc-match`/`fc-scan` 去系统里找字体 ——
+**Windows 上没有 fontconfig，那条路直接失效**（现场复现：Wine 默认前缀的 `C:\windows\Fonts` 是**空的**，
+连拉丁字体都没有）。所以现在**把字体带在身上**：
+
+- `app/assets/fonts/SourceHanSansCN-Regular.otf`（思源黑体 CN Regular，8.4 MB，**OFL-1.1**，许可原文
+  `SourceHanSansCN-LICENSE.txt` 随字体一起在仓库里）用 `include_bytes!` 编进二进制；
+- **单字面 SC 的 OTF**（索引 0 就是 SC）—— 顺便绕开 §7.1 那个坑：`NotoSansCJK-*.ttc` 里 0=JP/1=KR/2=SC，
+  而 `FontData::from_owned` 固定用索引 0 ⇒ 加载集合会让中文用上**日文字形**；
+- 于是**两个平台渲染完全一致**，而且启动少了 `fc-match` + `fc-scan` 两个子进程与 8 MB 读盘；
+- 想换字体：`OPM_FONT=<字体文件>[:字面索引]`（指了却读不到 ⇒ **回退内嵌**，不会因为一个坏路径变豆腐块）；
+- 韩文：内嵌那份不含 Hangul，Linux 上照旧借系统 `NotoSansCJK-Regular.ttc` 的 KR 字面（`install_kr_fallback`）。
+
+**"不会出豆腐块"是可执行的**：`opm-app --fonts` 造一个无头 egui、装上字体、拿 **355 字的探针**
+（界面词汇 + 常见汉字/标点 + 拉丁数字 + 假名）逐字问 `has_glyphs`，缺任何一个就退出码 3：
+
+```console
+$ opm-app --fonts
+CJK 字体          : 内嵌 思源黑体 CN Regular（OFL-1.1）（字面索引 0，探针 355 字） —— CJK 覆盖完整，不会出现豆腐块
+字体许可          : 思源黑体 CN Regular © Adobe，SIL Open Font License 1.1（原文见 app/assets/fonts/SourceHanSansCN-LICENSE.txt）
+$ wine opm-app.exe --fonts        # Windows 二进制、默认 wine 前缀（那边一个字体文件都没有）
+（同上两行）
+```
+
+同一条断言也在单测里（`fonts::tests::embedded_font_covers_the_probe_text`）—— 无头、无需 GPU，
+所以 Linux 与 Windows 上是同一条。
 
 ## 快速放置音符：Q/W/E/R（hold 跟随鼠标）
 
@@ -793,7 +829,8 @@ GUI 里对应工具栏的 `边界框` 勾选框与 `线半长` 拖动框；无�
   `scale_px = min(vp_w/1350, vp_h/900)`（等比 letterbox）把 RPE 坐标（x∈±675, y∈±450）映射到该矩形，画完恢复全屏 viewport。
   ⇒ 面板布局变化、分数 DPI 缩放都不会错位。**不要**用"铺满全屏 NDC 再被裁剪"的写法（S1b 踩过：矩形超出裁剪区会让 egui 静默丢弃整个回调）。
 - **CJK 字体必须自己装**（`src/fonts.rs`）：egui 默认字体无 CJK 字形；且 `NotoSansCJK-Regular.ttc` 的字面索引是 **0=JP、1=KR、2=SC**，
-  而 `FontData::from_owned` 固定用索引 0 ⇒ 直接加载会让中文用上日文字形且不报错。本实现优先单字面 SC 字体，退化时用 `fc-scan` 查正确索引。
+  而 `FontData::from_owned` 固定用索引 0 ⇒ 直接加载会让中文用上日文字形且不报错。本实现**内嵌单字面 SC 的 OTF**（索引 0 就是 SC，从根上避开这个坑）；
+  唯一还在用 `fc-scan` 的地方是 Linux 的韩文回退（借系统 TTC 的 KR 字面）。
 - **时间轴自适应抽稀**：整谱可见时拍线密度会远超像素密度（20 万音符的谱面曾画出 5 万条线，把帧时间拖到 20 ms）。
 - **对齐自检**（`--verify-align`）：RPE 四角与中心同时由自研管线（品红方块）与 egui 画笔（青色十字）绘制，两者重合即映射正确。
 

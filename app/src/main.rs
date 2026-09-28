@@ -202,6 +202,18 @@ fn main() -> eframe::Result<()> {
         trace.on = true;
     }
     trace.mark("参数解析");
+    // --fonts：只做字体自检，不开窗口。给 agent/CI（尤其是 Windows —— 那边没有 fontconfig）
+    // 一条**可执行**的证据："中文会不会变豆腐块"。缺字形时退出码 3。
+    // 放在启动横幅**之前**：这样输出就是干净的两行，不用让人从横幅里挑。
+    if args.fonts {
+        let cov = fonts::check();
+        println!("CJK 字体          : {}", cov.summary());
+        println!("字体许可          : {}", fonts::LICENSE_NOTE);
+        if !cov.missing.is_empty() {
+            std::process::exit(3);
+        }
+        return Ok(());
+    }
     println!("== OpenPhM UI 骨架 ==");
     println!(
         "  音符={} 长度={:.1}s 前瞻={}s 压力模式={} 限帧={:?} 强制缩放={:?} bench={}",
@@ -2410,13 +2422,9 @@ impl eframe::App for App {
             }
             mark(self, "wgpu 渲染回调资源（Playfield）", t_step);
             let t_fonts = Instant::now();
-            match fonts::install(&ctx) {
-                Some(f) => {
-                    println!("  CJK 字体          : {}（字面索引 {}）", f.desc, f.index);
-                    fonts::install_kr_fallback(&ctx);
-                }
-                None => eprintln!("  ⚠️ 未找到 CJK 字体，中文将显示为豆腐块"),
-            }
+            let f = fonts::install(&ctx);
+            println!("  CJK 字体          : {}", f.desc);
+            fonts::install_kr_fallback(&ctx);
             if let Some(s) = self.args.scale {
                 ctx.set_pixels_per_point(s);
             }

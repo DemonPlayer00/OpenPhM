@@ -130,6 +130,9 @@ pub struct Args {
     pub overlay_alpha: f32,
     /// `--audio-probe FILE`：只解码并打印信息然后退出（agent/排障用，不开窗口）
     pub audio_probe: Option<String>,
+    /// `--fonts`：只做字体自检（装进无头 egui、逐字问有没有字形）然后退出，**不开窗口**。
+    /// 这是"中文会不会变豆腐块"的可执行证据 —— 在 Windows/Wine 上也能跑。
+    pub fonts: bool,
     /// 音符区窗口 X 偏移（视图设置）：`--window-offset X`（RPE 单位）
     pub window_offset: f32,
     /// 启动时把某个对话框摊开（截图/agent 验证用）：`--dialog file|new|guard`
@@ -181,6 +184,7 @@ impl Default for Args {
             overlay_beats: state::EditorState::DEFAULT_OVERLAY_BEATS,
             overlay_alpha: 0.82,
             audio_probe: None,
+            fonts: false,
             beat_div: None,
             lane_div: None,
             window_offset: 0.0,
@@ -302,6 +306,7 @@ pub fn parse(argv: &[String]) -> Parsed {
                     a.audio_probe = Some(v);
                 }
             }
+            "--fonts" => a.fonts = true,
             "--overlay-beats" => {
                 if let Some(v) = take(&mut i) {
                     a.overlay_beats = v.parse().unwrap_or(a.overlay_beats);
@@ -377,6 +382,7 @@ OpenPhM —— Phigros 谱面编辑器（GUI）
   --verify-align        对齐自检
   --notes N             造 N 个音符的演示谱面（默认 0：不内建任何谱面）
   --audio-probe FILE    只解码并打印音频信息后退出（不开窗口）
+  --fonts               只做 CJK 字体自检（内嵌字体 + 逐字问字形）后退出（不开窗口）
   --verbose-updates     每次广播/重建打一行日志
   --trace-startup       打印启动耗时分解（进程启动 → 首帧；也认 OPM_TRACE_STARTUP=1）
   -h, --help            显示本说明";
@@ -444,6 +450,14 @@ mod tests {
         assert!(!parse_str(&[]).args.trace_startup);
         assert!(parse_str(&["--trace-startup"]).args.trace_startup);
         assert!(USAGE.contains("--trace-startup"));
+    }
+
+    /// 字体自检：默认关，`--fonts` 打开（"中文会不会变豆腐块"的可执行证据，见 `opm_app::fonts`）
+    #[test]
+    fn fonts_self_check_is_opt_in() {
+        assert!(!parse_str(&[]).args.fonts);
+        assert!(parse_str(&["--fonts"]).args.fonts);
+        assert!(USAGE.contains("--fonts"));
     }
 
     /// 数值参数写坏了不许 panic、也不许把默认值写成 0（"没听懂就用默认"）

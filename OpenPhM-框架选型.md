@@ -2648,21 +2648,99 @@ cargo build --release --target x86_64-pc-windows-gnu --bins
 api-set），**没有 `libgcc_s_*.dll` / `libwinpthread-1.dll`**（Rust 的 windows-gnu 自包含链接）。
 Vulkan / D3D12 是运行时动态加载 ⇒ 实际门槛是 **Windows 10+**（api-set 与 DXGI 都在那之后）。
 
-### 实测（Wine，`WINEPREFIX` 放在 `target/wine-test`，不进仓库）
+### 实测（Wine 11.18 staging，**默认前缀 `~/.wine`**）
+
+> 用户随后明确："**无需自己创建 wine 环境，使用默认 wine 环境**" —— 一开始我图干净把 `WINEPREFIX`
+> 放在 `target/wine-test`，现已删掉，下面全部改用默认前缀复测。
 
 | 检查 | 结果 |
 |---|---|
-| `opm-ctl.exe help` | 用法正常打印、退出 0（第二次起 ~0.9 s；首次运行是建 prefix） |
-| `opm-app.exe --help` | 同样正常 —— **GUI 那个二进制也起来了**（窗口本身没测：本机只有 Wayland、没 X11） |
-| `opm-ctl.exe new --out smoke.opm --name … --demo-notes 20` | 造出 8643 字节 `.opm`；**本机 Linux 的 `opm-ctl` 直接读得出来** ⇒ 两边文件格式互通 |
-| `--file smoke.opm validate --json` | 正常，按契约报 4 条 ERROR（demo 谱的轨道没铺到谱末） |
-| `--file smoke.opm overlaps` | 退出码 0（无重叠） |
-| `--file smoke.opm render --at 1.0 --width 320 --height 180 --out wine-render.png` | **wgpu 无头渲染成功**：320×180 PNG、26 个实例，图里音符块与判定线都在（Mesa 那几行 `failed to create dri2 screen` 是 Wine 侧的 EGL 噪声，不影响结果） |
+| `opm-ctl.exe help` | 用法正常打印、退出 0 |
+| `opm-app.exe --help` | 同样正常 |
+| `opm-ctl.exe new --out rel2.opm --demo-notes 24` | 造出 9887 字节 `.opm`；**本机 Linux 的 `opm-ctl` 直接读得出来** ⇒ 两边文件格式互通 |
+| `--file rel2.opm validate --json` / `overlaps` | 正常（按契约报 ERROR、退出码正确） |
+| `--file rel2.opm render --at 1.5 --width 480 --height 270 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例，图里音符块与判定线都在（`artifacts/windows-exe-wine-render.png`） |
+| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动 —— 这台机器没有 X11，本来以为测不了），中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态**：`artifacts/windows-exe-wine-ui.png` |
+
+**这最后一行顺带补上了 §7.29 留下的窟窿**：`#[cfg(windows)]` 那几处（`cmd /C start`、`CREATE_NO_WINDOW`、
+`.exe` 候选、"获取 7z…"按钮）以前只是"逻辑上单测过"，现在是**在 Windows 二进制上真的看见了**。
+
+体积（release，LTO thin）：`opm-app.exe` **29.3 MB**（含内嵌字体 8.4 MB）、`opm-ctl.exe` **8.5 MB**
+—— 命令行那个**不留字体**：`include_bytes!` 的字节在那个二进制里没人引用，LTO 直接剔掉（实测 +0 KB）。
 
 ### 仍未验证 / 缺口（照旧写明白）
 
 - **真 Windows 机器没跑过**（这台机器只有 Linux + Wine）：驱动层、输入法、文件对话框（`cmd /C start`）、
   多显示器 DPI 这些只有真机能定；
-- **GUI 窗口**在 Wine 下没测（缺 X11 显示）；
+- ~~GUI 窗口在 Wine 下没测~~ → **已测到**（Wine 的 Wayland 驱动，见上表最后一行）；
 - **控制通道在 Windows 上不存在**：命名管道待做（协议与全部视图命令可原样复用，只换传输）；
-- 未做 32 位目标（`i686-pc-windows-gnu`）与 MSVC 工具链（`x86_64-pc-windows-msvc`，需要 MSVC 链接器）。
+- 未做 32 位目标（`i686-pc-windows-gnu`）与 MSVC 工具链（`x86_64-pc-windows-msvc`，需要 MSVC 链接器）；
+- Wine 收尾**偶尔**以 SIGKILL(137) 结束（同一二进制重跑 3 次：0/0/137；Linux 侧 release 稳定 0）——
+  记一笔，不追：Wine 不是目标平台。
+
+## 7.46 自带 CJK 字体：从"找系统字体"改成"把字体带在身上"（2026-09-28）
+
+用户："**自带cjk字体以防止文字变为方块。**"
+
+### 问题：Windows 上没有 fontconfig，旧路径整个失效
+
+§7.1 定的做法是拿 `fc-match`/`fc-scan` 去系统里找中文字体。那在 Linux 上能用，**在 Windows 上根本
+没有这两个命令** —— `fonts::install()` 会走到"没找到字体"那一支，界面上的中文（以及通知、模态、
+状态栏）会变成一片豆腐块。现场复现（默认 Wine 前缀）：
+
+```console
+$ ls ~/.wine/drive_c/windows/Fonts | wc -l
+0                       # 一个字体文件都没有，连拉丁字体都没有
+$ wine cmd /c where fc-match
+                        # 空：Wine 里没有 fontconfig
+```
+
+顺带一提，即便是 Linux，"找字体"这条路也不是免费的：`fc-match` + `fc-scan` 两个子进程 + 读 8 MB OTF
+（实测那一档 ~220 ms）。
+
+### 修法：内嵌思源黑体 CN Regular，三级一起收掉
+
+- `app/assets/fonts/SourceHanSansCN-Regular.otf`（8429224 字节，**OFL-1.1**，`SourceHanSansCN-LICENSE.txt`
+  随字体入仓 —— OFL 要求随附许可原文）用 `include_bytes!` 编进二进制；
+- **单字面 SC 的 OTF（索引 0 就是 SC）**：顺手把 §7.1 那个坑从根上删掉（`NotoSansCJK-*.ttc` 的
+  0=JP/1=KR/2=SC + `FontData::from_owned` 固定索引 0 = 中文用日文字形）；
+- `choice_from_env` / `parse_override` 是纯函数：默认内嵌，`OPM_FONT=<文件>[:字面索引]` 可换；
+  **指了却读不到 ⇒ 回退内嵌**（不让一个坏路径把界面变成豆腐块）。`parse_override` 专门处理
+  "`C:\Windows\Fonts\msyh.ttc` 里的冒号不是字面索引分隔符"这件事，有单测；
+- `install()` 的返回类型从 `Option<LoadedFont>` 改成 `LoadedFont`：**"没字体"这个状态被删除了**，
+  调用点那条 `⚠️ 未找到 CJK 字体，中文将显示为豆腐块` 的告警随之消失（不存在的事不该留告警）；
+- 韩文：内嵌那份不含 Hangul，Linux 上照旧借系统 `NotoSansCJK-Regular.ttc` 的 KR 字面
+  （`install_kr_fallback`，找不到就静默跳过）。
+
+### "不会出豆腐块"是**可执行**的：`opm-app --fonts`
+
+字体这事"能加载"与"能显示"是两回事，而缺字形在界面上就是一片方框。所以加了一个不开窗口的自检：
+造一个无头 `egui::Context`、装字体、跑一帧（**egui 要有第一帧之后才有字体表** —— 在那之前
+`fonts_mut` 会 panic："No fonts available until first call to Context::run()"，这是踩过的坑），
+然后拿 **355 字的探针**（界面词汇 + 常见汉字/标点 + 拉丁数字 + 假名）逐字问 `has_glyphs`，
+缺任何一个 ⇒ 打印缺哪些字并**退出码 3**。
+
+```console
+$ opm-app --fonts
+CJK 字体          : 内嵌 思源黑体 CN Regular（OFL-1.1）（字面索引 0，探针 355 字） —— CJK 覆盖完整，不会出现豆腐块
+字体许可          : 思源黑体 CN Regular © Adobe，SIL Open Font License 1.1（原文见 app/assets/fonts/SourceHanSansCN-LICENSE.txt）
+
+$ wine target/x86_64-pc-windows-gnu/release/opm-app.exe --fonts     # 默认 wine 前缀：那边一个字体文件都没有
+（同上两行，exit 0）
+```
+
+同一条断言进了单测（`fonts::tests::embedded_font_covers_the_probe_text`），无头、不需要 GPU ——
+**Linux 与 Windows 上是同一条**。另外三条：默认即内嵌、`OPM_FONT` 解析（含 Windows 盘符）、
+坏路径回退。
+
+`cargo test`：**193 通过 / 0 失败 / 0 警告**（新增 5 条）；Windows 目标同样 **0 警告**。
+
+### 实测收益
+
+| 项 | 以前 | 现在 |
+|---|---|---|
+| 中/韩文字体装载（debug，三样本） | ~220 ms | **32.8 / 36.0 / 36.9 ms**（含读 19 MB 系统 TTC 的韩文回退） |
+| 依赖 | `fc-match` + `fc-scan` + 系统字体 | **无**（Windows/Wine/极简 Linux 都一样） |
+| 平台一致性 | 各平台各找各的 | 两个平台**同一份字体** ⇒ 渲染一致 |
+| `opm-app.exe` release | 20.9 MB | **29.3 MB**（+8.4 MB 字体） |
+| `opm-ctl.exe` release | 8.5 MB | **8.5 MB**（LTO 把没人引用的字体字节剔掉了） |
