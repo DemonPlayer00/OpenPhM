@@ -3766,3 +3766,33 @@ Ctrl 切换、组拖动（`GrabStart`/`GrabMove`/`GrabEnd`）、重叠禁用（�
 "值没变但 Response 说变了"的帧——没有它，这条测试就白写了。
 
 测试 **270 通过 / 0 失败 / 0 警告**。
+
+---
+
+## 7.65 缓动的选法改成"曲线 + in/out/io"两段（2026-09-28）
+
+用户：「修改缓动的选择方式：（缓动曲线|in/out/io）」
+
+这不是换一种排版，而是**同一个集合换一组坐标**：RPE 的 29 个缓动名字本来就是
+"曲线 × 变体"的笛卡尔积再加一个 `linear`（正弦/二次/三次/四次/五次/指数/圆形/回拉/弹性/弹跳
+× in/out/inOut）。所以做法是**先证明拆分无损**，再让界面用它：
+
+- `cmd::split_easing(name) -> Option<(EaseCurve, Option<EaseVariant>)>` 与
+  `cmd::easing_name(curve, variant) -> &'static str`（`cmd.rs`，紧挨着 `EASINGS` 放 ——
+  29 个名字的权威清单就在那里）。
+- **往返测试逐个钉住 29 个名字**（拆开再拼回来必须逐字相同），加一条**集合断言**：
+  下拉里所有能选的格子拼出来的名字**正好等于** `EASINGS`（一个不多一个不少）。
+  没有这条，"界面能不能表达全部 29 个"就只能靠人点一遍。
+- **真实存在的变体不是整齐的 3 个**：`quint`/`expo` 没有 `io`（RPE 的 29 个里就没有
+  `inOutQuint` / `inOutExpo`）。第一版把"每格都合法"写成 `EASINGS.contains(name)` 就放过了一个真问题
+  —— 那时 (Quint, io) 会**静默拼成 `linear`**（把用户选的曲线一起扔掉），而"集合正好 29 个"这条
+  断言因为两个退化名收敛到同一个而**恰好也成立**。现在 `EaseCurve::variants()` 给出每条的**准确清单**，
+  `clamp_variant` 负责"切曲线时旧变体不适用"（退到 `out` 而不是 `linear`），
+  并断言 `easing_name(Quint, InOut) == "outQuint"`。
+- 界面（`inspector.rs`）：两个 ComboBox —— 曲线（中文名 + 英文段，如"回拉 back"）与变体
+  （显示 `in`/`out`/`io`，即用户口径；名字里拼的仍是 RPE 的 `inOut`）。**线性那一格把变体下拉置灰**
+  而不是藏起来（布局不跳），"认不出的缓动"原样显示并说明，绝不拿猜测的名字改用户的文件。
+- 证据：`artifacts/easing-two-part.png`（`inOutBack` ⇒ 「回拉 back」+「io」；`linear` ⇒ 「线性」+
+  置灰的「out」）。
+
+测试 **275 通过 / 0 失败 / 0 警告**。

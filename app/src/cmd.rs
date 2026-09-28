@@ -28,6 +28,169 @@ pub const EASINGS: [&str; 29] = [
     "inElastic", "outBounce", "inBounce", "inOutBounce", "inOutElastic",
 ];
 
+// ---------------------------------------------------------------- 缓动的两段选择
+
+/// 缓动的**曲线**（用户要求：选择拆成"曲线 | in/out/io"两段，而不是在 29 个名字里翻）。
+///
+/// 29 个名字本来就是"曲线 × 变体"的笛卡尔积加一个线性，所以拆分是**无损**的
+/// （`split_easing` / `easing_name` 有往返测试逐个钉住）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EaseCurve {
+    Linear,
+    Sine,
+    Quad,
+    Cubic,
+    Quart,
+    Quint,
+    Expo,
+    Circ,
+    Back,
+    Elastic,
+    Bounce,
+}
+
+impl EaseCurve {
+    /// 下拉里的顺序（线性在最前，其余按"常用 → 特殊"）
+    pub const ALL: [EaseCurve; 11] = [
+        EaseCurve::Linear,
+        EaseCurve::Sine,
+        EaseCurve::Quad,
+        EaseCurve::Cubic,
+        EaseCurve::Quart,
+        EaseCurve::Quint,
+        EaseCurve::Expo,
+        EaseCurve::Circ,
+        EaseCurve::Back,
+        EaseCurve::Elastic,
+        EaseCurve::Bounce,
+    ];
+
+    /// 中文名（下拉里显示的是它；名字里的英文段由 [`Self::key`] 给）
+    pub fn label(self) -> &'static str {
+        match self {
+            EaseCurve::Linear => "线性",
+            EaseCurve::Sine => "正弦 sine",
+            EaseCurve::Quad => "二次 quad",
+            EaseCurve::Cubic => "三次 cubic",
+            EaseCurve::Quart => "四次 quart",
+            EaseCurve::Quint => "五次 quint",
+            EaseCurve::Expo => "指数 expo",
+            EaseCurve::Circ => "圆形 circ",
+            EaseCurve::Back => "回拉 back",
+            EaseCurve::Elastic => "弹性 elastic",
+            EaseCurve::Bounce => "弹跳 bounce",
+        }
+    }
+
+    /// 名字里的那一段（`out` + `Sine` 的 `Sine`；线性整名就是 `linear`）
+    fn key(self) -> &'static str {
+        match self {
+            EaseCurve::Linear => "linear",
+            EaseCurve::Sine => "Sine",
+            EaseCurve::Quad => "Quad",
+            EaseCurve::Cubic => "Cubic",
+            EaseCurve::Quart => "Quart",
+            EaseCurve::Quint => "Quint",
+            EaseCurve::Expo => "Expo",
+            EaseCurve::Circ => "Circ",
+            EaseCurve::Back => "Back",
+            EaseCurve::Elastic => "Elastic",
+            EaseCurve::Bounce => "Bounce",
+        }
+    }
+
+    /// 这条曲线**真实存在**的变体（RPE 的 29 个名字里没有 `inOutQuint` / `inOutExpo`
+    /// —— 下拉里因此也不该出现那两格，否则选出来的会是另一个名字）
+    pub fn variants(self) -> &'static [EaseVariant] {
+        match self {
+            EaseCurve::Linear => &[],
+            EaseCurve::Quint | EaseCurve::Expo => &[EaseVariant::In, EaseVariant::Out],
+            _ => &EaseVariant::ALL,
+        }
+    }
+
+    /// 这条曲线上**最接近** `variant` 的合法变体：不存在就退到 `out`（线性原样返回它的变体，
+    /// 因为线性根本不看变体）。
+    ///
+    /// "切成 quint 之后变体还停在 io" 是界面里真会发生的一步，夹取规则只有这一份实现
+    /// —— 界面与 [`easing_name`] 都用它。
+    pub fn clamp_variant(self, variant: EaseVariant) -> EaseVariant {
+        let avail = self.variants();
+        if avail.is_empty() || avail.contains(&variant) {
+            variant
+        } else {
+            EaseVariant::Out
+        }
+    }
+}
+
+/// 缓动曲线上的位置：**in / out / io**（用户用的就是这三个写法；RPE 里写作 `inOut`）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EaseVariant {
+    In,
+    Out,
+    InOut,
+}
+
+impl EaseVariant {
+    pub const ALL: [EaseVariant; 3] = [EaseVariant::In, EaseVariant::Out, EaseVariant::InOut];
+
+    /// 选择器里显示的字（用户口径：`in` / `out` / `io`）
+    pub fn label(self) -> &'static str {
+        match self {
+            EaseVariant::In => "in",
+            EaseVariant::Out => "out",
+            EaseVariant::InOut => "io",
+        }
+    }
+
+    /// 名字里的前缀（RPE 口径：`in` / `out` / `inOut`）
+    fn key(self) -> &'static str {
+        match self {
+            EaseVariant::In => "in",
+            EaseVariant::Out => "out",
+            EaseVariant::InOut => "inOut",
+        }
+    }
+}
+
+/// 把 29 个名字拆成 `(曲线, 变体)`；线性给 `None`（它没有变体）。
+/// 认不出来 ⇒ `None`（调用方按"未知缓动"处理，不要瞎猜一个）。
+pub fn split_easing(name: &str) -> Option<(EaseCurve, Option<EaseVariant>)> {
+    if name == EaseCurve::Linear.key() {
+        return Some((EaseCurve::Linear, None)); // 线性是唯一没有变体的
+    }
+    for curve in EaseCurve::ALL {
+        for v in EaseVariant::ALL {
+            let full = format!("{}{}", v.key(), curve.key());
+            if name == full {
+                return Some((curve, Some(v)));
+            }
+        }
+    }
+    None
+}
+
+/// `(曲线, 变体)` → 29 个名字之一。
+///
+/// **变体不适用于这条曲线时退到 `out`**（线性 ⇒ `linear`；`quint`/`expo` + `io` ⇒ `outQuint`/
+/// `outExpo`）—— 界面上"切曲线时顺手换了变体"不该发出一格不存在的名字，
+/// 而退回 `out` 比退回 `linear` 更接近用户的本意。界面自己也会夹变体（见 [`EaseCurve::variants`]），
+/// 所以正常情况下这条兜底根本走不到。
+pub fn easing_name(curve: EaseCurve, variant: EaseVariant) -> &'static str {
+    if curve == EaseCurve::Linear {
+        return "linear";
+    }
+    let want = curve.clamp_variant(variant);
+    // 拼出来的一定在 `EASINGS` 里（往返测试逐个钉住），所以能返回 'static
+    for name in EASINGS {
+        if split_easing(name) == Some((curve, Some(want))) {
+            return name;
+        }
+    }
+    "linear"
+}
+
 /// 校验实现，对应 `spec/opm-format.md` 第 8 节。
 /// **与 `spec/check.py` 是两份独立实现**，两者应在同一份文件上给出相同结论。
 pub fn validate(doc: &Document) -> Vec<Issue> {
@@ -374,5 +537,116 @@ fn compact(v: &Value) -> String {
         format!("{head}…")
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod easing_split_tests {
+    use super::*;
+
+    /// **29 个名字全都能拆回 `(曲线, 变体)` 再拼回去**（拆分必须无损，否则界面里选一圈
+    /// 就会把用户的缓动换成另一个名字）。
+    #[test]
+    fn every_easing_name_round_trips_through_the_two_part_selection() {
+        for name in EASINGS {
+            let (curve, variant) = split_easing(name).unwrap_or_else(|| panic!("拆不开 {name}"));
+            match variant {
+                Some(v) => assert_eq!(easing_name(curve, v), name, "{name} 往返不一致"),
+                None => {
+                    assert_eq!(curve, EaseCurve::Linear, "只有线性没有变体：{name}");
+                    assert_eq!(easing_name(curve, EaseVariant::Out), "linear");
+                }
+            }
+        }
+    }
+
+    /// **每一格都拼得出名字**，且名字一定合法（界面里随便点都不会发出非法缓动）
+    #[test]
+    fn every_curve_and_variant_pair_makes_a_known_name() {
+        for curve in EaseCurve::ALL {
+            for v in EaseVariant::ALL {
+                let name = easing_name(curve, v);
+                assert!(EASINGS.contains(&name), "{curve:?}+{v:?} 拼出了非法名字 {name}");
+            }
+        }
+        // 线性的变体是空的；quint/expo 只有 in/out（RPE 里没有 inOutQuint / inOutExpo）
+        assert!(EaseCurve::Linear.variants().is_empty());
+        assert_eq!(easing_name(EaseCurve::Linear, EaseVariant::InOut), "linear");
+        assert_eq!(
+            EaseCurve::Quint.variants(),
+            &[EaseVariant::In, EaseVariant::Out]
+        );
+        assert_eq!(EaseCurve::Expo.variants(), &[EaseVariant::In, EaseVariant::Out]);
+        for c in EaseCurve::ALL {
+            for v in c.variants() {
+                assert!(
+                    EASINGS.contains(&easing_name(c, *v)),
+                    "{c:?}+{v:?} 是下拉里会出现的一格，名字必须合法"
+                );
+            }
+        }
+        // 变体不适用时退到 `out`（不是 linear —— 退回线性等于把用户选的曲线也扔了）
+        assert_eq!(easing_name(EaseCurve::Quint, EaseVariant::InOut), "outQuint");
+        assert_eq!(easing_name(EaseCurve::Expo, EaseVariant::InOut), "outExpo");
+        // 下拉里所有格子拼出来的名字**正好是那 29 个**（一个不多一个不少）
+        let mut seen: Vec<&str> = Vec::new();
+        for curve in EaseCurve::ALL {
+            if curve == EaseCurve::Linear {
+                seen.push(easing_name(curve, EaseVariant::Out)); // 线性那一格（没有变体可选）
+                continue;
+            }
+            for v in curve.variants() {
+                let n = easing_name(curve, *v);
+                if !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+        }
+        seen.sort_unstable();
+        let mut want: Vec<&str> = EASINGS.to_vec();
+        want.sort_unstable();
+        assert_eq!(seen, want, "下拉能选出的名字应正好等于 EASINGS");
+    }
+
+    /// 认不出的名字：返回 `None`，不去猜一个（界面按"未知"显示原文，不动它）
+    #[test]
+    fn unknown_names_are_not_guessed() {
+        for bad in ["", "linear2", "sine", "InOutSine", "easeInOutQuad", "outSine "] {
+            assert!(split_easing(bad).is_none(), "{bad:?} 不该被认成某个缓动");
+        }
+        // 大小写敏感：RPE 的 `inOut` 就是大写 O
+        assert!(split_easing("inoutsine").is_none());
+        assert_eq!(
+            split_easing("inOutSine"),
+            Some((EaseCurve::Sine, Some(EaseVariant::InOut)))
+        );
+    }
+
+    /// 换曲线之后变体要**夹到这条曲线有的那些**（`quint`/`expo` 没有 `io`）
+    #[test]
+    fn switching_curve_clamps_the_variant() {
+        use EaseCurve as C;
+        use EaseVariant as V;
+        assert_eq!(C::Sine.clamp_variant(V::InOut), V::InOut, "正弦有 io");
+        assert_eq!(C::Quint.clamp_variant(V::InOut), V::Out, "五次没有 io ⇒ 退到 out");
+        assert_eq!(C::Expo.clamp_variant(V::InOut), V::Out);
+        assert_eq!(C::Quint.clamp_variant(V::In), V::In, "有的变体原样保留");
+        assert_eq!(C::Linear.clamp_variant(V::InOut), V::InOut, "线性不看变体");
+        // 夹完之后一定拼得出合法名字
+        for c in EaseCurve::ALL {
+            for v in EaseVariant::ALL {
+                let got = easing_name(c, c.clamp_variant(v));
+                assert!(EASINGS.contains(&got), "{c:?}+{v:?} → {got}");
+            }
+        }
+    }
+
+    /// 变体显示用 `in/out/io`（用户口径），名字里拼的是 RPE 的 `in/out/inOut`
+    #[test]
+    fn variant_labels_follow_the_user_wording() {
+        assert_eq!(EaseVariant::In.label(), "in");
+        assert_eq!(EaseVariant::Out.label(), "out");
+        assert_eq!(EaseVariant::InOut.label(), "io");
+        assert_eq!(easing_name(EaseCurve::Quad, EaseVariant::InOut), "inOutQuad");
     }
 }

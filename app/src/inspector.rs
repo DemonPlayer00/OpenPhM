@@ -152,16 +152,43 @@ pub fn inspector_ui(
                 changed |= value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed;
                 changed |= value_field(ui, &mut sv, "值起 ", 0.5, None).changed;
                 changed |= value_field(ui, &mut ev, "值止 ", 0.5, None).changed;
-                egui::ComboBox::from_id_salt("ev_easing")
-                    .selected_text(easing.clone())
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        for name in cmd::EASINGS {
-                            if ui.selectable_value(&mut easing, name.to_owned(), name).clicked() {
-                                changed = true;
+                // 缓动：**曲线 + in/out/io 两段**（用户要求）—— 29 个名字本来就是
+                // "曲线 × 变体"的笛卡尔积加一个线性，拆开选比在一长串里翻快得多。
+                // 拆分/拼回都在 `cmd`（有往返测试逐个钉住），这里只管画。
+                if let Some((curve, variant)) = cmd::split_easing(&easing) {
+                    let mut new_curve = curve;
+                    egui::ComboBox::from_id_salt("ev_easing_curve")
+                        .selected_text(curve.label())
+                        .width(104.0)
+                        .show_ui(ui, |ui| {
+                            for c in cmd::EaseCurve::ALL {
+                                ui.selectable_value(&mut new_curve, c, c.label());
                             }
-                        }
+                        });
+                    // 变体：线性没有（置灰而不是藏起来 —— 布局不跳，"为什么没得选"也看得出来）
+                    let mut new_variant = variant.unwrap_or(cmd::EaseVariant::Out);
+                    let avail = new_curve.variants();
+                    // 换了曲线之后旧变体可能不存在（`quint`/`expo` 没有 io）⇒ 先夹回去
+                    new_variant = new_curve.clamp_variant(new_variant);
+                    ui.add_enabled_ui(!avail.is_empty(), |ui| {
+                        egui::ComboBox::from_id_salt("ev_easing_variant")
+                            .selected_text(new_variant.label())
+                            .width(52.0)
+                            .show_ui(ui, |ui| {
+                                for v in avail {
+                                    ui.selectable_value(&mut new_variant, *v, v.label());
+                                }
+                            });
                     });
+                    let want = cmd::easing_name(new_curve, new_variant);
+                    if want != easing {
+                        easing = want.to_owned();
+                        changed = true;
+                    }
+                } else {
+                    // 认不出的缓动：**原样显示、不动它**（别拿一个猜的名字把用户的文件改了）
+                    ui.monospace(format!("缓动 {easing}（无法识别，已原样保留）"));
+                }
                 if changed {
                     // 头尾改时间走 resize_event（**只改这一个事件**；它早先会同步邻块，
                     // 用户明确否掉了那个语义，见 core.rs 的 `resize_event` 注释）；
