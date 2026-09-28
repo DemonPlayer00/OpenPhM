@@ -49,5 +49,6 @@ pub mod recents;
 pub mod render;
 pub mod shot;
 pub mod state;
+pub mod timeline;
 pub mod view;
 pub mod zip;
