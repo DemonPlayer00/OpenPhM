@@ -589,12 +589,21 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 continue;
             }
             let lead = (walk.to(note.time) * spd) as f32;
-            // **到线之后就不再往下走**：音符停在判定线上收缩消失（游戏里就是这样，
-            // 而不是从判定线下面继续往下掉）。`age > 0` = 已经到达判定线。
+            // ---- **判定线之下不显示**（用户口径，2026-09-28 明确）----
             //
-            // 到线**之前**不夹：负流速的音符从判定线下面飞上来，它就该画在线的下面
-            // （用户要求："音符只要在可见区域就要显示"——可见与否由下面的屏幕空间判据说了算）。
+            // 两类情形都落在这里：
+            // ① **流速为负**：音符从判定线下面飞上来，到线之前整条都在线下面；
+            // ② **流速从负变正的过零段**：过零点之前音符也还在线下面
+            //    （用户报的正是这一种："负→正期间的音符即使在判定线之下也会显示"）。
+            // 到线那一刻（`age ≥ 0`）就不再算"之下"了 ⇒ **击中效果照旧会播**，
+            // 音符本体随后停在判定线上收缩消失。
+            //
+            // 这条与"音符只要在可见区域就要显示"不冲突：后者管的是**别拿"离判定线多远"
+            // 当可见性判据**（判定线被移开/旋转时会漏画），本条管的是**在线下面那一半不画**。
             let age = state.playhead - note.time;
+            if age <= 0.0 && lead < 0.0 {
+                continue;
+            }
             let y_local = if age > 0.0 { 0.0 } else { lead };
             // 到达之后 0→1 的消失进度；`>= 1` 就彻底没了（只剩击中效果在场）。
             // **必须夹到 0**：`age < 0` 是"还没到"（绝大多数音符），不夹就成了负进度 ⇒
@@ -668,7 +677,8 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 // 段是**带符号**的：负流速时尾巴在判定线下面，段就画在线的下面。
                 let body_a = y_local;
                 let dy = tail_y - body_a;
-                if dy.abs() > 1.0 {
+                // 身子**整段都在判定线之下**（含贴线的那一端）⇒ 不画，与上面同一条口径
+                if dy.abs() > 1.0 && body_a.max(tail_y) > 0.0 {
                     let mid_local = [note.lane_x, body_a + dy * 0.5];
                     let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
                     if hold_selected {

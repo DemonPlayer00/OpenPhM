@@ -1273,7 +1273,9 @@ impl EditorState {
         // 走到判定线要 `510 / (120·|v|)` 秒 —— 流速 10（默认）是 0.42 秒，流速 1 是 4.25 秒。
         // `lookahead` 是**下限**（至少往后算这么多秒，保证它仍然是个有意义的旋钮），
         // 上限是 `MAX_BUILD_LOOKAHEAD`（流速趋近 0 时别把整份谱面都塞进实例列表）。
-        let v = l.min_speed_abs.max(crate::perf::MIN_SPEED_MAGNITUDE);
+        // 流速过零（或极慢）时 `speed_span` 会发散 —— 那正是"音符贴着判定线长时间逗留"的情形，
+        // 夹到上限即可（`clamp` 的下界也先夹一次，免得 floor > MAX 时 panic）
+        let v = l.min_speed_abs.max(1e-6);
         let speed_span = (RPE_WINDOW_HALF_H + Self::NOTE_SPAN_MARGIN) as f64
             / (crate::perf::SPEED_UNITS_PER_SEC * v);
         let floor = self.lookahead.min(Self::MAX_BUILD_LOOKAHEAD).max(0.05);

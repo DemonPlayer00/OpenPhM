@@ -885,11 +885,11 @@ fn every_note_becomes_visible_inside_the_window_before_its_hit() {
     }
 }
 
-/// **负流速支持**：流速为负时音符从判定线**下方**飞上来 —— 它照旧要显示
-/// （"音符只要在可见区域就要显示"），只是位置在线的下面；到线那一刻播一次击中效果，
-/// 之后本体停在线上收缩消失。
+/// **负流速**：音符从判定线**下方**飞上来 —— 但"判定线之下不显示"（用户口径），
+/// 所以到线之前一颗都不画；到线那一刻**击中效果照旧**（否则负流速段完全没有反馈），
+/// 音符本体随后停在判定线上收缩消失。
 #[test]
-fn a_negative_flow_speed_brings_notes_up_from_below() {
+fn a_negative_flow_speed_draws_nothing_below_the_line_but_still_flashes() {
     use opm_app::render::{HIT_FADE_SEC, HIT_FX_SEC};
     let doc = one_line_doc_speed(-10.0, &[(DocKind::Tap, 2.0, None, 0.0)]); // 2 拍 = 1 秒
     let mut st = EditorState::new(chart_from_doc(&doc));
@@ -901,33 +901,22 @@ fn a_negative_flow_speed_brings_notes_up_from_below() {
         build_instances(st, &mut inst);
         inst
     };
-    let note_y = |inst: &[NoteInstance]| -> Option<f32> {
-        inst.iter()
-            .find(|q| {
-                let c = q.color();
-                (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
-            })
-            .map(|q| q.center()[1])
-    };
-    // 到线之前：音符画在**判定线下方**、且在窗口里（越接近打击时刻越靠近判定线）
-    // 流速 10 ⇒ 1200 单位/秒：0.3 秒前偏移 -360、0.1 秒前 -120（都在 ±450 里）
-    let far = note_y(&at(&mut st, 0.7)).expect("0.7s：音符该在判定线下方可见");
-    let near = note_y(&at(&mut st, 0.9)).expect("0.9s：音符该更靠近判定线");
-    assert!(far < 0.0 && near < 0.0, "负流速下音符在线下面：{far} / {near}");
-    assert!(far < near, "越接近打击时刻越靠近判定线：{far} → {near}");
-    assert!(far >= -450.0, "还在窗口里：{far}");
-    // 再早一点就出窗口了 ⇒ 不建实例（不是"因为离判定线远"被丢的，是真的看不见）
-    assert_eq!(note_y(&at(&mut st, 0.5)), None, "0.5 秒前偏移 -600，已在窗口之外");
-    // 到线那一刻：闪光出现
-    assert!(flash_count(&at(&mut st, 1.0)) > 0, "负流速下击中效果要播");
-    // 效果结束 + 本体淡出之后：只剩判定线
+    // 到线之前：真值偏移是 −1200×(1−t)（在判定线下面）⇒ 一颗音符都不画
+    for t in [0.0, 0.5, 0.7, 0.9, 0.99] {
+        let inst = at(&mut st, t);
+        assert_eq!(
+            inst.len(),
+            1,
+            "t={t}：负流速下到线之前不该画音符（只剩判定线本体），实际 {} 个实例",
+            inst.len()
+        );
+    }
+    // 到线那一刻：击中效果要播（音符本体停在线上，随后淡出）
+    let hit = at(&mut st, 1.0);
+    assert!(flash_count(&hit) > 0, "负流速下击中效果仍要播");
+    // 效果与淡出都结束之后：又只剩判定线
     let after = at(&mut st, 1.0 + HIT_FADE_SEC + HIT_FX_SEC + 0.01);
     assert_eq!(after.len(), 1, "结束之后只剩线本体，实际 {}", after.len());
-    // 到线之后本体停在线上（不是继续往线上方跑）
-    let at_line = at(&mut st, 1.0 + 0.01);
-    if let Some(y) = note_y(&at_line) {
-        assert!(y.abs() < 1.0, "到线后应停在线上：{y}");
-    }
 }
 
 /// **"音符只要在可见区域就要显示"**：判据必须是**屏幕上的位置**，不是"离判定线多远"。
@@ -1037,10 +1026,11 @@ fn a_held_hold_tail_follows_the_current_time() {
     assert_eq!(body_top(&mut st, 4.0), None, "更晚也一样");
 }
 
-/// 广撒网：**各种流速 / 音符 speed / 时长**下，按住期间身子都必须一直在，
-/// 且尾部之后必须消失（上一版逐条查"缺哪几帧"找出来的 bug，收成一条回归测试）。
+/// 广撒网：**各种流速 / 音符 speed / 时长**下——
+/// 正流速时按住期间身子必须一直在、尾巴之后必须消失；
+/// **负流速时线下一律不画**（身子整段都在判定线之下）⇒ 过了头部的淡出窗口之后只剩判定线本体。
 #[test]
-fn a_held_hold_body_never_vanishes_mid_way() {
+fn a_held_hold_body_follows_the_speed_sign() {
     for speed in [10.0_f64, 1.0, -10.0] {
         for note_speed in [1.0_f32, 2.0] {
             for hold_beats in [1.0_f64, 4.0, 12.0] {
@@ -1050,38 +1040,152 @@ fn a_held_hold_body_never_vanishes_mid_way() {
                 let mut st = EditorState::new(chart_from_doc(&doc));
                 st.selected_line = usize::MAX;
                 let hold_sec = hold_beats * 0.5; // BPM 120
-                let mut t = 0.0;
-                while t < hold_sec - 0.05 {
+                // "音符本体（头或身子）在不在"：按**节奏色**认 —— 击中效果的环是提亮过的颜色
+                // （`rgb × 0.35 + 0.65`），闪光又是纯白，都不会被误认。
+                let note_quad = |st: &mut EditorState, t: f64| -> bool {
                     st.playhead = t;
                     let mut inst = Vec::new();
-                    build_instances(&st, &mut inst);
-                    assert!(
-                        inst.iter().any(|q| {
-                            let c = q.color();
-                            (c[0] - 0.75).abs() < 0.02
-                                && (c[1] - 0.90).abs() < 0.02
-                                && (c[2] - 1.0).abs() < 0.02
-                                && c[3] < 0.9
-                        }),
-                        "流速 {speed}、音符 speed {note_speed}、长 {hold_beats} 拍：t={t} 身子不见了"
-                    );
-                    t += 0.05;
-                }
-                // 尾巴之后：一律没有身子
-                st.playhead = hold_sec + 0.1;
-                let mut inst = Vec::new();
-                build_instances(&st, &mut inst);
-                assert!(
-                    !inst.iter().any(|q| {
+                    build_instances(st, &mut inst);
+                    inst.iter().any(|q| {
                         let c = q.color();
                         (c[0] - 0.75).abs() < 0.02
                             && (c[1] - 0.90).abs() < 0.02
                             && (c[2] - 1.0).abs() < 0.02
-                            && c[3] < 0.9
-                    }),
+                    })
+                };
+                // 从头部淡出之后扫到尾巴前 0.15 秒（`dy > 1` 的收尾不算）
+                let mut t = 0.1;
+                while t < hold_sec - 0.15 {
+                    let got = note_quad(&mut st, t);
+                    if speed > 0.0 {
+                        assert!(
+                            got,
+                            "流速 {speed}、长 {hold_beats} 拍：t={t} 按住期间身子该在"
+                        );
+                    } else {
+                        assert!(
+                            !got,
+                            "流速 {speed}、长 {hold_beats} 拍：t={t} 身子在判定线之下 ⇒ 不该画"
+                        );
+                    }
+                    t += 0.05;
+                }
+                // 尾巴之后：两种符号都不该再有身子
+                assert!(
+                    !note_quad(&mut st, hold_sec + 0.1),
                     "流速 {speed}、长 {hold_beats} 拍：尾巴过去了身子还在"
                 );
             }
         }
+    }
+}
+
+
+
+
+/// **判定线之上且在窗口里 ⇒ 必须被画；判定线之下 ⇒ 一律不画**（含"负→正"过零段）。
+///
+/// 这条是上面两条规则的**联合**验收，用**独立积分**（`perf::speed_travel`，不经过渲染侧的
+/// 单调累加器）当基准，对四种流速形状逐帧对账：
+/// · 线下采样（期望偏移 < −1）被画出来 ⇒ 失败；
+/// · 线上采样（期望偏移 > +1）没被画出来 ⇒ 失败。
+///
+/// 它一次抓出过两个真 bug：① 过零段里"线下却照画"（判定线之下不显示这条规则被漏掉过）；
+/// ② 过零段里"线上却没画"——构建窗口的下界按 `|v| ≥ 0.05` 过滤掉了过零点，
+/// 于是下界取成 1.25 ⇒ 窗口只有 3.4 秒，而**贴着判定线逗留**的音符在 3.45 秒外 ⇒ 整颗没实例。
+#[test]
+fn visible_notes_are_always_drawn_and_below_line_ones_never_are() {
+    for (a, b, from, to) in [
+        (2.0_f64, 10.0_f64, -10.0_f64, 10.0_f64),
+        (2.0, 4.0, -10.0, 10.0),
+        (4.0, 6.0, -20.0, 20.0),
+        (2.0, 20.0, -3.0, 3.0),
+    ] {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        doc.judge_lines.clear();
+        let mut l = JudgeLine::default();
+        // 拍 = 秒 × 2（BPM 120），用 1/4 拍的分母写精确
+        let beat = |sec: f64| Beat::new((sec * 8.0).round() as i64, 4);
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            Beat::zero(),
+            beat(a),
+            json!(from),
+            json!(from),
+            "linear",
+        ));
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            beat(a),
+            beat(b),
+            json!(from),
+            json!(to),
+            "linear",
+        ));
+        // 每颗音符一个**独一份**、且**落在窗口里**的 laneX（否则会认错音符 / 被横向裁掉）
+        let count = ((b + 1.0 - a) / 0.25).floor() as usize + 1;
+        let step = if count > 1 { 1100.0 / (count - 1) as f32 } else { 0.0 };
+        let mut s = a;
+        let mut i = 0;
+        while s <= b + 1.0 {
+            l.notes.push(DocNote::new(DocKind::Tap, beat(s), -550.0 + i as f32 * step));
+            s += 0.25;
+            i += 1;
+        }
+        doc.judge_lines.push(l);
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.selected_line = usize::MAX;
+        let tmap = st.chart.tmap.clone();
+        let events = st.chart.lines[0].tracks[4].events.clone();
+        let notes: Vec<(f64, f32)> = st.chart.lines[0]
+            .notes
+            .iter()
+            .map(|n| (n.time, n.lane_x))
+            .collect();
+
+        let (mut below, mut below_drawn, mut above, mut above_missing) =
+            (0usize, 0usize, 0usize, 0usize);
+        for (t_hit, lane) in &notes {
+            let mut t = (a - 1.0).max(0.0);
+            while t < *t_hit {
+                let want = opm_app::perf::speed_travel(&events, &tmap, t, *t_hit) as f32;
+                if want.abs() <= 380.0 {
+                    st.playhead = t;
+                    let mut inst = Vec::new();
+                    build_instances(&st, &mut inst);
+                    let drawn = inst.iter().any(|q| {
+                        let c = q.color();
+                        (q.center()[0] - lane).abs() < 1.0
+                            && (c[0] - 0.35).abs() < 0.02
+                            && (c[1] - 0.65).abs() < 0.02
+                            && (c[2] - 1.0).abs() < 0.02
+                    });
+                    if want < -1.0 {
+                        below += 1;
+                        if drawn {
+                            below_drawn += 1;
+                        }
+                    } else if want > 1.0 {
+                        above += 1;
+                        if !drawn {
+                            above_missing += 1;
+                            if above_missing <= 3 {
+                                eprintln!("  线上却没画：t_hit={t_hit:.2} t={t:.2} 偏移 {want:.0} lane {lane:.0}");
+                            }
+                        }
+                    }
+                }
+                t += 0.05;
+            }
+        }
+        assert_eq!(below_drawn, 0, "事件 [{a},{b}] {from}→{to}：判定线之下的音符被画了 {below_drawn} 次");
+        assert_eq!(
+            above_missing, 0,
+            "事件 [{a},{b}] {from}→{to}：窗口里的音符漏画了 {above_missing} 次"
+        );
+        assert!(below > 0 && above > 0, "用例本身要覆盖到线的两侧");
     }
 }
