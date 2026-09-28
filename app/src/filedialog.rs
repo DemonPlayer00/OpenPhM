@@ -46,6 +46,10 @@ pub const AUDIO_FILTER: Filter = Filter {
     label: "音频",
     patterns: "*.ogg *.mp3 *.wav *.flac *.m4a *.aac *.opus *.mp4",
 };
+/// opm 包（保存对话框用：目标是 `.opm` 一个文件）
+pub const OPM_FILTER: Filter = Filter { label: "opm 包", patterns: "*.opm" };
+/// RPE 谱面包（保存对话框用：目标是 `.pez` 一个文件）
+pub const PEZ_FILTER: Filter = Filter { label: "RPE 谱面包", patterns: "*.pez" };
 /// 曲绘/背景：常见位图（Phigros 侧实际就是 png/jpg）
 pub const IMAGE_FILTER: Filter = Filter {
     label: "曲绘",

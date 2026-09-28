@@ -136,6 +136,55 @@ pub fn write(doc: &Document, assets: &[zip::Entry]) -> Result<(Vec<u8>, zip::Bac
     zip::pack_preferred(&files)
 }
 
+/// 容器/谱面包的**条目清单**：谱面 + 资源（顺序固定：谱面在前）。
+///
+/// 打包（zip）与不打包（目录）两种形态共用这一份 —— 于是"打成包"和"摊成文件夹"
+/// **内容逐字节相同**，不会出现"包里有、文件夹里没有"这种两套逻辑的偏差。
+pub fn entries_for_dir(doc: &Document, assets: &[zip::Entry]) -> Vec<zip::Entry> {
+    let chart = serde_json::to_vec_pretty(&doc.to_json())
+        .unwrap_or_else(|_| b"{}".to_vec());
+    let mut files: Vec<zip::Entry> = Vec::with_capacity(assets.len() + 1);
+    files.push(zip::Entry { name: CHART_NAME.to_owned(), data: chart });
+    for a in assets {
+        if a.name == CHART_NAME {
+            continue; // 别让资源把谱面顶掉
+        }
+        files.push(a.clone());
+    }
+    files
+}
+
+/// 把一组条目**写进一个目录**（无压缩形态：`opm.json` + 资源，或 RPE 谱面包的三件套）。
+///
+/// 目录不存在就建。条目名必须是**纯文件名**（带目录的一律拒绝）—— 包内名字来自文档字段，
+/// 而文档字段是可以被手改成 `../x` 的；放行等于让"保存"写到目标目录之外。
+pub fn write_entries_to_dir(
+    entries: &[zip::Entry],
+    dir: &Path,
+    fid: &mut Fidelity,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {} 失败: {e}", dir.display()))?;
+    let mut bytes = 0usize;
+    for e in entries {
+        if e.name.is_empty() || e.name.contains('/') || e.name.contains('\\') {
+            return Err(format!(
+                "条目名 {:?} 不是合法文件名（不能带目录）—— 检查 meta.audio / meta.background",
+                e.name
+            ));
+        }
+        let p = dir.join(&e.name);
+        std::fs::write(&p, &e.data).map_err(|e| format!("写入 {} 失败: {e}", p.display()))?;
+        bytes += e.data.len();
+    }
+    fid.note(format!(
+        "无压缩文件夹：{} 个文件（共 {} KiB）→ {}",
+        entries.len(),
+        (bytes + 1023) / 1024,
+        dir.display()
+    ));
+    Ok(())
+}
+
 /// 写容器到文件；返回用的后端
 pub fn write_file(
     doc: &Document,

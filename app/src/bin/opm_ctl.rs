@@ -20,7 +20,7 @@ const USAGE: &str = r#"opm-ctl —— opm 谱面编辑入口（无头 / 附着�
 
 用法:
   opm-ctl new [--out FILE] [--name NAME] [--bpm BPM] [--demo-notes N]
-  opm-ctl convert IN [--to opm|opm-bare|rpe] [--out FILE] [--rpe-version N] [--quiet]
+  opm-ctl convert IN [--to opm|opm-dir|rpe|rpe-dir] [--out PATH] [--rpe-version N] [--quiet]
   opm-ctl --file FILE [--cmd JSON]... [--script FILE] [--stdin] [--save] [--json] [--quiet] [--atomic]
   opm-ctl --attach [SOCKET|auto] [--cmd JSON]... [--script FILE] [--stdin] [--json]
   opm-ctl --file FILE validate [--json]
@@ -423,7 +423,7 @@ fn run() -> i32 {
     }
 }
 
-/// `convert IN [--to opm|rpe] [--out FILE] [--rpe-version N] [--quiet]`
+/// `convert IN [--to opm|opm-dir|rpe|rpe-dir] [--out PATH] [--rpe-version N] [--quiet]`
 ///
 /// 输入按**内容**判格式；输出格式默认取反（RPE → opm，opm → RPE）。
 /// 无论成功与否都打印保真度报告 —— "能转"不等于"没丢东西"。
@@ -473,16 +473,21 @@ fn cmd_convert(args: &[String]) -> i32 {
     if !quiet {
         println!("输入 {} —— {}", input, in_fid.report());
     }
+    // 四种形态 = 格式（opm|rpe）× 打包开关（包 | 无压缩文件夹）；单文件 JSON 不再是保存形态
     let target = match to.as_deref() {
-        Some("opm") | Some("opmz") | Some("container") => SaveFormat::Opm, // `.opm` 容器
-        Some("opm-bare") | Some("opm.json") => SaveFormat::OpmBare,        // 裸工程文件
-        Some("rpe") => SaveFormat::Rpe,
+        Some("opm") | Some("opmz") | Some("container") => SaveFormat::OpmPacked,
+        Some("opm-dir") | Some("opm-folder") => SaveFormat::OpmFolder,
+        Some("rpe") | Some("pez") => SaveFormat::RpePacked,
+        Some("rpe-dir") | Some("rpe-folder") => SaveFormat::RpeFolder,
         None => match in_fid.source.as_str() {
-            "rpe" => SaveFormat::Opm, // RPE 谱面默认转成**容器**（正式形态）
-            _ => SaveFormat::Rpe,
+            "rpe" => SaveFormat::OpmPacked, // RPE 谱面默认转成 opm 包（正式形态）
+            _ => SaveFormat::RpePacked,
         },
         Some(other) => {
-            eprintln!("convert: --to 只能是 opm | opm-bare | rpe（得到 {other}）");
+            eprintln!(
+                "convert: --to 只能是 opm | opm-dir | rpe | rpe-dir（得到 {other}）\
+                 \n  四种形态 = 格式 × 打包开关；单文件 JSON 不再是保存形态"
+            );
             return 2;
         }
     };
@@ -491,16 +496,20 @@ fn cmd_convert(args: &[String]) -> i32 {
         None => {
             let stem = in_path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
             let dir = in_path.parent().unwrap_or(std::path::Path::new("."));
-            match target {
-                SaveFormat::Opm => dir.join(format!("{stem}.opm")),
-                SaveFormat::OpmBare => dir.join(format!("{stem}.opm.json")),
-                _ => dir.join(format!("{stem}.rpe.json")),
+            match (target.chart_format(), target.packed()) {
+                // 文件夹形态：目标是一个**目录**（里面放 opm.json / chart.json + 资源）
+                (_, Some(false)) => dir.join(stem),
+                (Some(opm_app::codec::Format::Rpe), _) => {
+                    dir.join(format!("{stem}{}", opm_app::codec::package::PACKAGE_EXTENSION))
+                }
+                _ => dir.join(format!("{stem}.opm")),
             }
         }
     };
     // 目标版本档位可切换（规范 §9 要求）：RPE 目标走 rpe::save_file，opm 目标走原生序列化
     let out_fid = match target {
-        SaveFormat::Rpe => match codec::rpe::save_file(
+        // 单文件 RPE json 已经不再是可选形态：四种形态一律走 core 的保存路径
+        SaveFormat::Auto => match codec::rpe::save_file(
             &doc,
             &out_path,
             RpeTarget { version: rpe_version, ..Default::default() },

@@ -1264,24 +1264,46 @@ impl App {
         filedialog::sanitize_stem(&self.edit_name)
     }
 
-    /// 这次保存（按当前草稿目标与所选格式）会写出什么扩展名。
+    /// 当前形态在这个目标路径上会写成什么（`Auto` 也在这里定下来）。
     ///
-    /// **不自己写一份匹配**：判据与真正写盘时用的 [`core::SaveFormat::resolve`] 完全相同
-    /// （`Auto` 先看目标扩展名，判不出来才沿用来源格式），扩展名再取自
-    /// [`opm_app::codec::Format::extension`]。原先这里另有一份 `match`，而对话框的提示文字
-    /// 又是第三份说法 —— 结果提示说"opm → `.opm.json`"、实际写出 `.opm`。
-    fn save_ext(&self) -> &'static str {
-        let (loaded, has_assets) = self
+    /// **不自己写一份匹配**：判据与真正写盘时用的 [`core::SaveFormat::resolve`] 是同一个 ——
+    /// 否则界面提示与实际产物一定会在某天分叉。
+    fn save_shape_of(&self, path: &std::path::Path) -> Result<core::SaveShape, String> {
+        let loaded = self
             .core
             .lock()
-            .map(|c| (c.source_format(), c.references_assets()))
-            .unwrap_or((opm_app::codec::Format::Opm, false));
-        match self.target_path() {
-            // 已有保存目标：沿用它的扩展名（`Auto` 就是"跟着名字走"）
-            Some(p) => self.save_format.resolve(&p, loaded).extension(),
-            // 还没有目标（新建的谱面）：**引用了音乐/曲绘就建议 `.opm` 容器** ——
-            // 否则第一次保存默认给 `曲名.opm.json`，音乐与曲绘会留在包外（用户要求它们进包）
-            None => self.save_format.suggested_extension(loaded, has_assets),
+            .map(|c| c.source_format())
+            .unwrap_or(opm_app::codec::Format::Opm);
+        self.save_format.resolve(path, loaded)
+    }
+
+    /// 补扩展名：**打包形态**才补（`.opm` / `.pez`）；文件夹形态的目标是目录，什么都不补
+    fn with_extension(&self, path: std::path::PathBuf) -> std::path::PathBuf {
+        let Some(ext) = self.save_shape_of(&path).ok().and_then(|s| s.extension()) else {
+            return path;
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(ext) {
+            path
+        } else {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(ext);
+            std::path::PathBuf::from(s)
+        }
+    }
+
+    /// 还没有保存目标时的**建议名字**，以及它是"目录"还是"文件"：
+    /// 打包形态给 `曲名.opm` / `曲名.pez`，文件夹形态给 `曲名`（一个目录）
+    fn suggested_save_name(&self) -> (String, bool) {
+        let loaded = self
+            .core
+            .lock()
+            .map(|c| c.source_format())
+            .unwrap_or(opm_app::codec::Format::Opm);
+        let stem = self.file_stem();
+        match self.save_format.suggested_extension(loaded) {
+            Some(ext) => (format!("{stem}{ext}"), false),
+            None => (stem, true),
         }
     }
 
@@ -1309,7 +1331,7 @@ impl App {
         if self.save_target().is_none() {
             // 界面草稿里有目标：先采用它再保存
             if let Some(p) = self.target_path() {
-                let p = filedialog::ensure_extension(&p, self.save_ext());
+                let p = self.with_extension(p);
                 self.target_draft = p.display().to_string();
                 self.save_doc_as(&p.display().to_string());
                 return;
@@ -1484,18 +1506,34 @@ impl App {
             c.path().map(std::path::Path::to_path_buf)
         };
         let dir = cur.as_deref().and_then(|p| p.parent()).map(|d| d.to_path_buf());
-        let start = Some(filedialog::start_for_new_save(
-            dir.as_deref(),
-            &self.file_stem(),
-            self.save_ext(),
-        ));
-        match filedialog::pick(filedialog::Which::Save, start.as_deref(), filedialog::CHART_FILTER) {
-            Ok(Some(p)) => {
+        let (name, is_dir) = self.suggested_save_name();
+        // **两种形态、两种系统框**：打包形态要选一个**文件**（给建议文件名 + 对应过滤器）；
+        // 文件夹形态要选一个**目录**（`pick_folder`）。起始位置都必须是**已存在**的目录 ——
+        // 传一个不存在的路径给 kdialog，KDE 会当目录处理并报"目录不存在"（踩过的坑）。
+        let (picked, err) = if is_dir {
+            let start = dir.as_deref().map(filedialog::nearest_existing_dir);
+            match filedialog::pick_folder(start.as_deref()) {
+                Ok(v) => (v, None),
+                Err(e) => (None, Some(e)),
+            }
+        } else {
+            let start = Some(filedialog::start_for_new_save(dir.as_deref(), &name, ""));
+            let filter = match self.save_shape_of(std::path::Path::new(&name)) {
+                Ok(core::SaveShape::RpeZip) => filedialog::PEZ_FILTER,
+                _ => filedialog::OPM_FILTER,
+            };
+            match filedialog::pick(filedialog::Which::Save, start.as_deref(), filter) {
+                Ok(v) => (v, None),
+                Err(e) => (None, Some(e)),
+            }
+        };
+        match (picked, err) {
+            (Some(p), _) => {
                 self.save_doc_as(&p.display().to_string());
                 self.sync_file_fields();
             }
-            Ok(None) => self.file_message = Some((true, "已取消".to_owned())),
-            Err(e) => {
+            (None, None) => self.file_message = Some((true, "已取消".to_owned())),
+            (None, Some(e)) => {
                 self.file_message = Some((false, format!("{e}（可在下面直接输入路径）")));
                 self.sync_file_fields();
                 self.file_dialog_open = true;
@@ -1566,12 +1604,8 @@ impl App {
 
     /// 另存为：格式由 `save_format` 决定（`Auto` 按扩展名 —— `.opm.json` 是 opm，`.json` 按 RPE 生态习惯）
     fn save_doc_as(&mut self, path: &str) {
-        let fmt = match self.save_format {
-            core::SaveFormat::Auto => "auto",
-            core::SaveFormat::Opm => "opm",           // 容器（正式形态）
-            core::SaveFormat::OpmBare => "opm-bare",  // 裸工程文件
-            core::SaveFormat::Rpe => "rpe",
-        };
+        // 形态名由库里给（`SaveFormat::as_str`）：界面上那一行说明与真正写盘用的是同一套词
+        let fmt = self.save_format.as_str();
         let resp = {
             let mut c = self.core.lock().unwrap();
             c.exec(&serde_json::json!({"op": "save", "path": path, "format": fmt}))
@@ -3037,15 +3071,40 @@ impl eframe::App for App {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label("另存为格式");
-                    ui.selectable_value(&mut self.save_format, core::SaveFormat::Auto, "自动");
-                    ui.selectable_value(&mut self.save_format, core::SaveFormat::Opm, "opm 包");
-                    ui.selectable_value(&mut self.save_format, core::SaveFormat::OpmBare, "裸 opm");
-                    ui.selectable_value(&mut self.save_format, core::SaveFormat::Rpe, "RPE");
-                    opm_app::dialog::hint(
-                        ui,
-                        "opm 包 = `.opm`（ZIP：谱面 + 音乐 + 曲绘）；裸 opm = `.opm.json`（可 diff）；RPE = `.json`",
-                    );
+                    // **两个轴**：格式（opm / RPE）× 打包开关 —— 一共就是那四种形态
+                    ui.label("另存为");
+                    let cur_chart = self.save_format.chart_format();
+                    let packed = self.save_format.packed().unwrap_or(true);
+                    if ui
+                        .selectable_label(self.save_format == core::SaveFormat::Auto, "自动")
+                        .on_hover_text("跟着目标走；新建的谱面默认存成 opm 包")
+                        .clicked()
+                    {
+                        self.save_format = core::SaveFormat::Auto;
+                    }
+                    for (label, f) in [
+                        ("opm", opm_app::codec::Format::OpmZip),
+                        ("RPE", opm_app::codec::Format::Rpe),
+                    ] {
+                        if ui
+                            .selectable_label(cur_chart == Some(f), label)
+                            .clicked()
+                        {
+                            self.save_format = core::SaveFormat::from_axes(f, packed);
+                        }
+                    }
+                    let mut p = packed;
+                    if ui
+                        .checkbox(&mut p, "打包成一个文件")
+                        .on_hover_text("勾上 = 一个 `.opm`/`.pez`；不勾 = 一个无压缩文件夹（可 diff、可进版本库）")
+                        .changed()
+                    {
+                        self.save_format = core::SaveFormat::from_axes(
+                            cur_chart.unwrap_or(opm_app::codec::Format::OpmZip),
+                            p,
+                        );
+                    }
+                    opm_app::dialog::hint(ui, self.save_format.describe());
                 });
                 ui.separator();
                 opm_app::dialog::hint(ui, format!("系统文件对话框：{native}"));
@@ -3109,7 +3168,7 @@ impl eframe::App for App {
                 }
                 Some(FileAction::UseTypedTarget) => {
                     if let Some(p) = self.target_path() {
-                        let p = filedialog::ensure_extension(&p, self.save_ext());
+                        let p = self.with_extension(p);
                         self.target_draft = p.display().to_string();
                         self.file_message =
                             Some((true, format!("保存目标 → {}", p.display())));

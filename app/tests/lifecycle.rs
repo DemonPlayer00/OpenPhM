@@ -72,13 +72,13 @@ fn save_without_target_is_refused_until_a_target_is_given() {
 
     // 目录不存在 → 报**能看懂**的错，而不是内核那句 "No such file or directory"
     let dir = tmpdir("save-target");
-    let missing = dir.join("没有这个目录").join("x.opm.json");
-    let err = core.save_as(&missing, SaveFormat::Opm).unwrap_err();
+    let missing = dir.join("没有这个目录").join("x.opm");
+    let err = core.save_as(&missing, SaveFormat::OpmPacked).unwrap_err();
     assert!(err.contains("目标目录不存在"), "{err}");
 
     // 指定目标后写成功；**文件还不存在也能指定**（这正是用户报的那个问题）
-    let fresh = dir.join("新谱面.opm.json");
-    let (written, _fid) = core.save_as(&fresh, SaveFormat::Opm).unwrap();
+    let fresh = dir.join("新谱面.opm");
+    let (written, _fid) = core.save_as(&fresh, SaveFormat::OpmPacked).unwrap();
     assert!(written.exists(), "{}", written.display());
     assert!(!core.is_dirty(), "保存成功后不该再是脏的");
     assert_eq!(core.path(), Some(written.as_path()));
@@ -123,7 +123,7 @@ fn new_chart_packs_audio_and_illustration_into_the_container() {
     );
 
     let target = dir.join("带资源的谱.opm");
-    let (written, fid) = core.save_as(&target, SaveFormat::Opm).unwrap();
+    let (written, fid) = core.save_as(&target, SaveFormat::OpmPacked).unwrap();
     assert!(written.exists(), "{}", written.display());
     // 保存后字段里应当是**包内名**（不是宿主机绝对路径），否则读回来会在容器里找不到条目
     assert_eq!(core.doc().meta.audio.as_deref(), Some("song.ogg"));
@@ -153,19 +153,29 @@ fn new_chart_packs_audio_and_illustration_into_the_container() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// 新建谱面**第一次保存**建议哪种扩展名：引用了音乐/曲绘就给容器 `.opm`（它们要进包），
-/// 没引用资源就维持裸 `.opm.json`（可 diff、可入版本库）；用户显式选的格式一律优先。
+/// 新建谱面**第一次保存**建议哪种名字：打包形态给扩展名，文件夹形态给目录名；
+/// **不再给单文件 JSON 当默认**（用户："保存时限定为 opm 或 rpe 包（或对应无压缩文件夹），而不是 json"）
 #[test]
-fn suggested_extension_prefers_the_container_when_assets_are_referenced() {
+fn suggested_extension_offers_packages_or_folders_never_json() {
     use opm_app::codec::Format;
-    assert_eq!(SaveFormat::Auto.suggested_extension(Format::Opm, true), ".opm");
-    assert_eq!(SaveFormat::Auto.suggested_extension(Format::Opm, false), ".opm.json");
-    // 从容器载入的文档（没有目标时）也仍旧给容器
-    assert_eq!(SaveFormat::Auto.suggested_extension(Format::OpmZip, false), ".opm");
-    // 用户显式选的格式优先于"有资源就容器"这条建议
-    assert_eq!(SaveFormat::OpmBare.suggested_extension(Format::OpmZip, true), ".opm.json");
-    assert_eq!(SaveFormat::Opm.suggested_extension(Format::Opm, false), ".opm");
-    assert_eq!(SaveFormat::Rpe.suggested_extension(Format::Opm, true), ".json");
+    // 打包形态：各自的包扩展名
+    assert_eq!(SaveFormat::OpmPacked.suggested_extension(Format::Opm), Some(".opm"));
+    assert_eq!(SaveFormat::RpePacked.suggested_extension(Format::Opm), Some(".pez"));
+    // 文件夹形态：没有扩展名（建议的是一个目录名）
+    assert_eq!(SaveFormat::OpmFolder.suggested_extension(Format::Opm), None);
+    assert_eq!(SaveFormat::RpeFolder.suggested_extension(Format::Rpe), None);
+    // 自动：新建的谱面默认给正式形态（opm 包）；从 RPE 来的给 `.pez`
+    assert_eq!(SaveFormat::Auto.suggested_extension(Format::Opm), Some(".opm"));
+    assert_eq!(SaveFormat::Auto.suggested_extension(Format::OpmZip), Some(".opm"));
+    assert_eq!(SaveFormat::Auto.suggested_extension(Format::Rpe), Some(".pez"));
+    // 任何一条都不该给出 json
+    for f in [SaveFormat::Auto, SaveFormat::OpmPacked, SaveFormat::OpmFolder, SaveFormat::RpePacked, SaveFormat::RpeFolder] {
+        for loaded in [Format::Opm, Format::OpmZip, Format::Rpe] {
+            if let Some(ext) = f.suggested_extension(loaded) {
+                assert!(!ext.contains("json"), "{f:?} + {loaded:?} → {ext}");
+            }
+        }
+    }
 }
 
 /// `references_assets` 是上面那条建议的判据：音乐/曲绘任一**非空白**即为真
@@ -179,4 +189,138 @@ fn references_assets_tracks_music_and_illustration() {
     assert!(!core.references_assets(), "只有空白路径不算引用");
     core.exec(&json!({"op": "new", "meta": {"name": "x", "background": "bg.png"}, "bpm": 174.0}));
     assert!(core.references_assets(), "有曲绘即为真");
+}
+
+/// **四种形态**（用户："4 种导出方式（opm|rpe|打包开关）"）各写一遍，并核对内容一致。
+///
+/// 要点：① opm 的包与文件夹内容**同源**；② RPE 的包与文件夹都带 `info.yml` + `chart.json`；
+/// ③ 打包出来的是 zip（PK 头），文件夹形态真的落在目录里；④ 保存后 `path` 指向能直接再打开的那个文件。
+#[test]
+fn four_save_shapes_produce_the_expected_artifacts() {
+    use opm_app::codec::{package, Format};
+    use opm_app::core::SaveFormat;
+    let dir = tmpdir("four-shapes");
+    let audio = dir.join("song.ogg");
+    let art = dir.join("bg.png");
+    std::fs::write(&audio, b"OggS-payload").unwrap();
+    std::fs::write(&art, b"\x89PNG-payload").unwrap();
+
+    let mut form = opm_app::recents::NewChartForm::default();
+    form.name = "四形态".to_owned();
+    form.charter = "我".to_owned();
+    form.bpm = 174.0;
+
+    // ---- ① opm 包（zip）与 ② opm 文件夹：内容同源 ----
+    let mut zip_core = EditCore::new();
+    zip_core.exec(&form.to_new_command());
+    zip_core.exec(&json!({"op": "set_meta", "set": {
+        "audio": audio.display().to_string(), "background": art.display().to_string()}}));
+    let packed = dir.join("四形态.opm");
+    let (p1, _f) = zip_core.save_as(&packed, SaveFormat::OpmPacked).unwrap();
+    assert_eq!(p1, packed);
+    let bytes = std::fs::read(&packed).unwrap();
+    assert_eq!(&bytes[..2], b"PK", "opm 包应当是个 zip");
+
+    let mut dir_core = EditCore::new();
+    dir_core.exec(&form.to_new_command());
+    dir_core.exec(&json!({"op": "set_meta", "set": {
+        "audio": audio.display().to_string(), "background": art.display().to_string()}}));
+    let folder = dir.join("四形态.opm.d");
+    let (p2, _f) = dir_core.save_as(&folder, SaveFormat::OpmFolder).unwrap();
+    assert_eq!(p2, folder.join("opm.json"), "文件夹形态的路径指向目录里的谱面文件");
+    assert!(folder.is_dir());
+    for name in ["opm.json", "song.ogg", "bg.png"] {
+        assert!(folder.join(name).is_file(), "文件夹里缺 {name}");
+    }
+    // 打包与不打包的**谱面内容**逐字节一致（两种形态用同一份条目清单）
+    let zip_entries = opm_app::zip::read(&bytes).unwrap();
+    let in_zip = zip_entries.iter().find(|e| e.name == "opm.json").expect("包内有 opm.json");
+    assert_eq!(
+        std::fs::read(folder.join("opm.json")).unwrap(),
+        in_zip.data,
+        "包里的 opm.json 与文件夹里的 opm.json 应当逐字节相同"
+    );
+
+    // ---- ③ RPE 包（.pez）与 ④ RPE 文件夹 ----
+    let mut r1 = EditCore::new();
+    r1.exec(&form.to_new_command());
+    r1.exec(&json!({"op": "set_meta", "set": {
+        "audio": audio.display().to_string(), "background": art.display().to_string()}}));
+    let pez = dir.join("四形态.pez");
+    let (p3, fid3) = r1.save_as(&pez, SaveFormat::RpePacked).unwrap();
+    assert_eq!(p3, pez);
+    let zb = std::fs::read(&pez).unwrap();
+    assert_eq!(&zb[..2], b"PK", "RPE 谱面包应当是个 zip");
+    let entries = opm_app::zip::read(&zb).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for want in [package::INFO_NAME, package::CHART_NAME, "song.ogg", "bg.png"] {
+        assert!(names.contains(&want), "谱面包里缺 {want}（实际 {names:?}）");
+    }
+    assert!(format!("{fid3:?}").contains("info.yml"), "保真度报告要提到 info.yml");
+    // `info.yml` 指向同一批文件（不会"包里有、信息文件里写别的名字"）
+    let info = String::from_utf8(
+        entries.iter().find(|e| e.name == package::INFO_NAME).unwrap().data.clone(),
+    )
+    .unwrap();
+    assert!(info.contains("chart: \"chart.json\""), "{info}");
+    assert!(info.contains("music: \"song.ogg\""), "{info}");
+    assert!(info.contains("illustration: \"bg.png\""), "{info}");
+    assert!(info.contains("name: \"四形态\""), "{info}");
+
+    let mut r2 = EditCore::new();
+    r2.exec(&form.to_new_command());
+    r2.exec(&json!({"op": "set_meta", "set": {
+        "audio": audio.display().to_string(), "background": art.display().to_string()}}));
+    let rdir = dir.join("四形态.rpe.d");
+    let (p4, _f) = r2.save_as(&rdir, SaveFormat::RpeFolder).unwrap();
+    assert_eq!(p4, rdir.join("chart.json"));
+    for name in [package::INFO_NAME, package::CHART_NAME, "song.ogg", "bg.png"] {
+        assert!(rdir.join(name).is_file(), "RPE 文件夹里缺 {name}");
+    }
+    // 文件夹里的 info.yml 与包里的**逐字节相同**
+    assert_eq!(
+        std::fs::read(rdir.join(package::INFO_NAME)).unwrap(),
+        entries.iter().find(|e| e.name == package::INFO_NAME).unwrap().data
+    );
+
+    // ---- 保存后都能"再打开"（文件夹形态的 path 就是目录里那个谱面文件）----
+    assert_eq!(dir_core.source_format(), Format::Opm);
+    assert_eq!(r2.source_format(), Format::Rpe);
+    let reopened = EditCore::load(&p4).unwrap();
+    assert_eq!(reopened.doc().meta.name, "四形态");
+    assert_eq!(reopened.doc().meta.audio.as_deref(), Some("song.ogg"));
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// `Auto`：**新建单文件 JSON 被拒绝**（保存形态只有那四种），但**写回已存在的单文件**照旧 ——
+/// 老谱面不能因为这条规定就存不回去。
+#[test]
+fn auto_refuses_new_json_targets_but_still_writes_back_existing_ones() {
+    use opm_app::codec::Format;
+    use opm_app::core::{SaveFormat, SaveShape};
+    let dir = tmpdir("auto-json");
+    let fresh = dir.join("新谱面.json");
+    let err = SaveFormat::Auto.resolve(&fresh, Format::Opm).unwrap_err();
+    assert!(err.contains("单文件 JSON 不再是保存形态"), "{err}");
+    assert!(err.contains(".opm") && err.contains(".pez"), "报错要说清楚该换成什么：{err}");
+
+    // 已经存在的单文件：按原形态写回
+    let legacy = dir.join("老谱面.opm.json");
+    std::fs::write(&legacy, "{}").unwrap();
+    assert_eq!(SaveFormat::Auto.resolve(&legacy, Format::Opm).unwrap(), SaveShape::OpmSingle);
+    let mut core = EditCore::new();
+    core.exec(&json!({"op": "new", "meta": {"name": "老谱面"}, "bpm": 174.0}));
+    let (p, _f) = core.save_as(&legacy, SaveFormat::Auto).unwrap();
+    assert_eq!(p, legacy);
+    assert!(!std::fs::read(&legacy).unwrap().starts_with(b"PK"), "写回的是裸 json，不是 zip");
+    let reopened = EditCore::load(&legacy).unwrap();
+    assert_eq!(reopened.doc().meta.name, "老谱面");
+
+    // 扩展名决定形态；没有扩展名（或目录路径）⇒ 按来源格式的**文件夹**形态
+    assert_eq!(SaveFormat::Auto.resolve(&dir.join("a.opm"), Format::Opm).unwrap(), SaveShape::OpmZip);
+    assert_eq!(SaveFormat::Auto.resolve(&dir.join("a.pez"), Format::Opm).unwrap(), SaveShape::RpeZip);
+    assert_eq!(SaveFormat::Auto.resolve(&dir.join("某目录"), Format::Opm).unwrap(), SaveShape::OpmFolder);
+    assert_eq!(SaveFormat::Auto.resolve(&dir.join("某目录"), Format::Rpe).unwrap(), SaveShape::RpeFolder);
+    std::fs::remove_dir_all(dir).ok();
 }

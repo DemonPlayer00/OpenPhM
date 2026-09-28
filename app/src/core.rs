@@ -76,77 +76,229 @@ pub struct EditCore {
     /// 这样 GUI 与 CLI 都只是**读** [`EditCore::overlaps`]（或问 `{"op":"overlaps"}`），
     /// 而不是各自维护一份、各自决定何时重查 —— 两份实现迟早不一致（这正是它搬家的原因）。
     overlaps: Vec<crate::cmd::Overlap>,
+    /// 上次保存用的（形态, 目标路径）：同路径再存要回到**同一个形态**。
+    /// 文件夹形态下 `path` 是目录里的谱面文件，光看扩展名会把"文件夹"误判成"单文件"。
+    last_save: Option<(SaveShape, PathBuf)>,
 }
 
-/// 保存目标格式（`Auto` 按扩展名：`*.opm.json` → opm，其余 `*.json` → RPE 生态习惯）
+/// 保存形态：**两个格式 × 打包开关**（用户："4 种导出方式（opm|rpe|打包开关）"）。
+///
+/// |                | 打包（一个文件） | 不打包（一个文件夹） |
+/// |---|---| ---|
+/// | **opm** | `.opm`（zip：`opm.json` + 音乐/曲绘） | 目录：`opm.json` + 音乐/曲绘 |
+/// | **RPE** | `.pez`（zip：`info.yml` + `chart.json` + 音乐/曲绘） | 目录：同左三件 |
+///
+/// **单文件 JSON 不再是保存形态**（用户："而不是 json"）：`.opm.json` 与 RPE 的单文件 `.json`
+/// 仍然**读得进来**，而且**已经存在的**目标文件依旧按原形态写回（不偷偷改别人文件的格式），
+/// 但"新建一个目标"时不再往单文件 JSON 上解析 —— 见 [`SaveFormat::resolve`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveFormat {
+    /// 跟着目标走（没有目标时按"opm 包"这个正式形态）
     Auto,
-    /// **opm 容器**（`.opm`）：ZIP，含谱面与资源 —— 这是"opm 文件"的正式形态
-    Opm,
-    /// 裸 opm（`.opm.json`）：可 diff、可入版本库；开发/agent/测试用
-    OpmBare,
-    Rpe,
+    /// opm 包：一个 `.opm`（zip）
+    OpmPacked,
+    /// opm 无压缩文件夹：`opm.json` + 音乐/曲绘
+    OpmFolder,
+    /// RPE 谱面包：一个 `.pez`（zip：`info.yml` + `chart.json` + 音乐/曲绘）
+    RpePacked,
+    /// RPE 无压缩文件夹：`info.yml` + `chart.json` + 音乐/曲绘
+    RpeFolder,
+}
+
+/// 解析之后的"实际写什么"（`Auto` 已经定下来）。
+///
+/// 比 [`SaveFormat`] 多出两个 `*Single`：它们**只用于写回已经存在的单文件 JSON**，
+/// 界面上不提供（用户要求保存限定在四种形态里），但老文件不能因为这条规定就写不回去。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveShape {
+    /// `.opm`（zip）
+    OpmZip,
+    /// 目录：`opm.json` + 资源
+    OpmFolder,
+    /// 裸 `.opm.json`（仅写回既有文件）
+    OpmSingle,
+    /// `.pez`（zip：`info.yml` + `chart.json` + 资源）
+    RpeZip,
+    /// 目录：`info.yml` + `chart.json` + 资源
+    RpeFolder,
+    /// 单文件 RPE `.json`（仅写回既有文件）
+    RpeSingle,
+}
+
+impl SaveShape {
+    /// **谱面文件本体**用哪个格式存 —— 它同时决定 `source_format`，因为"格式跟着文件走"：
+    /// 文件夹形态里躺着的是裸 `opm.json`，所以它对应 `Format::Opm`（重新打开这个文件也是这样报的）。
+    pub fn chart_file_format(self) -> Format {
+        match self {
+            SaveShape::OpmZip => Format::OpmZip,
+            SaveShape::OpmFolder | SaveShape::OpmSingle => Format::Opm,
+            SaveShape::RpeZip | SaveShape::RpeFolder | SaveShape::RpeSingle => Format::Rpe,
+        }
+    }
+    /// 是不是"一个文件夹"形态（目标路径是目录，不是文件）
+    pub fn is_folder(self) -> bool {
+        matches!(self, SaveShape::OpmFolder | SaveShape::RpeFolder)
+    }
+    /// 谱面本体在包内/目录里叫什么（单文件形态没有这一层，返回 `None`）
+    pub fn chart_entry(self) -> Option<&'static str> {
+        match self {
+            SaveShape::OpmZip | SaveShape::OpmFolder => Some(codec::container::CHART_NAME),
+            SaveShape::RpeZip | SaveShape::RpeFolder => Some(codec::package::CHART_NAME),
+            SaveShape::OpmSingle | SaveShape::RpeSingle => None,
+        }
+    }
+    /// 打包形态的默认扩展名（文件夹形态没有扩展名）
+    pub fn extension(self) -> Option<&'static str> {
+        match self {
+            SaveShape::OpmZip => Some(".opm"),
+            SaveShape::RpeZip => Some(codec::package::PACKAGE_EXTENSION),
+            _ => None,
+        }
+    }
 }
 
 impl From<Format> for SaveFormat {
+    /// "跟随来源格式"：裸进裸出（旧的单文件形态 → 现在对应它的**文件夹**形态）
     fn from(f: Format) -> Self {
         match f {
-            Format::Opm => SaveFormat::OpmBare, // 裸进裸出
-            Format::OpmZip => SaveFormat::Opm,   // 容器进容器出
-            Format::Rpe => SaveFormat::Rpe,
+            Format::Opm => SaveFormat::OpmFolder, // 裸 opm 就是"谱面 + 同目录资源"，即无压缩形态
+            Format::OpmZip => SaveFormat::OpmPacked,
+            Format::Rpe => SaveFormat::RpeFolder,
         }
     }
 }
 
 impl SaveFormat {
     pub fn parse(s: Option<&str>) -> Option<Self> {
-        match s? {
-            "auto" => Some(SaveFormat::Auto),
-            "opm" | "opmz" | "container" => Some(SaveFormat::Opm),
-            "opm-bare" | "opm.json" => Some(SaveFormat::OpmBare),
-            "rpe" => Some(SaveFormat::Rpe),
-            _ => None,
-        }
+        let s = s?.trim().to_ascii_lowercase();
+        Some(match s.as_str() {
+            "auto" => SaveFormat::Auto,
+            "opm" | "opmz" | "container" | "opm-pack" | "opm-packed" => SaveFormat::OpmPacked,
+            "opm-dir" | "opm-folder" | "opm-unpacked" => SaveFormat::OpmFolder,
+            "rpe" | "pez" | "rpe-pack" | "rpe-packed" => SaveFormat::RpePacked,
+            "rpe-dir" | "rpe-folder" | "rpe-unpacked" => SaveFormat::RpeFolder,
+            _ => return None,
+        })
     }
-    /// 决定实际写哪种格式：显式指定就用它，`Auto` 看扩展名，都判不出来时**沿用来源格式**
-    pub fn resolve(self, path: &Path, loaded: Format) -> Format {
+    /// 控制通道回话用的短名（与 `parse` 一一对应）
+    pub fn as_str(self) -> &'static str {
         match self {
-            SaveFormat::Opm => Format::OpmZip,      // "opm" = 容器（正式形态）
-            SaveFormat::OpmBare => Format::Opm,     // 裸工程文件
-            SaveFormat::Rpe => Format::Rpe,
-            SaveFormat::Auto => {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.ends_with(".opm.json") {
-                    Format::Opm // 显式要裸工程文件
-                } else if name.ends_with(".opm") || name.ends_with(".opmz") {
-                    Format::OpmZip // `.opm` = 容器（正式形态）
-                } else if name.ends_with(".json") {
-                    Format::Rpe
-                } else {
-                    loaded
-                }
-            }
+            SaveFormat::Auto => "auto",
+            SaveFormat::OpmPacked => "opm",
+            SaveFormat::OpmFolder => "opm-dir",
+            SaveFormat::RpePacked => "rpe",
+            SaveFormat::RpeFolder => "rpe-dir",
         }
     }
-    /// `Auto` 且**还没有保存目标**（新建出来的谱面）时，建议用哪个扩展名。
+    /// 界面上那一行说明（四种形态 + 它们的产物）
+    pub fn describe(self) -> &'static str {
+        match self {
+            SaveFormat::Auto => "自动（跟着目标：`.opm` → 包，目录 → 文件夹；新建默认 opm 包）",
+            SaveFormat::OpmPacked => "opm 包：一个 `.opm`（谱面 + 音乐 + 曲绘）",
+            SaveFormat::OpmFolder => "opm 文件夹：目录里放 `opm.json` + 音乐 + 曲绘（可 diff）",
+            SaveFormat::RpePacked => "RPE 包：一个 `.pez`（`info.yml` + `chart.json` + 音乐 + 曲绘）",
+            SaveFormat::RpeFolder => "RPE 文件夹：目录里放 `info.yml` + `chart.json` + 音乐 + 曲绘",
+        }
+    }
+    /// 打包开关这一轴（`None` = 自动）
+    pub fn packed(self) -> Option<bool> {
+        match self {
+            SaveFormat::Auto => None,
+            SaveFormat::OpmPacked | SaveFormat::RpePacked => Some(true),
+            SaveFormat::OpmFolder | SaveFormat::RpeFolder => Some(false),
+        }
+    }
+    /// 格式这一轴（opm / RPE）——界面上两个控件就是这两轴
+    pub fn chart_format(self) -> Option<Format> {
+        match self {
+            SaveFormat::Auto => None,
+            SaveFormat::OpmPacked | SaveFormat::OpmFolder => Some(Format::OpmZip),
+            SaveFormat::RpePacked | SaveFormat::RpeFolder => Some(Format::Rpe),
+        }
+    }
+    /// 用两轴的取值拼回来（界面控件用）
+    pub fn from_axes(chart: Format, packed: bool) -> Self {
+        match (matches!(chart, Format::Rpe), packed) {
+            (false, true) => SaveFormat::OpmPacked,
+            (false, false) => SaveFormat::OpmFolder,
+            (true, true) => SaveFormat::RpePacked,
+            (true, false) => SaveFormat::RpeFolder,
+        }
+    }
+    /// **还没有保存目标**时建议用什么名字（文件夹形态：建议一个目录名，不带扩展名）
+    pub fn suggested_extension(self, loaded: Format) -> Option<&'static str> {
+        match self {
+            SaveFormat::OpmPacked => Some(".opm"),
+            SaveFormat::OpmFolder => None,
+            SaveFormat::RpePacked => Some(codec::package::PACKAGE_EXTENSION),
+            SaveFormat::RpeFolder => None,
+            // 自动：新建的目标用**正式形态**（opm 包）—— 不再给单文件 JSON 当默认
+            SaveFormat::Auto => Some(match loaded {
+                Format::Rpe => codec::package::PACKAGE_EXTENSION,
+                _ => ".opm",
+            }),
+        }
+    }
+    /// 决定实际写什么。**这里是"保存形态只有四种"这条规则的落点。**
     ///
-    /// 规则里的那一条是用户要求推出来的：**引用了音乐/曲绘就该存成容器 `.opm`** ——
-    /// 否则默认给出 `曲名.opm.json`，第一次保存就把音乐和曲绘留在包外了
-    /// （"音乐和曲绘都要放到 opm 文件中"）。没有引用资源时维持裸 `.opm.json`（可 diff、可入版本库）。
-    pub fn suggested_extension(self, loaded: Format, references_assets: bool) -> &'static str {
-        match self {
-            SaveFormat::Opm => Format::OpmZip.extension(),
-            SaveFormat::OpmBare => Format::Opm.extension(),
-            SaveFormat::Rpe => Format::Rpe.extension(),
-            SaveFormat::Auto => {
-                if matches!(loaded, Format::OpmZip) || references_assets {
-                    Format::OpmZip.extension()
-                } else {
-                    loaded.extension()
-                }
-            }
+    /// `Auto` 的顺序：先看目标名（`.opm`/`.pez`），再看它是不是既有的单文件（写回原形态），
+    /// 都不像就按来源格式的**文件夹**形态；而"**新建**一个 `.json`/`.opm.json`"会被明确拒绝 ——
+    /// 单文件 JSON 不再是保存形态，但报错要说清楚该换成什么。
+    pub fn resolve(self, path: &Path, loaded: Format) -> Result<SaveShape, String> {
+        let explicit = match self {
+            SaveFormat::OpmPacked => Some(SaveShape::OpmZip),
+            SaveFormat::OpmFolder => Some(SaveShape::OpmFolder),
+            SaveFormat::RpePacked => Some(SaveShape::RpeZip),
+            SaveFormat::RpeFolder => Some(SaveShape::RpeFolder),
+            SaveFormat::Auto => None,
+        };
+        if let Some(shape) = explicit {
+            return Ok(shape);
         }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+        let exists = path.is_file();
+        if name.ends_with(".opm") || name.ends_with(".opmz") {
+            return Ok(SaveShape::OpmZip);
+        }
+        if name.ends_with(codec::package::PACKAGE_EXTENSION) || name.ends_with(".pez") {
+            return Ok(SaveShape::RpeZip);
+        }
+        let single = if name.ends_with(".opm.json") {
+            Some(SaveShape::OpmSingle)
+        } else if name.ends_with(".json") {
+            Some(SaveShape::RpeSingle)
+        } else {
+            None
+        };
+        if let Some(shape) = single {
+            if exists {
+                // 写回一个已经存在的单文件：**保持它原来的形态**（偷偷改格式比不改更糟）
+                return Ok(shape);
+            }
+            return Err(format!(
+                "单文件 JSON 不再是保存形态（只能是 opm 包 `.opm` / opm 文件夹 / RPE 包 `{}` / RPE 文件夹）：\
+                 目标 `{}` 看起来是新建的单文件。在「另存为格式」里选一种形态，或把目标写成一个目录。",
+                codec::package::PACKAGE_EXTENSION,
+                path.display()
+            ));
+        }
+        // 没有扩展名（或就是个目录路径）⇒ 按来源格式的**无压缩文件夹**形态
+        Ok(match loaded {
+            Format::Rpe => SaveShape::RpeFolder,
+            _ => SaveShape::OpmFolder,
+        })
+    }
+}
+
+/// 形态的短名（回话与日志共用；与 `SaveFormat::as_str` 同一套词）
+pub fn shape_name(s: SaveShape) -> &'static str {
+    match s {
+        SaveShape::OpmZip => "opm",
+        SaveShape::OpmFolder => "opm-dir",
+        SaveShape::OpmSingle => "opm-bare",
+        SaveShape::RpeZip => "rpe",
+        SaveShape::RpeFolder => "rpe-dir",
+        SaveShape::RpeSingle => "rpe-json",
     }
 }
 
@@ -187,6 +339,7 @@ impl EditCore {
             assets: Vec::new(),
             // 空文档没有事件 ⇒ 没有重叠（不必扫一遍）
             overlaps: Vec::new(),
+            last_save: None,
         }
     }
 
@@ -227,7 +380,8 @@ impl EditCore {
             rpe_target,
             last_fidelity: Some(fid.clone()),
             assets, // 裸 JSON 时为空；容器时是包里的资源
-            overlaps: Vec::new(), // 下面立刻全量扫一遍（载入是"整表变化"）
+            overlaps: Vec::new(),
+            last_save: None, // 下面立刻全量扫一遍（载入是"整表变化"）
         };
         let mut core = core;
         core.refresh_overlaps_all();
@@ -373,109 +527,221 @@ impl EditCore {
 
     /// 保存（沿用**载入时的格式**）：RPE 进就 RPE 出，opm 进就 opm 出。
     pub fn save(&mut self, path: Option<&Path>) -> Result<PathBuf, String> {
+        // 同路径保存（Ctrl+S）：**沿用上次用的形态**。文件夹形态下 `self.path` 是目录里的
+        // `opm.json`，只看扩展名会被判成"单文件"，于是音乐与曲绘不会被刷新 —— 那是错的。
+        if path.is_none() {
+            if let (Some((shape, target)), true) = (self.last_save.clone(), self.path.is_some()) {
+                let (target, fid) = self.save_shape(&target, shape)?;
+                self.last_fidelity = Some(fid);
+                return Ok(target);
+            }
+        }
+        // 没存过（或显式给了新路径）：交给 `Auto` 按目标名判形态
         let target = path
             .map(|p| p.to_path_buf())
             .or_else(|| self.path.clone())
             .ok_or("未指定保存路径")?;
-        // 显式给了新路径（Save As）时按扩展名重新判断格式；同路径保存则沿用载入格式
-        let fmt = if path.is_some() { SaveFormat::Auto } else { SaveFormat::from(self.source_format) };
-        let (target, fid) = self.save_as(&target, fmt)?;
+        let (target, fid) = self.save_as(&target, SaveFormat::Auto)?;
         self.last_fidelity = Some(fid);
         Ok(target)
     }
 
-    /// 另存为：`fmt` 决定写哪种格式（`Auto` 按扩展名）
+    /// 另存为：`fmt` 决定写**哪一种形态**（四种之一；`Auto` 见 [`SaveFormat::resolve`]）。
+    ///
+    /// 四种形态（用户："opm|rpe|打包开关"）：
+    ///
+    /// | 形态 | 产物 |
+    /// |---|---|
+    /// | opm 包 | 一个 `.opm`（zip：`opm.json` + 音乐/曲绘） |
+    /// | opm 文件夹 | 目录里 `opm.json` + 音乐/曲绘 |
+    /// | RPE 包 | 一个 `.pez`（zip：`info.yml` + `chart.json` + 音乐/曲绘） |
+    /// | RPE 文件夹 | 目录里 `info.yml` + `chart.json` + 音乐/曲绘 |
+    ///
+    /// 前两种与后两种共用同一份"资源收集 + 名字规范化"逻辑（`collect_assets` +
+    /// `planned_asset_renames`），所以**打包与不打包的内容逐字节相同**（有测试钉住）。
+    /// 返回的路径：文件夹形态给的是**目录里的那个谱面文件**（`opm.json` / `chart.json`）——
+    /// 于是"保存后这个文档的路径"仍然是一个能直接再打开的文件。
     pub fn save_as(
         &mut self,
         path: &Path,
         fmt: SaveFormat,
     ) -> Result<(PathBuf, codec::Fidelity), String> {
-        let fmt = fmt.resolve(path, self.source_format);
-        // 目标目录不存在就**明说**：内核不会替你建目录，`写入失败: No such file or directory`
-        // 这种原始错误对用户毫无指向性（"我明明选了文件夹"）。
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            if !dir.is_dir() {
-                return Err(format!(
-                    "目标目录不存在：{}（先建好目录，或用「选择文件夹…」挑一个已有的）",
-                    dir.display()
-                ));
+        let shape = fmt.resolve(path, self.source_format)?;
+        self.save_shape(path, shape)
+    }
+
+    /// 按**已解析的形态**写盘（`save_as` 与"同路径再存一次"都走这里）。
+    fn save_shape(
+        &mut self,
+        path: &Path,
+        shape: SaveShape,
+    ) -> Result<(PathBuf, codec::Fidelity), String> {
+        let dir_target: Option<PathBuf> = if shape.is_folder() { Some(path.to_path_buf()) } else { None };
+        let file_target: PathBuf = match shape.chart_entry() {
+            Some(entry) if shape.is_folder() => path.join(entry),
+            Some(_) => path.to_path_buf(),
+            None => path.to_path_buf(),
+        };
+        // 压缩形态：目标**目录**必须已经存在（内核不会替你建）。
+        // 文件夹形态：目录由我们建（"另存为一个文件夹"当然可以创建它）。
+        if !shape.is_folder() {
+            if let Some(dir) = file_target.parent().filter(|d| !d.as_os_str().is_empty()) {
+                if !dir.is_dir() {
+                    return Err(format!(
+                        "目标目录不存在：{}（先建好目录，或用「选择文件夹…」挑一个已有的）",
+                        dir.display()
+                    ));
+                }
             }
+        } else if path.exists() && !path.is_dir() {
+            return Err(format!(
+                "{} 已经是一个文件；文件夹形态需要一个目录路径（或改用打包形态）",
+                path.display()
+            ));
         }
-        let (target, fid) = match fmt {
-            codec::Format::Opm => {
-                // 裸 opm（`.opm.json`）：可 diff、可入版本库
+        // 资源从哪儿找：优先"文档现在所在的那本谱面"的目录，其次新目标的目录。
+        // （`meta.audio`/`meta.background` 里是绝对路径时用不着它，相对路径才需要。）
+        let base_dir = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| file_target.parent().map(Path::to_path_buf));
+
+        let (target, fid) = match shape {
+            SaveShape::OpmSingle => {
+                // 裸 opm（`.opm.json`）：**只**用于写回已存在的单文件（不再是可选的保存形态）
                 let text = serde_json::to_string_pretty(&self.doc.to_json())
                     .map_err(|e| format!("序列化失败: {e}"))?;
-                std::fs::write(path, format!("{text}\n")).map_err(|e| format!("写入失败: {e}"))?;
+                std::fs::write(&file_target, format!("{text}\n"))
+                    .map_err(|e| format!("写入失败: {e}"))?;
                 let mut fid = codec::Fidelity::new("opm", format!("v{}", self.doc.format_version));
-                fid.note("原生格式，无转换");
-                (path.to_path_buf(), fid)
+                fid.note("原生格式，无转换（写回既有的单文件 `.opm.json`）");
+                (file_target.clone(), fid)
             }
-            codec::Format::OpmZip => {
-                // **opm 容器**：谱面 + 资源。已有的资源（例如刚从这个容器载入的）原样带回去；
+            SaveShape::OpmZip | SaveShape::OpmFolder => {
+                // opm 的两种形态：谱面 + 资源。已有的资源（例如刚从容器载入的）原样带回去；
                 // 文档新引用的外部文件（`meta.audio`/`meta.background`）从它所在目录读进来。
-                let base = path.parent().map(|p| p.to_path_buf());
-                let mut fid = codec::Fidelity::new("opm", "容器（zip）".to_owned());
+                let mut fid = codec::Fidelity::new(
+                    "opm",
+                    if shape.is_folder() { "无压缩文件夹".to_owned() } else { "容器（zip）".to_owned() },
+                );
                 // 资源**先按当前字段**收集（字段里可能还是 `/tmp/x/song.ogg` 这样的外部路径，
                 // 那时才读得到盘）；随后才把字段规范成包内相对名。
                 let assets = codec::container::collect_assets(
                     &self.doc,
                     &self.assets,
-                    base.as_deref(),
+                    base_dir.as_deref(),
                     &mut fid,
                 );
-                // 资源在包里用**文件名**（不是外部绝对路径）：写进 `opm.json` 的文档必须同步改写，
-                // 否则"读回来"会去找 `/tmp/.../song.ogg` 这种容器里根本没有的条目。
-                let renames = planned_asset_renames(&self.doc);
-                let mut shifted = self.doc.clone();
-                for r in &renames {
-                    r.apply(&mut shifted);
+                let (doc_for_write, renames) = self.normalized_for_write(&assets, &mut fid);
+                if shape.is_folder() {
+                    let dir = dir_target.as_deref().unwrap_or(path);
+                    let entries = codec::container::entries_for_dir(&doc_for_write, &assets);
+                    codec::container::write_entries_to_dir(&entries, dir, &mut fid)?;
+                } else {
+                    let backend = codec::container::write_file(&doc_for_write, &assets, path)?;
                     fid.note(format!(
-                        "{} `{}` → 包内相对名 `{}`（文档字段同步改写，可撤销）",
-                        r.label, r.from, r.to
+                        "容器：{} 个资源 + 谱面 `opm.json`（打包后端：{}）",
+                        assets.len(),
+                        backend.name()
                     ));
                 }
-                // **副本**送去写盘：文件真的写出来了，才把这次改名落到内存文档。
-                // 早先它直接改内存文档而 `write_file` 在之后 —— 写盘失败就会留下
-                // "文档被改、文件没写、没有任何信号"的状态；而且那次改动没 +revision、没广播，
-                // 界面缓存看不见它（保存链路上唯一一处绕过命令路径的改写）。
-                let doc_for_write = if renames.is_empty() { &self.doc } else { &shifted };
-                let backend = codec::container::write_file(doc_for_write, &assets, path)?;
-                fid.note(format!(
-                    "容器：{} 个资源 + 谱面 `opm.json`（打包后端：{}）",
-                    assets.len(),
-                    backend.name()
-                ));
                 fid.finalize();
                 self.assets = assets; // 存完把资源留在内存里，下次保存不必再读盘
-                // 写成功了，才把资源名落到内存文档 —— 走**命令路径**，与用户自己改 `meta` 同一条路：
-                // 记 journal（可撤销）、revision +1、按 set_meta 的话题广播。
-                if !renames.is_empty() {
-                    let mut set = serde_json::Map::new();
-                    for r in &renames {
-                        set.insert(r.field.to_owned(), json!(r.to));
-                    }
-                    let cmd = json!({"op": "set_meta", "set": Value::Object(set)});
-                    let resp = self.exec(&cmd);
-                    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                        self.log.push(format!(
-                            "资源名规范化未能落到文档（文件已写好）：{}",
-                            resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
-                        ));
-                    }
-                }
-                (path.to_path_buf(), fid)
+                self.land_renames(renames);
+                (file_target.clone(), fid)
             }
-            codec::Format::Rpe => {
-                let fid = codec::rpe::save_file(&self.doc, path, self.rpe_target)?;
-                (path.to_path_buf(), fid)
+            SaveShape::RpeSingle => {
+                let fid = codec::rpe::save_file(&self.doc, &file_target, self.rpe_target)?;
+                (file_target.clone(), fid)
+            }
+            SaveShape::RpeZip | SaveShape::RpeFolder => {
+                // RPE 的两种形态：`info.yml` + `chart.json` + 音乐/曲绘（Phira 谱面标准）。
+                // 名字规范化与 opm 走同一条规矩（包里一律用文件名，字段同步改写）。
+                let mut fid = codec::Fidelity::new(
+                    "rpe",
+                    if shape.is_folder() { "谱面包（无压缩文件夹）".to_owned() } else { "谱面包（zip）".to_owned() },
+                );
+                let assets = codec::container::collect_assets(
+                    &self.doc,
+                    &self.assets,
+                    base_dir.as_deref(),
+                    &mut fid,
+                );
+                let (doc_for_write, renames) = self.normalized_for_write(&assets, &mut fid);
+                let entries = codec::package::build_entries(
+                    &doc_for_write,
+                    self.rpe_target,
+                    base_dir.as_deref(),
+                    &assets,
+                    &mut fid,
+                )?;
+                if shape.is_folder() {
+                    let dir = dir_target.as_deref().unwrap_or(path);
+                    codec::container::write_entries_to_dir(&entries, dir, &mut fid)?;
+                } else {
+                    let (bytes, backend) = crate::zip::pack_preferred(&entries)?;
+                    std::fs::write(path, bytes).map_err(|e| format!("写入失败: {e}"))?;
+                    fid.note(format!("谱面包已打包（打包后端：{}）", backend.name()));
+                }
+                fid.finalize();
+                self.assets = assets;
+                self.land_renames(renames);
+                (file_target.clone(), fid)
             }
         };
         self.path = Some(target.clone());
-        self.source_format = fmt;
+        self.source_format = shape.chart_file_format();
+        // 记住"这次用的是哪种形态、目标路径是哪一个"：文件夹形态下 `self.path` 是目录里的谱面文件，
+        // 下次 Ctrl+S 必须回到**同一个形态**（否则只会刷新谱面，把旁边的音乐/曲绘落下）
+        self.last_save = Some((shape, path.to_path_buf()));
         self.saved_revision = self.revision; // 存过就不算脏
         self.last_fidelity = Some(fid.clone());
         Ok((target, fid))
+    }
+
+    /// 资源名规范化：把 `meta.audio`/`meta.background` 里的外部路径改成**包内文件名**，
+    /// 返回（送去写盘的文档副本, 需要落到内存文档的改名清单）。
+    ///
+    /// 为什么用**副本**：文件真的写出来了，才把改名落到内存文档 —— 早先它直接改内存文档而写盘在后，
+    /// 写盘失败就会留下"文档被改、文件没写、没有任何信号"的状态；而且那次改动没 +revision、没广播，
+    /// 界面缓存看不见它（保存链路上唯一一处绕过命令路径的改写）。
+    fn normalized_for_write(
+        &self,
+        _assets: &[crate::zip::Entry],
+        fid: &mut codec::Fidelity,
+    ) -> (Document, Vec<AssetRename>) {
+        let renames = planned_asset_renames(&self.doc);
+        let mut shifted = self.doc.clone();
+        for r in &renames {
+            r.apply(&mut shifted);
+            fid.note(format!(
+                "{} `{}` → 包内相对名 `{}`（文档字段同步改写，可撤销）",
+                r.label, r.from, r.to
+            ));
+        }
+        (shifted, renames)
+    }
+
+    /// 写盘成功后，把资源改名**走命令路径**落到内存文档：记 journal（可撤销）、revision +1、
+    /// 按 `set_meta` 的话题广播 —— 与用户自己改 `meta` 是同一条路。
+    fn land_renames(&mut self, renames: Vec<AssetRename>) {
+        if renames.is_empty() {
+            return;
+        }
+        let mut set = serde_json::Map::new();
+        for r in &renames {
+            set.insert(r.field.to_owned(), json!(r.to));
+        }
+        let cmd = json!({"op": "set_meta", "set": Value::Object(set)});
+        let resp = self.exec(&cmd);
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            self.log.push(format!(
+                "资源名规范化未能落到文档（文件已写好）：{}",
+                resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+            ));
+        }
     }
 
     /// 把另一个文件**装进当前核心**（GUI「打开」/控制通道 `{"op":"load"}` 走这里）。
@@ -488,6 +754,7 @@ impl EditCore {
         self.doc = doc;
         self.assets = assets;
         self.journal = Journal::default(); // 换了谱面，旧的逆操作全部作废
+        self.last_save = None; // 换了文档，上次的保存形态不再适用
         self.path = Some(path.to_path_buf());
         self.source_format = codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm);
         if self.source_format == codec::Format::Rpe {
@@ -763,16 +1030,18 @@ impl EditCore {
                         let (p, fid) = self.save_as(&p, f)?;
                         return Ok(json!({
                             "path": p.display().to_string(),
-                            "format": f.resolve(&p, self.source_format).as_str(),
+                            "format": f.as_str(),
+                            "shape": self.last_save.as_ref().map(|(s, _)| shape_name(*s)),
                             "fidelity": fidelity_json(&fid),
                         }));
                     }
                     (Some(p), None) => {
-                        // 显式路径但没指定格式：按扩展名
+                        // 显式路径但没指定形态：按扩展名/目标名判（`Auto`）
                         let (p, fid) = self.save_as(&p, SaveFormat::Auto)?;
                         return Ok(json!({
                             "path": p.display().to_string(),
-                            "format": self.source_format.as_str(),
+                            "format": "auto",
+                            "shape": self.last_save.as_ref().map(|(s, _)| shape_name(*s)),
                             "fidelity": fidelity_json(&fid),
                         }));
                     }

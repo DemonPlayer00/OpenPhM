@@ -8,7 +8,40 @@
 //! 3. **必须产出保真度报告**：转换了什么、丢了什么，都要写出来（导出侧尤其）。
 
 pub mod container;
+pub mod package;
 pub mod rpe;
+
+/// 资源名 → **包内文件名**（同时按 `/` 与 `\` 切分）。
+///
+/// 为什么要两种分隔符：谱面是**跨平台交换**的 —— Windows 上作者写的 `music\song.mp3` 到了 Linux
+/// （或反过来）也得认出文件名，否则打包时会把整串当文件名：既读不到文件，又会把宿主机的目录结构
+/// 带进包里。`Path::file_name()` 只认本机的分隔符，所以这里不能直接用它。
+pub fn asset_base_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    name.rsplit(['/', '\\']).next().unwrap_or(name).to_owned()
+}
+
+#[cfg(test)]
+mod base_name_tests {
+    use super::asset_base_name;
+
+    /// 两种分隔符、重复分隔符、尾部分隔符、空串
+    #[test]
+    fn asset_base_name_handles_both_separators() {
+        assert_eq!(asset_base_name("song.ogg"), "song.ogg");
+        assert_eq!(asset_base_name("/tmp/x/song.ogg"), "song.ogg");
+        assert_eq!(asset_base_name(r"C:\music\song.ogg"), "song.ogg");
+        assert_eq!(asset_base_name(r"mixed/dir\song.ogg"), "song.ogg");
+        assert_eq!(asset_base_name("  bg.png  "), "bg.png");
+        assert_eq!(asset_base_name(""), "");
+        // 尾部分隔符 ⇒ 那是个目录、不是文件：给空串（调用方据此当"没资源"处理）
+        assert_eq!(asset_base_name("dir/"), "");
+        assert_eq!(asset_base_name(r"dir\"), "");
+    }
+}
 
 use std::sync::OnceLock;
 
