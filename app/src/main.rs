@@ -140,8 +140,43 @@ enum GuardAction {
     OpenDialog,
 }
 
+/// 启动耗时探针：把"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。
+///
+/// 为什么要它：启动慢的原因靠猜十有八九猜错（字体解析？7z 探测？Vulkan 初始化？窗口映射？），
+/// 而这条链路跨了 `main` 与首帧两处，只有打点才能分辨。默认关（`--trace-startup` / `OPM_TRACE_STARTUP=1`）。
+struct Trace {
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    on: bool,
+}
+
+impl Trace {
+    fn new(on: bool) -> Self {
+        let now = std::time::Instant::now();
+        Self { t0: now, last: now, on }
+    }
+    /// 打一个点（`what` 写"这一步干了什么"）
+    fn mark(&mut self, what: &str) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        println!(
+            "  启动耗时          : +{:7.1} ms（本步 {:7.1} ms）  {}",
+            (now - self.t0).as_secs_f64() * 1000.0,
+            (now - self.last).as_secs_f64() * 1000.0,
+            what
+        );
+        self.last = now;
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    let mut trace = Trace::new(
+        std::env::var("OPM_TRACE_STARTUP").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0"),
+    );
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    trace.mark("日志系统就绪");
     // 解析是纯函数（`cli::parse`）：打印警告、打用法、退出都由这里做
     let parsed = cli::parse(&std::env::args().skip(1).collect::<Vec<_>>());
     for w in &parsed.warnings {
@@ -153,6 +188,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let args = parsed.args;
+    if args.trace_startup {
+        trace.on = true;
+    }
+    trace.mark("参数解析");
     println!("== OpenPhM UI 骨架 ==");
     println!(
         "  音符={} 长度={:.1}s 前瞻={}s 压力模式={} 限帧={:?} 强制缩放={:?} bench={}",
@@ -180,6 +219,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    trace.mark("启动横幅（stdout）");
     // 编辑文档：--doc 载入真实 opm 文件，否则按 --notes 生成演示谱面
     let doc_arg = args.doc.clone();
     let core0 = match &doc_arg {
@@ -195,6 +235,7 @@ fn main() -> eframe::Result<()> {
         },
         None => core::EditCore::new(),
     };
+    trace.mark("文档核心就绪（--doc 时含读盘+解析）");
     // ---- 起始界面（谱面列表）----
     // 打开程序先显示它；`--doc` 直接进编辑器（CLI/agent/截图都走那条），无头用途（bench/stress）也不显示。
     let mut recents = recents::Recents::load_default();
@@ -202,6 +243,7 @@ fn main() -> eframe::Result<()> {
     if dropped > 0 {
         println!("  最近打开          : 清理 {dropped} 条已不存在的记录");
     }
+    trace.mark("最近打开列表（读盘 + 清理不存在的条目）");
     // ---- 启动检查：7z 能不能**调用**（opm 容器靠它打包/解包）----
     // 检查的是"能不能真的跑起来"，不是"文件在不在"：装了一半、权限不对、架构不符都会露出来。
     // 无头用途（bench/stress）不弹窗，只打一行日志。
@@ -220,6 +262,7 @@ fn main() -> eframe::Result<()> {
             }
         }
     };
+    trace.mark("7z 探测（起一次 `7z i` 真跑一遍）");
     let mut core0 = core0;
     if doc_arg.is_none() && args.notes > 0 {
         // 演示谱面也**走命令**（实现在库里 `opm_app::demo`）：文档只有 EditCore 能写，
@@ -311,6 +354,7 @@ fn main() -> eframe::Result<()> {
     let doc_lines = core0.doc().judge_lines.len();
     let doc_notes = core0.doc().note_count();
 
+    trace.mark("演示谱面 / 首帧前状态");
     // 共享编辑会话：GUI 线程 + 控制通道线程操作同一份文档
     let shared = core::shared(core0);
     let stats = control::ui_stats();
@@ -374,6 +418,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    trace.mark("音频（--audio/谱面 meta.audio：解码 + 开输出设备）");
     // 窗口的**初始标题与尺寸按启动阶段来**：启动页是小窗（"选择谱面"），进编辑页后再换成编辑尺寸。
     // 启动页上的弹窗不改这两个值（模态不换屏，见 `LAUNCH_SIZE` 的注释）。
     let on_launcher = doc_arg.is_none() && !args.bench_only() && !args.stress;
@@ -400,6 +445,9 @@ fn main() -> eframe::Result<()> {
     if let Some((x, y)) = args.pos {
         vp = vp.with_position([x, y]);
     }
+    trace.mark("控制通道 / GPU 策略 / 窗口参数");
+    let trace_on = trace.on;
+    let trace_t0 = trace.t0;
     let mut options = eframe::NativeOptions {
         viewport: vp,
         renderer: eframe::Renderer::Wgpu,
@@ -420,9 +468,16 @@ fn main() -> eframe::Result<()> {
     if gpu_policy != opm_app::gpu::GpuPolicy::Default {
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(cfg_new) = &mut options.wgpu_options.wgpu_setup
         {
+            let sel_t0 = trace_t0;
             cfg_new.native_adapter_selector = Some(std::sync::Arc::new(
                 move |adapters: &[eframe::wgpu::Adapter],
                       surface: Option<&eframe::wgpu::Surface<'_>>| {
+                    if trace_on {
+                        println!(
+                            "  启动耗时          : +{:7.1} ms  适配器枚举完成（wgpu 实例 + Vulkan loader 之后）",
+                            (std::time::Instant::now() - sel_t0).as_secs_f64() * 1000.0
+                        );
+                    }
                     // 只考虑"能出图到这个 surface"的适配器（选一个不能呈现的等于自找黑屏）
                     let usable: Vec<usize> = adapters
                         .iter()
@@ -454,21 +509,40 @@ fn main() -> eframe::Result<()> {
                         info.device_type,
                         gpu_policy.label()
                     );
+                    if trace_on {
+                        println!(
+                            "  启动耗时          : +{:7.1} ms  适配器选择完成（设备/表面还没建）",
+                            (std::time::Instant::now() - sel_t0).as_secs_f64() * 1000.0
+                        );
+                    }
                     Ok(adapters[chosen].clone())
                 },
             ));
         }
     }
 
+    trace.mark("准备完毕，交棒给 eframe::run_native（窗口创建 + wgpu 初始化 + 首帧）");
     let a = args.clone();
     let r = eframe::run_native(
         "opm-app",
         options,
         Box::new(move |_cc| {
-            Ok(Box::new(App::new(
+            let t_app = std::time::Instant::now();
+            let app = App::new(
                 state, shared, stats, sub, ctx_slot, audio, view, meta_name, doc_lines, doc_notes, a,
                 recents, seven_zip_missing, launch_phase,
-            )))
+            );
+            if trace_on {
+                println!(
+                    "  启动耗时          : +{:7.1} ms（本步 {:7.1} ms）  App::new（创建回调里）",
+                    (t_app - trace_t0).as_secs_f64() * 1000.0,
+                    t_app.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let mut app = app;
+            app.startup_t0 = Some(trace_t0);
+            app.trace_startup = trace_on;
+            Ok(Box::new(app))
         }),
     );
     // 正常退出时收走自己的 socket（异常退出留下的由下次 bind 前清理 + 死进程过滤兜底）
@@ -554,6 +628,10 @@ struct App {
     seven_zip_missing: Option<String>,
     /// 启动阶段（见 [`LaunchPhase`]）
     phase: LaunchPhase,
+    /// 启动耗时探针：进程启动的时刻（`--trace-startup` 时才用）
+    startup_t0: Option<Instant>,
+    /// 启动耗时探针是否开着（`--trace-startup` / `OPM_TRACE_STARTUP=1`）
+    trace_startup: bool,
     /// `OPM_LAUNCH_AUTO` 的值（**启动时读一次**）：启动页用它替人做选择（截图/CI）。
     /// 放在字段里而不是每帧 `env::var` —— 那是纯粹的启动期钩子，帧里不该有 env 查询。
     launch_auto: Option<String>,
@@ -736,6 +814,8 @@ impl App {
             file_badge,
             file_dirty,
             file_has_target,
+            startup_t0: None,
+            trace_startup: false,
             // 启动期钩子：**只在这里读一次**（帧里不该有 env 查询）
             launch_auto: std::env::var("OPM_LAUNCH_AUTO").ok(),
             guard_for: match dialog_at_start.as_deref() {
@@ -2158,6 +2238,23 @@ impl App {
         self.publish_stats();
         self.frames += 1;
         self.pace(ctx);
+        if self.frames == 1 {
+            if let Some(t0) = self.startup_t0.filter(|_| self.trace_startup) {
+                println!(
+                    "  启动耗时          : +{:7.1} ms  **首帧（启动页）构建完成** —— 之后交给合成器显示",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        } else if self.frames == 2 {
+            // 第二帧 = 稳态：首帧里那几百毫秒如果在这里消失，就说明它是**一次性**开销（字体图集等）
+            if let Some(t0) = self.startup_t0.filter(|_| self.trace_startup) {
+                let ui_ms = self.ui_ms.last().copied().unwrap_or(f64::NAN);
+                println!(
+                    "  启动耗时          : +{:7.1} ms  第二帧（稳态，UI {ui_ms:.1} ms）",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
     }
 }
 
@@ -2180,6 +2277,18 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         if !self.inited {
+            // 首帧的两段初始化（wgpu 回调资源 + 字体）也计入启动耗时
+            let mark = |me: &Self, what: &str, t: Instant| {
+                if let (true, Some(t0)) = (me.trace_startup, me.startup_t0) {
+                    println!(
+                        "  启动耗时          : +{:7.1} ms（本步 {:7.1} ms）  {}",
+                        (t - t0).as_secs_f64() * 1000.0,
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        what
+                    );
+                }
+            };
+            let t_step = Instant::now();
             if let Some(rs) = frame.wgpu_render_state() {
                 let info = rs.adapter.get_info();
                 self.adapter = format!("{} [{:?}/{:?}]", info.name, info.backend, info.device_type);
@@ -2192,6 +2301,8 @@ impl eframe::App for App {
                 let pf = Playfield::new(&rs.device, rs.target_format);
                 rs.renderer.write().callback_resources.insert(pf);
             }
+            mark(self, "wgpu 渲染回调资源（Playfield）", t_step);
+            let t_fonts = Instant::now();
             match fonts::install(&ctx) {
                 Some(f) => {
                     println!("  CJK 字体          : {}（字面索引 {}）", f.desc, f.index);
@@ -2206,7 +2317,14 @@ impl eframe::App for App {
             if let Ok(mut g) = self.ctx_slot.lock() {
                 *g = Some(ctx.clone());
             }
+            mark(self, "CJK 字体装载（读中文/韩文字体文件）", t_fonts);
             self.inited = true;
+            if let Some(t0) = self.startup_t0.filter(|_| self.trace_startup) {
+                println!(
+                    "  启动耗时          : +{:7.1} ms  首帧初始化结束（此后是首帧 UI 构建）",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
 
         // ---- 启动页：**一屏**（谱面列表）+ 盖在它上面的模态 ----

@@ -100,6 +100,8 @@ pub struct Args {
     pub control: Option<String>,
     /// 每次广播与重建都打一行（排查"到底谁被更新了"用）
     pub verbose_updates: bool,
+    /// `--trace-startup`：把"进程启动 → 首帧"之间每一步的耗时打出来（启动慢在哪，猜不如量）
+    pub trace_startup: bool,
     /// 窗口位置 `--pos X,Y` —— 只是给合成器的提示，Wayland 下会被无视（实测）
     pub pos: Option<(f32, f32)>,
     /// `--shot PATH`：**让应用自己截图**（egui viewport 截图，与合成器无关）。
@@ -164,6 +166,7 @@ impl Default for Args {
             doc: None,
             control: None,
             verbose_updates: false,
+            trace_startup: false,
             pos: None,
             shot: None,
             shot_frame: 30,
@@ -246,6 +249,7 @@ pub fn parse(argv: &[String]) -> Parsed {
             }
             "--help" | "-h" => help = true,
             "--verbose-updates" => a.verbose_updates = true,
+            "--trace-startup" => a.trace_startup = true,
             "--file-dialog" => a.dialog = Some("file".to_owned()), // 旧写法，等价于 --dialog file
             "--dialog" => a.dialog = take(&mut i),
             "--window-offset" => {
@@ -374,6 +378,7 @@ OpenPhM —— Phigros 谱面编辑器（GUI）
   --notes N             造 N 个音符的演示谱面（默认 0：不内建任何谱面）
   --audio-probe FILE    只解码并打印音频信息后退出（不开窗口）
   --verbose-updates     每次广播/重建打一行日志
+  --trace-startup       打印启动耗时分解（进程启动 → 首帧；也认 OPM_TRACE_STARTUP=1）
   -h, --help            显示本说明";
 
 #[cfg(test)]
@@ -431,6 +436,14 @@ mod tests {
         let p = parse_str(&["--control", "--stress"]);
         assert_eq!(p.args.control.as_deref(), Some("auto"));
         assert!(p.args.stress);
+    }
+
+    /// 启动耗时探针：默认关，`--trace-startup` 打开
+    #[test]
+    fn trace_startup_is_opt_in() {
+        assert!(!parse_str(&[]).args.trace_startup);
+        assert!(parse_str(&["--trace-startup"]).args.trace_startup);
+        assert!(USAGE.contains("--trace-startup"));
     }
 
     /// 数值参数写坏了不许 panic、也不许把默认值写成 0（"没听懂就用默认"）
