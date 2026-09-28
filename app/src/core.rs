@@ -1102,12 +1102,22 @@ impl EditCore {
     /// 写/刷新缓存目录里的会话元数据。`snapshot` = 最近一次文档快照的时刻（0 = 从没写过）。
     ///
     /// 失败只记日志：这是**元数据**，写不进去不该影响编辑（顶多下次启动少一次提示）。
-    fn write_session(&mut self, snapshot: u64, dirty: bool) -> Result<(), String> {
+    fn write_session(&self, snapshot: u64, dirty: bool) -> Result<(), String> {
         let Some(dir) = self.asset_dir.clone() else {
             return Err("没有解压缓存目录".to_owned());
         };
-        let started = codec::container::read_session(&dir).map(|s| s.started).unwrap_or(0);
-        let s = codec::container::Session {
+        let s = self.session_meta(&dir, snapshot, dirty);
+        codec::container::write_session(&dir, &s)
+    }
+
+    /// 会话元数据（`session.json` 的内容）：出处、出生时间、快照时刻与脏位。
+    ///
+    /// 抽出来是因为它有**两个用户**：同步写（[`Self::snapshot_session`]，保存时走的一条）
+    /// 与后台写手（[`Self::snapshot_job`] → [`crate::autosave::write_snapshot`]）。
+    /// 两份手抄的元数据必然漂移，而漂移的表现是"继续此谱面"提示错的东西。
+    pub fn session_meta(&self, dir: &Path, snapshot: u64, dirty: bool) -> codec::container::Session {
+        let started = codec::container::read_session(dir).map(|s| s.started).unwrap_or(0);
+        codec::container::Session {
             pid: std::process::id(),
             exe: codec::container::exe_name(),
             source: self.path.as_ref().map(|p| p.display().to_string()),
@@ -1117,8 +1127,26 @@ impl EditCore {
             started: if started > 0 { started } else { codec::container::now_secs() },
             snapshot,
             dirty,
+        }
+    }
+
+    /// **打一份可以交给别的线程去写的快照**：锁内只做"克隆文档 + 定下元数据"。
+    ///
+    /// 为什么不在锁内序列化：那是 223 ms（50 000 音符，见 [`crate::autosave`] 的表），
+    /// 而克隆只要 2~4.5 ms —— 差三五十倍。GUI 帧里付这几毫秒没人看得出来，付那 223 ms
+    /// 就是"每 2 秒卡一下"（而且播放头是墙钟驱动的，画面还会跟着跳 0.28 秒）。
+    ///
+    /// 元数据在这里就**定死**：`snapshot` 用此刻、`dirty` 用此刻的脏位 —— 序列化时文档可能
+    /// 已经被继续编辑，那份改动属于下一拍。
+    pub fn snapshot_job(&self) -> Result<crate::autosave::SnapshotJob, String> {
+        let Some(dir) = self.asset_dir.clone() else {
+            return Err("没有解压缓存目录（不是从容器载入的）".to_owned());
         };
-        codec::container::write_session(&dir, &s)
+        Ok(crate::autosave::SnapshotJob {
+            session: self.session_meta(&dir, codec::container::now_secs(), self.is_dirty()),
+            dir,
+            doc: self.doc.clone(),
+        })
     }
 
     /// 把当前**文档快照**写回解压缓存（`<缓存目录>/opm.json` + 会话元数据里的时间与脏位）。
@@ -1132,17 +1160,13 @@ impl EditCore {
     ///
     /// 落法是"先写临时文件再改名"：强杀可能正好发生在写的中途，半截 JSON 比旧快照更糟
     /// （下次启动会拿着半截文件当文档）。同一目录内的改名在 Unix/Windows 上都是原子替换。
-    pub fn snapshot_session(&mut self) -> Result<(), String> {
-        let Some(dir) = self.asset_dir.clone() else {
-            return Err("没有解压缓存目录（不是从容器载入的）".to_owned());
-        };
-        let chart = serde_json::to_vec_pretty(&self.doc.to_json())
-            .map_err(|e| format!("序列化失败: {e}"))?;
-        let tmp = dir.join(format!("{}.tmp", codec::container::CHART_NAME));
-        std::fs::write(&tmp, &chart).map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, dir.join(codec::container::CHART_NAME))
-            .map_err(|e| format!("替换 {} 失败: {e}", dir.display()))?;
-        self.write_session(codec::container::now_secs(), self.is_dirty())
+    ///
+    /// **这条是同步的（调用线程付 223 ms/5 万音符）**，只有两处该用它：保存之后的对齐
+    /// （用户刚存过盘，界面本来就停在那一下）与 CLI/无头路径。GUI 每 2 秒的那一拍走
+    /// [`crate::autosave`] 的后台写手，别在这里同步写 —— 那正是"播放时每 2 秒卡一下"的成因。
+    pub fn snapshot_session(&self) -> Result<(), String> {
+        let job = self.snapshot_job()?;
+        crate::autosave::write_snapshot(&job)
     }
 
     /// **从解压缓存继续**（启动时那个"上次没有正常退出"的对话框选「继续」走这里）。

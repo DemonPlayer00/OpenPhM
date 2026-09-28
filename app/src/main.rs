@@ -842,6 +842,20 @@ struct App {
     build_ms: Vec<f64>,
     inst_counts: Vec<usize>,
     reported: bool,
+    /// `OPM_FRAME_LOG=<路径>`：**逐帧**耗时流水（CSV，一行一帧）。默认关。
+    ///
+    /// 为什么需要它：`--bench` 只报 p50/p99，而"播放时**间歇性**卡一下"的特征恰恰是
+    /// **稀疏的尖峰** —— p50 看不出来，p99 也说不清"每隔几秒一次、那一下花在哪"。
+    /// 有了一份逐帧流水，尖峰就能与帧号、实例数、待算数、播放头对齐，问题从"猜"变成"看"。
+    /// 关掉时每帧只多一次 `Option::is_none` 判断（见 [`App::frame_log`]）。
+    frame_log: Option<std::io::BufWriter<std::fs::File>>,
+    /// 打不开就不每帧重试（路径写错时不该刷屏）
+    frame_log_failed: bool,
+    /// 已经写下去的解压缓存快照次数（逐帧流水里的对照量：它一跳就是一次重活）
+    snapshots: u64,
+    /// **快照的后台写手**：GUI 帧里只克隆文档（2~4.5 ms），序列化+落盘在别的线程
+    /// （见 [`opm_app::autosave`] 与 [`App::maybe_snapshot`]）。
+    autosave: opm_app::autosave::Autosave,
     ws: Workspace,
     /// bench：活跃阶段结束后的空闲阶段起点与帧计数
     idle_start: Option<Instant>,
@@ -1086,6 +1100,10 @@ impl App {
             build_ms: Vec::new(),
             inst_counts: Vec::new(),
             reported: false,
+            frame_log: None,
+            frame_log_failed: false,
+            snapshots: 0,
+            autosave: opm_app::autosave::Autosave::spawn(),
             ws: args_ws,
             idle_start: None,
             idle_frames: 0,
@@ -1847,8 +1865,22 @@ impl App {
     /// `close_requested()` 为真 —— 不加这个旗子，程序化退出会被自己的"未保存守卫"拦下来等人点按钮
     /// （`--shot-exit` 与 bench 会当场卡住）。
     fn quit_now(&mut self, ctx: &egui::Context) {
+        // **退出前等后台快照落完**：缓存目录是 `main` 在 `run_native` 返回后删的，
+        // 后台还在写就会把刚删掉的目录又建出来 —— 下次启动会平白多问一次"上次没有正常退出"。
+        self.flush_snapshot();
         self.quit_allowed = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// **保存前 / 退出前的那道栅栏**：等后台那份快照写完。
+    ///
+    /// 保存为什么也要等：`EditCore::save_doc` 存完盘会**同步**刷新一次缓存快照（"缓存跟着保存走"），
+    /// 而如果这时后台手上还有一份**保存之前**克隆的任务，它会在保存之后才落盘 ——
+    /// 缓存里的文档于是退回旧内容、脏位还写着"有未保存改动"，下次「继续此谱面」就是骗人。
+    /// 等它的代价与那次同步写一样（~223 ms/5 万音符），而且只在**真的有一份在飞**时才付。
+    fn flush_snapshot(&mut self) {
+        self.autosave.flush();
+        self.pump_snapshot_errors();
     }
 
     /// 缺 7z 的门槛模态：**启动页与编辑页共用这一份**（文案、下载页 URL、`fetch`/`quit` 的处置）。
@@ -2085,6 +2117,7 @@ impl App {
     fn save_doc_as(&mut self, path: &str) {
         // 形态名由库里给（`SaveFormat::as_str`）：界面上那一行说明与真正写盘用的是同一套词
         let fmt = self.save_format.as_str();
+        self.flush_snapshot();
         let resp = {
             let mut c = self.core.lock().unwrap();
             c.exec(&serde_json::json!({"op": "save", "path": path, "format": fmt}))
@@ -2127,6 +2160,7 @@ impl App {
             self.save_as_via_system();
             return;
         }
+        self.flush_snapshot();
         let resp = {
             let mut c = self.core.lock().unwrap();
             c.exec(&serde_json::json!({"op": "save"}))
@@ -2846,32 +2880,101 @@ impl App {
     /// （否则它只能重新打开一份旧文件，用户看到的还是"全丢了"）。
     ///
     /// 只在**脏**的时候写：干净就意味着文档与文件一致，不必动缓存。
+    ///
+    /// **这 223 ms 不在这一帧里花**（50 000 音符；构成见 [`opm_app::autosave`] 模块头）：
+    /// 帧里只做"锁内克隆 + 定元数据"（2~4.5 ms），序列化与落盘都交给后台线程。
+    /// 曾经它是同步的，于是**每 2 秒卡一下 ~250 ms**（`OPM_FRAME_LOG` 量到 30 次/60 秒，
+    /// `ui_ms` 250~275 ms；播放头是墙钟驱动的 ⇒ 画面还会跳掉 0.28 秒）。
+    /// 实测修前/修后：`ui_ms` max 274.5 → 13.5 ms，>60 ms 的帧 30 → 0（同一场景、同一段播放）。
+    /// 上一份还没写完就**跳过这一拍**（不推进节流时刻，下一帧再试）。
     fn maybe_snapshot(&mut self, now: Instant) {
+        // 顺序要紧：先看后台忙不忙（一个原子量，不抢锁），忙就整拍跳过 ——
+        // 否则我们会每帧都去克隆一份 50 000 音符的文档，比原来还糟
+        if !self.autosave.idle() {
+            return;
+        }
         if now.duration_since(self.snapshot_at) < SNAPSHOT_MIN_INTERVAL {
             return;
         }
-        let (dirty, has_dir) = {
+        let job = {
             let c = self.core.lock().unwrap();
-            (c.is_dirty(), c.asset_dir().is_some())
+            if !c.is_dirty() {
+                return;
+            }
+            match c.snapshot_job() {
+                Ok(j) => j,
+                // 没有解压缓存目录（不是从容器载入的）：这不是失败，只是没什么可写
+                Err(_) => return,
+            }
         };
-        if !dirty || !has_dir {
-            return;
-        }
         self.snapshot_at = now;
-        let r = {
-            let mut c = self.core.lock().unwrap();
-            c.snapshot_session()
-        };
-        match r {
-            Ok(()) => self.snapshot_err = None,
-            // 失败**只在原因变化时报一次**：这是每两秒重试的兜底，不能每两秒刷一行日志
-            Err(e) => {
-                if self.snapshot_err.as_deref() != Some(e.as_str()) {
-                    self.console_log.push((false, format!("缓存快照失败：{e}")));
-                    self.snapshot_err = Some(e);
+        if self.autosave.try_send(job) {
+            self.snapshots += 1;
+        }
+    }
+
+    /// 回捞后台写手的失败原因。**只在理由变化时报一次**：这是每两秒重试的兜底，
+    /// 不能每两秒刷一行日志。
+    fn pump_snapshot_errors(&mut self) {
+        if let Some(e) = self.autosave.take_error() {
+            if self.snapshot_err.as_deref() != Some(e.as_str()) {
+                self.console_log.push((false, format!("缓存快照失败：{e}")));
+                self.snapshot_err = Some(e);
+            }
+        }
+    }
+
+    /// **逐帧耗时流水**（`OPM_FRAME_LOG=<路径>`，CSV 一行一帧）。
+    ///
+    /// 与 `--bench` 的分工：`--bench` 给的是 p50/p99（"总体多快"），这一份给的是
+    /// **每一帧分别是多少** —— 只有后者能回答"播放时每隔几秒卡一下"这种问题：
+    /// 尖峰的节奏、以及那一下是 UI 构建还是镶嵌/呈现（`delta_ms` 与 `ui_ms` 的差）。
+    ///
+    /// 每帧一次 `writeln!` 到 `BufWriter`，落盘是 8 KB 一批 —— 相对一帧的工作量可以忽略，
+    /// 但它**确实**在量测对象上留了痕迹，所以默认关、且列里带够对照量（实例数/待算数/播放头）。
+    fn frame_log(&mut self, delta_ms: Option<f64>, ui_ms: f64, build_ms: f64, inst: usize) {
+        if self.frame_log.is_none() && !self.frame_log_failed {
+            let Some(path) = std::env::var_os("OPM_FRAME_LOG") else {
+                self.frame_log_failed = true; // 没设过 ⇒ 以后也不必再看
+                return;
+            };
+            match std::fs::File::create(&path) {
+                Ok(f) => {
+                    let mut w = std::io::BufWriter::new(f);
+                    let _ = writeln!(
+                        w,
+                        "frame,delta_ms,ui_ms,build_ms,inst,pending,tl_notes,dirty,snapshots,playing,playhead_s"
+                    );
+                    self.frame_log = Some(w);
+                }
+                Err(e) => {
+                    eprintln!("  ⚠️ OPM_FRAME_LOG 打不开 {}：{e}", path.to_string_lossy());
+                    self.frame_log_failed = true;
+                    return;
                 }
             }
         }
+        // 先把这一帧要记的量全部取出来，再借 `frame_log` 写 —— 否则"借 writer"与"读 self"会打架
+        let tl_notes = self.state.selected().map(|l| l.notes.len()).unwrap_or(0);
+        let (frame, pending, playing, playhead) = (
+            self.frames,
+            self.state.floor_pending(),
+            self.state.playing as u8,
+            self.state.playhead,
+        );
+        let (dirty, snapshots) = (self.dirty_flag(), self.snapshots);
+        let Some(w) = self.frame_log.as_mut() else { return };
+        let _ = writeln!(
+            w,
+            "{frame},{:.3},{ui_ms:.3},{build_ms:.3},{inst},{pending},{tl_notes},{dirty},{snapshots},{playing},{playhead}",
+            delta_ms.unwrap_or(f64::NAN),
+        );
+    }
+
+    /// 当前文档有没有未保存改动（`dirty` 决定 [`App::maybe_snapshot`] 会不会每 2 秒写一次快照 ——
+    /// 那是一次"序列化整份谱面 + 写盘"，是**唯一**与播放无关却按固定节奏发生的重活）。
+    fn dirty_flag(&self) -> u8 {
+        self.core.lock().map(|c| c.is_dirty() as u8).unwrap_or(2)
     }
 
     /// **被"已经有一个会话在运行"挡住的那一屏**。
@@ -3368,6 +3471,7 @@ impl eframe::App for App {
         self.state.pump_floors(EditorState::FLOOR_NOTES_PER_FRAME);
         // 编辑期把文档快照写回解压缓存（节流；被强杀时"继续此谱面"才有东西可继续）
         self.maybe_snapshot(Instant::now());
+        self.pump_snapshot_errors();
 
         // 播放头：有音频时由音频游标驱动（见 state::advance），否则墙钟
         self.state.advance(self.audio.as_ref());
@@ -4290,15 +4394,21 @@ impl eframe::App for App {
 
         // ---- 帧计时与限帧 ----
         self.publish_stats();
-        self.ui_ms.push(t_ui.elapsed().as_secs_f64() * 1000.0);
+        let ui_ms = t_ui.elapsed().as_secs_f64() * 1000.0;
+        self.ui_ms.push(ui_ms);
         self.build_ms.push(build_ms);
         self.inst_counts.push(inst_count);
         let now = Instant::now();
-        if let Some(prev) = self.last_frame {
-            self.deltas.push((now - prev).as_secs_f64() * 1000.0);
+        // 帧间隔在这里取：**上一帧 `ui()` 结束 → 这一帧 `ui()` 结束**。它因此包含
+        // "上一帧的镶嵌/上传/呈现 + 本帧的 UI 构建"两段 —— 尖峰落在哪一段，靠 `ui_ms` 分辨
+        // （`delta ≈ ui_ms` ⇒ UI 里；`delta ≫ ui_ms` ⇒ 在 `ui()` 之外）。
+        let delta_ms = self.last_frame.map(|prev| (now - prev).as_secs_f64() * 1000.0);
+        if let Some(d) = delta_ms {
+            self.deltas.push(d);
         }
         self.last_frame = Some(now);
         self.frames += 1;
+        self.frame_log(delta_ms, ui_ms, build_ms, inst_count);
 
         if self.args.bench > 0 && self.frames >= self.args.bench {
             // 进入空闲阶段：停止主动重绘，只保留 idle_fps 心跳，测量真实空闲帧率

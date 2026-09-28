@@ -685,3 +685,75 @@ fn abort_counts_as_a_change_only_when_it_rolls_something_back() {
     // 回滚真的把内容退回去了
     assert_eq!(core.doc().meta.charter, "");
 }
+
+/// **缓存快照：后台写手写出来的东西必须与同步那条路一模一样**。
+///
+/// 为什么这条值得钉：快照本来只有一个入口（`EditCore::snapshot_session`，在 GUI 帧里同步写），
+/// 现在多了一条"GUI 只克隆、别的线程写"的路（`snapshot_job` → `autosave::write_snapshot`）。
+/// 两条路一旦漂移，表现是"被强杀之后「继续此谱面」拿回来的是别的东西" ——
+/// 那种 bug 只在崩溃之后才暴露，平时看不见。
+///
+/// 顺带钉住元数据的几个字段（`source` / `name` / `dirty` / `snapshot`）：它们决定下次启动怎么问。
+#[test]
+fn a_background_snapshot_matches_the_synchronous_one() {
+    use opm_app::autosave::write_snapshot;
+    use opm_app::codec::container;
+
+    let dir = tmpdir("snapshot");
+    // ① 先造一份**容器**（带资源的那条路才有解压缓存目录，快照才有地方可写）
+    let audio = dir.join("song.ogg");
+    std::fs::write(&audio, b"OggS-fake-audio-payload").unwrap();
+    let mut maker = EditCore::new();
+    maker.exec(&json!({"op": "new", "meta": {"name": "快照", "audio": audio.display().to_string()}}));
+    let chart = dir.join("快照.opm");
+    maker.save_as(&chart, SaveFormat::OpmPacked).unwrap();
+
+    // ② 载入 → 改一处 ⇒ 脏（脏才会写快照）
+    let mut core = EditCore::load(&chart).unwrap();
+    let cache = core.asset_dir().expect("容器载入要摊出缓存目录").to_path_buf();
+    core.exec(&json!({"op": "set_meta", "set": {"charter": "我"}}));
+    assert!(core.is_dirty());
+
+    // ③ 后台那条路：任务（锁内克隆 + 定元数据）→ 写手
+    let job = core.snapshot_job().expect("有缓存目录就该打得出任务");
+    write_snapshot(&job).unwrap();
+    let async_bytes = std::fs::read(cache.join(container::CHART_NAME)).unwrap();
+
+    // ④ 同步那条路：同一目录再写一次
+    core.snapshot_session().unwrap();
+    let sync_bytes = std::fs::read(cache.join(container::CHART_NAME)).unwrap();
+    assert_eq!(async_bytes, sync_bytes, "两条路写出来的必须是同一份字节");
+
+    // ⑤ 内容确实是**内存里那份文档**（不是载入时的那份）
+    let back = opm_app::doc::Document::from_json(
+        serde_json::from_slice(&async_bytes).expect("快照必须是合法 JSON"),
+    )
+    .expect("快照必须能解析回文档");
+    assert_eq!(back.to_json(), core.doc().to_json());
+    assert_eq!(back.meta.charter, "我", "快照要带上未保存的改动");
+
+    // ⑥ 元数据：出处/名字/脏位都对得上
+    let s = container::read_session(&cache).expect("会话元数据要落下");
+    assert!(s.dirty, "写的时候是脏的 ⇒ 元数据必须说脏（否则「继续」会骗人）");
+    assert_eq!(s.name, "快照");
+    assert_eq!(s.source.as_deref(), Some(chart.display().to_string().as_str()));
+    assert!(s.snapshot > 0, "快照时刻要写进去");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// 没有解压缓存目录（裸 `.opm.json`）：打不出任务，**而且不是错误** ——
+/// 这条路上本来就没有"工作副本"可写，`maybe_snapshot` 据此静默跳过。
+#[test]
+fn a_bare_chart_has_no_snapshot_job() {
+    let dir = tmpdir("snapshot-bare");
+    // 单文件 JSON **只写得回已经存在的文件**（新建一律走四种形态）⇒ 这里手写一份再载入
+    let path = dir.join("裸的.opm.json");
+    let mut doc = opm_app::doc::Document::default();
+    doc.meta.name = "裸的".to_owned();
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc.to_json()).unwrap()).unwrap();
+    let core = EditCore::load(&path).unwrap();
+    assert!(core.asset_dir().is_none(), "裸谱面不摊缓存目录");
+    assert!(core.snapshot_job().is_err());
+    std::fs::remove_dir_all(dir).ok();
+}
