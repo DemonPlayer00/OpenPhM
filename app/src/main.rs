@@ -463,6 +463,15 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // ---- **平台契约**：只有 Linux 插手显卡选择，别的平台保持默认选择器 ----
+    //
+    // 一处判定（`gpu::manages_gpu`），下面三处都用它：ICD 白名单 / 后端集合 / 适配器选择器。
+    // Windows 上"程序用哪块卡"完全交给系统那一套；唯一越过这条线的是用户自己设 `OPM_GPU`。
+    // `OPM_GPU_PLATFORM=windows` 是诊断钩子：在 Linux 上把下面整段当成 Windows 跑一遍。
+    let gpu_linux = opm_app::gpu::manages_gpu(cfg!(target_os = "linux"), &|k| std::env::var(k).ok());
+    if !gpu_linux {
+        println!("  显卡平台          : 非 Linux：不改 ICD、不改后端集合、不装适配器选择器（用平台默认的显卡选择器）");
+    }
     // ---- **不打扰独显**：默认把 NVIDIA 的 Vulkan ICD 从枚举里摘掉 ----
     //
     // 实测（`/sys/.../power/runtime_status`）：光启动一次程序，运行时断电的 NVIDIA 独显就会
@@ -471,22 +480,27 @@ fn main() -> eframe::Result<()> {
     // 规则见 `gpu::icd_plan`：只在"Linux + 用户没指定 ICD + 没显式要独显 + 本机还有别的 ICD"时才摘。
     {
         let env = |k: &str| std::env::var(k).ok();
-        let icd_files: Vec<String> = opm_app::gpu::icd_search_paths(&env)
-            .iter()
-            .filter(|d| d.is_dir())
-            .flat_map(|d| {
-                std::fs::read_dir(d)
-                    .map(|rd| {
-                        rd.flatten()
-                            .map(|e| e.path())
-                            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
-        let plan = opm_app::gpu::icd_plan(cfg!(target_os = "linux"), &env, &icd_files);
+        // 非 Linux：连目录都不扫（那边根本不查 Vulkan ICD）
+        let icd_files: Vec<String> = if gpu_linux {
+            opm_app::gpu::icd_search_paths(&env)
+                .iter()
+                .filter(|d| d.is_dir())
+                .flat_map(|d| {
+                    std::fs::read_dir(d)
+                        .map(|rd| {
+                            rd.flatten()
+                                .map(|e| e.path())
+                                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let plan = opm_app::gpu::icd_plan(gpu_linux, &env, &icd_files);
         match &plan.keep {
             Some(keep) => {
                 println!(
@@ -513,23 +527,30 @@ fn main() -> eframe::Result<()> {
     // 用户设了 `WGPU_BACKEND` 时一切照旧（不抢 wgpu 自己的开关）。
     {
         let env = |k: &str| std::env::var(k).ok();
-        // 显式指定的 ICD 路径要么都在、要么不信（见 `gpu::vulkan_icd_usable`）
-        let explicit: Vec<bool> = ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"]
-            .iter()
-            .filter_map(|k| std::env::var(k).ok())
-            .flat_map(|v| {
-                v.split(':')
-                    .filter(|p| !p.trim().is_empty())
-                    .map(|p| std::path::Path::new(p.trim()).is_file())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let default_json = opm_app::gpu::icd_search_paths(&env)
-            .iter()
-            .any(|p| p.is_dir() && dir_has_json(p));
-        let icd = opm_app::gpu::vulkan_icd_usable(&explicit, default_json);
-        let loader = opm_app::gpu::loader_candidates().iter().any(|p| std::path::Path::new(p).is_file());
-        let (plan, why) = opm_app::gpu::backend_plan(cfg!(target_os = "linux"), &env, icd, loader);
+        // 非 Linux：不探测（`libvulkan.so.1` 那几条路径在别的平台没有意义，走不到 VulkanOnly）
+        let (icd, loader) = if gpu_linux {
+            // 显式指定的 ICD 路径要么都在、要么不信（见 `gpu::vulkan_icd_usable`）
+            let explicit: Vec<bool> = ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok())
+                .flat_map(|v| {
+                    v.split(':')
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| std::path::Path::new(p.trim()).is_file())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let default_json = opm_app::gpu::icd_search_paths(&env)
+                .iter()
+                .any(|p| p.is_dir() && dir_has_json(p));
+            let loader = opm_app::gpu::loader_candidates()
+                .iter()
+                .any(|p| std::path::Path::new(p).is_file());
+            (opm_app::gpu::vulkan_icd_usable(&explicit, default_json), loader)
+        } else {
+            (false, false)
+        };
+        let (plan, why) = opm_app::gpu::backend_plan(gpu_linux, &env, icd, loader);
         println!("  图形后端          : {}（{why}）", plan.label());
         if plan == opm_app::gpu::BackendPlan::VulkanOnly {
             if let eframe::egui_wgpu::WgpuSetup::CreateNew(cfg_new) =
@@ -549,8 +570,7 @@ fn main() -> eframe::Result<()> {
     // 边界（实测）：**"一个后端都用不了"轮不到这个选择器** —— wgpu 先要建 surface，
     // 没有可用后端时 eframe 直接报 `FailedToCreateSurfaceForAnyBackend` 并以可读错误退出；
     // 这里的选择器只在"有适配器可挑"时运行（候选全部不能出图到 surface 时会返回下面那句 Err）。
-    let (gpu_policy, gpu_why) =
-        opm_app::gpu::policy_from_env(cfg!(target_os = "linux"), &|k| std::env::var(k).ok());
+    let (gpu_policy, gpu_why) = opm_app::gpu::policy_from_env(gpu_linux, &|k| std::env::var(k).ok());
     println!("  显卡策略          : {}", opm_app::gpu::describe(gpu_policy, gpu_why));
     if gpu_policy != opm_app::gpu::GpuPolicy::Default {
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(cfg_new) = &mut options.wgpu_options.wgpu_setup

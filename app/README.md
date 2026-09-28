@@ -36,6 +36,7 @@ wgpu 枚举适配器时，Vulkan loader 会把 ICD 目录里的**所有**驱动�
 "Linux + 没显式指定 ICD + 没显式要独显 + 本机还有别的 ICD"时才这么做 ——
 **单独显机器**（只有 NVIDIA）与**显式要独显**（`prime-run` / `OPM_GPU=discrete` / `DRI_PRIME`）一律不干预，
 后者实测照旧选中 NVIDIA。启动日志里有一行 `图形 ICD : …（保留 N 个：…）`，摘了谁、为什么，一眼可见。
+**这些一律只在 Linux 生效** —— 平台边界见下面的「平台契约」一节（Windows 上连 ICD 目录都不扫）。
 
 **局限**（写清楚）：只能按**文件名**认厂商，分不出"同厂商的核显与独显"（AMD 平台的 `radeon_icd` 可能是独显，
 那种机器仍会被枚举到）；另外 GL 后端那条路无法这样过滤（所以"没有 Vulkan"时仍可能碰到独显）。
@@ -540,8 +541,35 @@ wgpu 的默认电源偏好是 `HighPerformance`，于是**什么都不设**时�
 | `OPM_GPU=discrete` / `OPM_GPU=integrated` | 明确要独显 / 明确要核显（程序自己的开关，优先级最高） |
 | `WGPU_POWER_PREF=high|low|none` | 尊重 wgpu 自己的偏好变量 |
 
-非 Linux 平台不干预（Windows/macOS 的高性能/省电由系统设置决定）。启动日志会把
-`显卡策略` / 每个`适配器候选` / `显卡选用` 三行打出来 —— 用了哪块卡、为什么，一眼可核对。
+## 平台契约：**只有 Linux 插手，Windows 保持默认选择器**
+
+上面那一整套（ICD 白名单、后端集合、适配器选择器、`WGPU_POWER_PREF` 的翻译）**只在 Linux 生效**。
+非 Linux 上"程序用哪块卡"完全交给系统那一套（Windows 图形设置 / 驱动面板 / 混合输出）：
+
+| 会不会动 | Linux | Windows / macOS |
+|---|---|---|
+| 适配器选择器 | 装（默认核显优先） | **不装** |
+| Vulkan ICD 白名单 | 默认摘掉 NVIDIA | **不碰**（连目录都不扫） |
+| 后端集合 | 探到 Vulkan 就只开 Vulkan | **不碰**（egui-wgpu 默认 `PRIMARY \| GL`） |
+| `WGPU_POWER_PREF` | 翻译成策略 | **不翻译** —— egui-wgpu 自己 `PowerPreference::from_env()` 读它，我们插手只会多装一个选择器 |
+
+**唯一能越过这条线的是 `OPM_GPU`**：它明确写着"本程序自己的开关"，是用户点名要的，不是程序替他做的决定。
+判定只有一处（`gpu::manages_gpu`），三处调用点都用它 —— 于是"Windows 不受影响"是结构性的，不靠谁记得加 `cfg`。
+
+这条不是只写在文档里：`OPM_GPU_PLATFORM=windows|linux` 是**诊断钩子**，能在 Linux 构建上把整段当成
+Windows 跑一遍（认不出的值退回编译期平台）。本机实测（`--trace-startup`，同一个二进制、同一台机器）：
+
+| 跑法 | 启动日志 | 独显 `runtime_status` | 首帧 |
+|---|---|---|---|
+| Linux 默认（摘 NVIDIA ICD、只开 Vulkan、装选择器） | `保留 3 个：radeon/intel_hasvk/intel_icd.json` + `显卡选用: AMD Radeon 610M` | `suspended` **全程没被碰** | 248 ms |
+| `OPM_GPU_PLATFORM=windows` | `非 Linux：不改 ICD、不改后端集合、不装适配器选择器` + `图形后端: 全部后端` + `显卡策略: 交给平台默认` | `suspended` → **`active`**（ICD 未被过滤 ⇒ 枚举到 NVIDIA） | **4773 ms** |
+| `OPM_GPU_PLATFORM=windows OPM_GPU=integrated` | 上面三行 + `适配器候选 [1] NVIDIA GeForce RTX 5070` + `显卡选用: AMD Radeon 610M` | `active` | 5584 ms |
+
+第二行是"Windows 分支真的没干预"的**硬证据**：枚举里出现了 NVIDIA 适配器、后端集合是默认的、日志里
+根本没有 `显卡选用` 那一行（说明我们的选择器压根没装）。启动慢 4.5 s 也正是"枚举独显 + 初始化 GL"的代价。
+
+启动日志会把 `显卡平台` / `图形 ICD` / `图形后端` / `显卡策略` / 每个`适配器候选` / `显卡选用` 打出来 ——
+用了哪块卡、为什么、这一步是谁在做主，一眼可核对。
 
 **在各种硬件组合上都验过**（本机能做的：直接换枚举集合来模拟；选择逻辑本身**完全不看厂商**，
 只吃 `wgpu::DeviceType`，所以"AMD/Intel 独显"与"NVIDIA 独显"走的是同一条路）：
@@ -556,7 +584,8 @@ wgpu 的默认电源偏好是 `HighPerformance`，于是**什么都不设**时�
 | 完全没后端 | `WGPU_BACKEND=vulkan` + 假 ICD 路径 | eframe 报 `FailedToCreateSurfaceForAnyBackend` 后**可读退出**（不 panic）✓ |
 
 另有 64 种适配器子集 × 2 种策略的穷举单测（不变量：有硬件绝不选软件、有核显必选核显、
-只有独显必用它、结果确定），以及"策略不看厂商"的结构性测试。
+只有独显必用它、结果确定），以及"策略不看厂商"的结构性测试；再加一条 **128 种环境组合的非 Linux 穷举**
+（不看平台就断言"策略=交给平台、ICD 不干预、后端不动"，唯一的例外是 `OPM_GPU`）与平台钩子的单测。
 
 ## 快速放置音符：Q/W/E/R（hold 跟随鼠标）
 

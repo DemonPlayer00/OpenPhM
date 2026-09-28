@@ -2541,3 +2541,62 @@ wgpu 枚举适配器时，Vulkan loader 会把 ICD 目录里的**所有**驱动�
 **局限（写进代码注释与文档）**：只能按**文件名**认厂商，分不出"同厂商的核显与独显"
 （AMD 平台的 `radeon_icd` 也可能是独显）；GL 后端那条路没法这样过滤，所以"完全没有 Vulkan"的机器
 仍可能碰到独显。
+
+### 7.44.3 Windows 保持默认显卡选择器：把平台边界做成结构（2026-09-28）
+
+用户："**windows保持默认显卡选择器。**"
+
+#### 先审计：三条干预是不是各自都带 `is_linux` 门槛
+
+§7.43 的适配器选择器、§7.44.1 的后端集合、§7.44.2 的 ICD 白名单，三处都传了
+`cfg!(target_os = "linux")`，所以 Windows 上**运行时确实没被改**。但这是"三处各写一遍、谁改谁负责"的
+形状，而且**没法验证** —— Windows 分支在 Linux 上跑不到，只能靠阅读代码相信。
+
+#### 修法：一处判定 + 一个能执行的钩子
+
+- `gpu::manages_gpu(linux_build, env)` = **平台契约的唯一判定点**，三处调用点都改用它
+  （顺便：非 Linux 时**连 ICD 目录都不扫、连 loader 都不探** —— 那些路径在别的平台本来就不存在）；
+- `OPM_GPU_PLATFORM=windows|linux` = **诊断钩子**，在 Linux 构建上把整段当成 Windows 跑；
+  认不出的值（含空串）**退回编译期平台** —— 钩子不该凭一个错别字把程序带进另一条路；
+- `WGPU_POWER_PREF` 在非 Linux 上**不再翻译**：egui-wgpu 自己 `PowerPreference::from_env()` 读同一个变量
+  （`low`/`high`/`none` 与我们的策略一一对应），我们插一手只会多装一个选择器。这处是这轮唯一的行为收敛。
+- 默认的 `OPM_GPU`（本程序自己的开关）**仍然生效**：那是用户点名要的，不是程序替他做的决定。
+
+#### 契约表
+
+| 会不会动 | Linux | Windows / macOS |
+|---|---|---|
+| 适配器选择器 | 装（核显优先） | **不装** |
+| Vulkan ICD 白名单 | 默认摘掉 NVIDIA | **不碰** |
+| 后端集合 | 探到 Vulkan 就只开 Vulkan | **不碰**（egui-wgpu 默认 `PRIMARY \| GL`） |
+| `WGPU_POWER_PREF` | 翻译成策略 | **不翻译**（交还 egui-wgpu） |
+| prime-run / `DRI_PRIME` 标记 | 认 | **不认** |
+| `OPM_GPU` | 认 | **认**（唯一的例外） |
+
+#### 实测（同一个二进制、同一台机器，`--trace-startup`）
+
+| 跑法 | 独显 `runtime_status` | 首帧 | 关键日志 |
+|---|---|---|---|
+| Linux 默认 | `suspended`（**全程没被碰**） | 248 ms | `保留 3 个：radeon/intel_hasvk/intel_icd.json`、`显卡选用: AMD Radeon 610M` |
+| `OPM_GPU_PLATFORM=windows` | `suspended` → **`active`** | **4773 ms** | `非 Linux：不改 ICD、不改后端集合、不装适配器选择器`、`图形后端: 全部后端`、`显卡策略: 交给平台默认`、**没有 `显卡选用` 那一行** |
+| + `OPM_GPU=integrated` | `active` | 5584 ms | 上面三行 + `适配器候选 [1] NVIDIA GeForce RTX 5070 Laptop GPU` + `显卡选用: AMD Radeon 610M` |
+
+第二行的证据链是闭合的：枚举里出现 NVIDIA 适配器（ICD 未被过滤）、后端是默认集合、
+日志里**根本没有 `显卡选用`**（我们的选择器没装）；首帧慢 4.5 s 正是"枚举独显 + 初始化 GL"的代价。
+
+#### 测试
+
+- `non_linux_never_interferes_with_the_platform_selector`：7 个"在 Linux 上立刻改变行为"的环境变量
+  （prime-run 三标记、两种显式 ICD、`WGPU_POWER_PREF`、`WGPU_BACKEND`）穷举 **2⁷ = 128 种组合**，
+  每种都断言"策略 = 交给平台（`pick_index` 返回 `None`）、ICD 不干预、后端不动"；
+- `opm_gpu_is_the_only_knob_that_works_on_non_linux`：唯一的例外及其边界；
+- `platform_hook_switches_the_contract`：钩子生效 + 错别字退回编译期平台。
+
+`cargo test`：**188 通过 / 0 失败 / 0 警告**（新增 3 条）。
+
+**仍未验证**：Windows 本机编译与运行（`rustup target add x86_64-pc-windows-gnu` 失败，见 §7.29）。
+本轮的"Windows 行为"是在 Linux 上用钩子**执行**平台无关的那几条判定得到的 ——
+`power_preference` 与 wgpu 后端实现层面在 Windows 上的真实表现，仍需目标机。
+另外记一笔现状：egui-wgpu 的默认电源偏好是 `HighPerformance`（`WGPU_POWER_PREF` 未设时），
+我们**没动它** —— 用户要的是"保持默认"，而这就是那套默认；若哪天要改成"让 Windows 图形设置说了算"，
+那是另一处改动（把 `power_preference` 设成 `PowerPreference::None`），不是这一处。

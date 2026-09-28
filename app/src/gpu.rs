@@ -13,7 +13,28 @@
 //! | `OPM_GPU=discrete` | 本程序自己的开关（也可 `integrated` 明确要核显） |
 //! | `WGPU_POWER_PREF=high` | wgpu 自己的偏好环境变量，尊重它 |
 //!
-//! 非 Linux 平台**不动**（Windows 的"高性能/省电"由系统设置决定，程序不该抢）。
+//! 非 Linux 平台**不动**（Windows 的"高性能/省电"由系统设置决定，程序不该抢）—— 这条现在是
+//! 结构化的平台契约，见下。
+//!
+//! ## 平台契约：**只有 Linux 会插手，别的平台保持默认选择器**
+//!
+//! 非 Linux（首要是 Windows）**一个字都不改**，全部交给平台自己的默认选择器：
+//!
+//! | 我们会不会动 | Linux | Windows / 其它 |
+//! |---|---|---|
+//! | 适配器选择器（`native_adapter_selector`） | 默认装（核显优先） | **不装** —— 除非用户自己设了 `OPM_GPU` |
+//! | Vulkan ICD 白名单（`icd_plan`） | 默认摘掉 NVIDIA | **不碰**（连目录都不扫） |
+//! | 后端集合（`backend_plan`） | 探到 Vulkan 就只开 Vulkan | **不碰**（egui-wgpu 默认 `PRIMARY \| GL`） |
+//! | 电源偏好（`WGPU_POWER_PREF`） | 我们翻译成策略 | **不翻译** —— egui-wgpu 自己就 `from_env()` 读它 |
+//! | prime-run / `DRI_PRIME` 标记 | 认 | **不认**（这些变量在别的平台没有意义） |
+//!
+//! 于是 Windows 上"程序用哪块卡"完全由系统那套（Windows 图形设置 / 驱动面板 / 混合输出）决定 ——
+//! 那正是用户要的"保持默认显卡选择器"。**唯一能越过这条线的是 `OPM_GPU`**：它明确写着
+//! "本程序自己的开关"，是用户点名要的，不是我们替他做的决定。
+//!
+//! 契约靠 [`manages_gpu`] 一处判定；`OPM_GPU_PLATFORM` 是**诊断钩子**，能把 Linux 构建当成
+//! Windows 跑一遍 —— 于是"Windows 不干预"不是只写在文档里的声明，而是在本机真被执行到
+//! （README 的「平台契约」与《框架选型》§7.44.3 有实测输出）。
 //!
 //! 纯逻辑都在这里（策略判定 + 打分），**不依赖 wgpu 类型**，所以能单测；
 //! 把 `wgpu::Adapter` 映射成 [`GpuKind`] 的那几行在 `main.rs`（那里本来就有 wgpu）。
@@ -91,11 +112,34 @@ pub fn pick_index(policy: GpuPolicy, kinds: &[GpuKind]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// **平台契约的唯一判定点**：本程序要不要按 Linux 那套插手显卡选择。
+///
+/// `linux_build` 是编译期事实（调用点传 `cfg!(target_os = "linux")`）。
+/// `OPM_GPU_PLATFORM=windows|linux` 是**诊断钩子**（生产环境没人会设它）：在 Linux 上把它设成
+/// `windows`，整条链路就走"非 Linux"分支 —— 于是"Windows 保持默认选择器"能被真的执行、
+/// 被启动日志与 sysfs 验证，而不是靠阅读代码相信。
+///
+/// 认不出的值（含空串）**退回编译期平台**：钩子不该能凭一个错别字把程序带进另一条路。
+pub fn manages_gpu(linux_build: bool, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    let forced = env("OPM_GPU_PLATFORM")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    match forced.as_deref() {
+        Some("windows") | Some("win") | Some("other") | Some("macos") => false,
+        Some("linux") => true,
+        _ => linux_build,
+    }
+}
+
 /// 环境变量 → 策略（**纯函数**：`env` 传进来，于是可测）。
+///
+/// `linux` = [`manages_gpu`] 的结论（**不是**"编译目标是 Linux"）：为 `false` 时除 `OPM_GPU`
+/// 外一切都不拦 —— 包括 `WGPU_POWER_PREF`，那个变量 egui-wgpu 自己会读
+/// （`PowerPreference::from_env()`），用不着我们翻译一遍（翻译反而多装一个选择器）。
 ///
 /// 顺序即优先级：程序自己的开关 > prime-run 的标记 > wgpu 的环境变量 > 默认。
 pub fn policy_from_env(
-    is_linux: bool,
+    linux: bool,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> (GpuPolicy, &'static str) {
     let get = |k: &str| env(k).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
@@ -110,7 +154,7 @@ pub fn policy_from_env(
         _ => {}
     }
     // ② prime-run / Mesa 的显式指定（**在 Linux 上才认**：别的平台这些变量没有意义）
-    if is_linux {
+    if linux {
         let offload = get("__NV_PRIME_RENDER_OFFLOAD").as_deref() == Some("1");
         let optimus = get("__VK_LAYER_NV_optimus").as_deref() == Some("nvidia_only");
         let glx = get("__GLX_VENDOR_LIBRARY_NAME").as_deref() == Some("nvidia");
@@ -119,18 +163,22 @@ pub fn policy_from_env(
             return (GpuPolicy::DiscreteFirst, "prime-run / DRI_PRIME：显式要独显");
         }
     }
-    // ③ wgpu 自己的偏好变量：尊重它（`high` 才是"要独显"）
-    match get("WGPU_POWER_PREF").as_deref() {
-        Some("high") => return (GpuPolicy::DiscreteFirst, "WGPU_POWER_PREF=high"),
-        Some("low") => return (GpuPolicy::IntegratedFirst, "WGPU_POWER_PREF=low"),
-        Some("none") => return (GpuPolicy::Default, "WGPU_POWER_PREF=none"),
-        _ => {}
+    // ③ wgpu 自己的偏好变量：**只在 Linux 上翻译**。别的平台上 egui-wgpu 会自己
+    //    `PowerPreference::from_env()` 读同一个变量（low/high/none 与我们的策略一一对应），
+    //    我们插一手只会多装一个选择器 —— 那就不是"保持默认"了。
+    if linux {
+        match get("WGPU_POWER_PREF").as_deref() {
+            Some("high") => return (GpuPolicy::DiscreteFirst, "WGPU_POWER_PREF=high"),
+            Some("low") => return (GpuPolicy::IntegratedFirst, "WGPU_POWER_PREF=low"),
+            Some("none") => return (GpuPolicy::Default, "WGPU_POWER_PREF=none"),
+            _ => {}
+        }
     }
     // ④ 默认
-    if is_linux {
+    if linux {
         (GpuPolicy::IntegratedFirst, "默认：核显优先，独显要显式指定")
     } else {
-        (GpuPolicy::Default, "非 Linux：交给平台默认")
+        (GpuPolicy::Default, "非 Linux：交给平台默认（不动选择器）")
     }
 }
 
@@ -164,8 +212,11 @@ impl BackendPlan {
 /// - 用户设了 `WGPU_BACKEND` ⇒ **不动**（那是 wgpu 自己的开关，别抢）；
 /// - Linux 且 ICD json 与 loader 都在 ⇒ 只开 Vulkan；
 /// - 其余（非 Linux、探测不到 Vulkan）⇒ 全后端。
+///
+/// `linux` = [`manages_gpu`] 的结论。非 Linux 时调用点**连探测都不做**（`libvulkan.so.1`
+/// 这种路径在 Windows 上本来就不存在），这里的结论也就是"不动后端集合"。
 pub fn backend_plan(
-    is_linux: bool,
+    linux: bool,
     env: &dyn Fn(&str) -> Option<String>,
     vulkan_icd_present: bool,
     vulkan_loader_present: bool,
@@ -183,16 +234,19 @@ pub fn backend_plan(
     if get("WGPU_BACKEND").is_some() {
         return (BackendPlan::All, "尊重 WGPU_BACKEND（用户自己指定了后端）");
     }
-    if is_linux && vulkan_icd_present && vulkan_loader_present {
-        return (BackendPlan::VulkanOnly, "检测到 Vulkan ICD 与 loader");
-    }
-    if !is_linux {
+    if !linux {
+        // 非 Linux：后端集合保持 egui-wgpu 的默认（`PRIMARY | GL`），我们不碰
         return (BackendPlan::All, "非 Linux：不动后端集合");
+    }
+    if vulkan_icd_present && vulkan_loader_present {
+        return (BackendPlan::VulkanOnly, "检测到 Vulkan ICD 与 loader");
     }
     (BackendPlan::All, "没探测到可用的 Vulkan：保留全后端")
 }
 
-/// Vulkan ICD 声明文件可能所在的位置（按 Vulkan loader 的查找规则：环境变量优先，其次 XDG/默认目录）
+/// Vulkan ICD 声明文件可能所在的位置（按 Vulkan loader 的查找规则：环境变量优先，其次 XDG/默认目录）。
+///
+/// **Linux 专用**：非 Linux 平台不查 ICD（见 [`manages_gpu`]），这里给的也是 Linux 的路径。
 pub fn icd_search_paths(env: &dyn Fn(&str) -> Option<String>) -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     let mut out: Vec<PathBuf> = Vec::new();
@@ -230,6 +284,8 @@ pub fn icd_search_paths(env: &dyn Fn(&str) -> Option<String>) -> Vec<std::path::
 ///
 /// 局限（写清楚，别让后来人以为它能分辨一切）：只能按**文件名**判断厂商，
 /// 分不出"同厂商的核显与独显"；AMD 平台上的 `radeon_icd` 可能是独显，那种机器仍会被枚举到。
+///
+/// `linux` = [`manages_gpu`] 的结论：非 Linux 一律不干预（Windows 的显卡就归 Windows 管）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcdPlan {
     /// `Some(paths)` = 只加载这些 ICD；`None` = 不干预
@@ -239,7 +295,7 @@ pub struct IcdPlan {
 
 /// 算出 ICD 计划（**纯函数**：环境与"目录里有哪些 ICD"都由调用方给）
 pub fn icd_plan(
-    is_linux: bool,
+    linux: bool,
     env: &dyn Fn(&str) -> Option<String>,
     icd_files: &[String],
 ) -> IcdPlan {
@@ -249,13 +305,13 @@ pub fn icd_plan(
             .filter(|v| !v.is_empty())
     };
     let no_change = |reason: &'static str| IcdPlan { keep: None, reason };
-    if !is_linux {
+    if !linux {
         return no_change("非 Linux：不动 ICD");
     }
     if get("VK_DRIVER_FILES").is_some() || get("VK_ICD_FILENAMES").is_some() {
         return no_change("用户显式指定了 Vulkan ICD");
     }
-    if policy_from_env(is_linux, env).0 == GpuPolicy::DiscreteFirst {
+    if policy_from_env(linux, env).0 == GpuPolicy::DiscreteFirst {
         return no_change("已显式要独显（prime-run / OPM_GPU=discrete）");
     }
     let is_nvidia = |p: &str| {
@@ -331,6 +387,95 @@ mod tests {
         // 非 Linux：不干预
         let (p, _) = policy_from_env(false, &env_of(&[]));
         assert_eq!(p, GpuPolicy::Default);
+    }
+
+    /// **Windows 保持默认选择器**（穷举）：非 Linux 上，除了用户自己点名的 `OPM_GPU`，
+    /// 任何环境组合都不许让我们插手 —— 不改 ICD 白名单、不改后端集合、不装选择器。
+    ///
+    /// 环境池专挑"在 Linux 上会立刻改变行为"的那些变量：prime-run 的三个标记、显式 ICD、
+    /// wgpu 自己的 `WGPU_POWER_PREF`/`WGPU_BACKEND`。2^7 = 128 种组合逐个过。
+    #[test]
+    fn non_linux_never_interferes_with_the_platform_selector() {
+        let pool: [(&str, &str); 7] = [
+            ("DRI_PRIME", "1"),
+            ("__NV_PRIME_RENDER_OFFLOAD", "1"),
+            ("__GLX_VENDOR_LIBRARY_NAME", "nvidia"),
+            ("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/nvidia_icd.json"),
+            ("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/nvidia_icd.json"),
+            ("WGPU_POWER_PREF", "high"),
+            ("WGPU_BACKEND", "vulkan"),
+        ];
+        let icds = vec![
+            "/usr/share/vulkan/icd.d/radeon_icd.json".to_owned(),
+            "/usr/share/vulkan/icd.d/nvidia_icd.json".to_owned(),
+        ];
+        for mask in 0u32..(1 << pool.len()) {
+            let pairs: Vec<(&str, &str)> = (0..pool.len())
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| pool[i])
+                .collect();
+            let env = env_of(&pairs);
+            // ① 策略 = 交给平台（`Default` ⇒ 调用点根本不装选择器）
+            let (p, why) = policy_from_env(false, &env);
+            assert_eq!(p, GpuPolicy::Default, "{pairs:?} ⇒ {why}");
+            assert_eq!(
+                pick_index(p, &[GpuKind::Integrated, GpuKind::Discrete]),
+                None,
+                "{pairs:?}"
+            );
+            // ② ICD 白名单：一个字都不改（哪怕显式指了 NVIDIA 的 ICD）
+            assert_eq!(icd_plan(false, &env, &icds).keep, None, "{pairs:?}");
+            // ③ 后端集合：即便"探测到 Vulkan"也不改（非 Linux 上连探测都不做）
+            assert_eq!(backend_plan(false, &env, true, true).0, BackendPlan::All, "{pairs:?}");
+        }
+        // ④ `WGPU_POWER_PREF` 在非 Linux 上**交还给 wgpu**：egui-wgpu 自己 `PowerPreference::from_env()`
+        //    读它（low/high/none 与我们的策略一一对应）；我们翻译一遍只会多装一个选择器。
+        for (v, on_linux) in [
+            ("low", GpuPolicy::IntegratedFirst),
+            ("high", GpuPolicy::DiscreteFirst),
+            ("none", GpuPolicy::Default),
+        ] {
+            let env = env_of(&[("WGPU_POWER_PREF", v)]);
+            assert_eq!(policy_from_env(true, &env).0, on_linux, "{v}");
+            assert_eq!(policy_from_env(false, &env).0, GpuPolicy::Default, "{v}");
+        }
+    }
+
+    /// 唯一的例外是 `OPM_GPU`：它写着"本程序自己的开关"，是用户点名要的，非 Linux 也照办
+    #[test]
+    fn opm_gpu_is_the_only_knob_that_works_on_non_linux() {
+        let (p, why) = policy_from_env(false, &env_of(&[("OPM_GPU", "integrated")]));
+        assert_eq!(p, GpuPolicy::IntegratedFirst);
+        assert!(why.contains("OPM_GPU"), "{why}");
+        assert_eq!(
+            policy_from_env(false, &env_of(&[("OPM_GPU", "discrete")])).0,
+            GpuPolicy::DiscreteFirst
+        );
+        // 但"选哪块卡"之外的事仍然是 Linux 的活儿：非 Linux 不动 ICD 白名单
+        let icds = vec![
+            "/usr/share/vulkan/icd.d/nvidia_icd.json".to_owned(),
+            "/usr/share/vulkan/icd.d/radeon_icd.json".to_owned(),
+        ];
+        assert_eq!(
+            icd_plan(false, &env_of(&[("OPM_GPU", "integrated")]), &icds).keep,
+            None
+        );
+    }
+
+    /// 平台钩子 `OPM_GPU_PLATFORM`：能把 Linux 构建当成 Windows 跑（"不干预"这条因此可执行、
+    /// 可验证）；认不出的值退回编译期平台 —— 钩子不该被一个错别字带进另一条路。
+    #[test]
+    fn platform_hook_switches_the_contract() {
+        assert!(manages_gpu(true, &env_of(&[])));
+        assert!(!manages_gpu(false, &env_of(&[])));
+        for v in ["windows", " Win ", "other", "macos"] {
+            assert!(!manages_gpu(true, &env_of(&[("OPM_GPU_PLATFORM", v)])), "{v}");
+        }
+        assert!(manages_gpu(false, &env_of(&[("OPM_GPU_PLATFORM", "linux")])));
+        for v in ["", "  ", "windwos", "win32"] {
+            assert!(manages_gpu(true, &env_of(&[("OPM_GPU_PLATFORM", v)])), "{v:?}");
+            assert!(!manages_gpu(false, &env_of(&[("OPM_GPU_PLATFORM", v)])), "{v:?}");
+        }
     }
 
     /// prime-run 的三个标记 + Mesa 的 DRI_PRIME 都算"显式要独显"；`DRI_PRIME=0` 不算
