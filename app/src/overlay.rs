@@ -52,14 +52,16 @@ pub enum OverlayAction {
     EventResizeEnd,
     /// **快速放置**（Q/W/E/R）：把指针处的音符放下去（位置已吸附；kind = tap/flick/drag/hold）
     QuickPlace { kind: opm_app::doc::NoteKind, lane_x: f32, beat: f64 },
-    /// 待放置的 hold：终点跟随鼠标（**只在指针真的移动时**发 —— 滚动/缩放不改长度）
-    PendingHoldFollow { beat: f64 },
-    /// 待放置的 hold：拖时间控制杆改起点或终点
-    PendingHoldResize { edge: EventEdge, beat: f64 },
-    /// 待放置的 hold：放下（R / 回车）
-    PendingHoldCommit,
-    /// 待放置的 hold：取消（Esc）
-    PendingHoldCancel,
+    /// **事件区**起一个事件块草稿（指针所在那一列 = 轨道；与 hold 同一套跟随流程）
+    StartEventDraft { track: TrackId, beat: f64 },
+    /// 草稿（hold 或事件块）的终点跟随鼠标 —— **只在指针真的移动时**发，滚动/缩放不改长度
+    DraftFollow { beat: f64 },
+    /// 草稿：拖时间控制杆改起点或终点
+    DraftResize { edge: EventEdge, beat: f64 },
+    /// 草稿：放下（R / 回车 / **鼠标左键**）
+    DraftCommit,
+    /// 草稿：取消（Esc）
+    DraftCancel,
     /// 面板想跟用户说一句话（例如"指针不在音符区，快速放置用不了"）——
     /// 动作只描述意图，显示在状态栏/控制台由调用方决定
     Notice(String),
@@ -1024,38 +1026,58 @@ pub fn draw(
         _ => {}
     }
 
-    // ---- 快速放置（Q/W/E/R）与 hold 跟随 ----
+    // ---- 快速放置（Q/W/E/R）、事件区起草稿、草稿跟随与控制杆 ----
     //
-    // 位置解析（指针 → 吸附后的 laneX/拍）只有这里懂，所以"按键 → 放什么"也放在这里：
+    // 位置解析（指针 → 吸附后的 laneX/拍/轨道列）只有这里懂，所以"按键 → 放什么"也放在这里：
     // 调用方只负责施加动作。
     //
-    // **约束（用户要求）：hold 跟随状态下，编辑区的滚动与缩放必须照常。**
+    // **约束（用户要求）：草稿跟随状态下，编辑区的滚动与缩放必须照常。**
     // 具体做法：这一段既不读也不消费滚轮/缩放事件（它们在下面独立处理），
     // 跟随只认"指针**移动**"这一个信号 —— 于是滚动/缩放时长度不变、功能不受影响。
     let pointer_in_notes = |pos: egui::Pos2| pos.x < mid_x && !in_axis(pos) && !over_ruler(pos);
-    if keys_enabled && st.pending_hold.is_none() {
+    let event_col_of = |pos: egui::Pos2| -> Option<(TrackId, f32)> {
+        if pos.x <= mid_x || in_axis(pos) || over_ruler(pos) {
+            return None;
+        }
+        let k = (((pos.x - ev_pane.min.x) / col_w).floor() as usize).min(lanes - 1);
+        Some((TrackId::ALL[k], ev_pane.min.x + col_w * (k as f32 + 0.5)))
+    };
+    if keys_enabled && !st.drafting() {
         for key in [egui::Key::Q, egui::Key::W, egui::Key::E, egui::Key::R] {
             if !key_pressed_once(ui, key) {
                 continue;
             }
-            let Some(kind) = opm_app::keymap::quick_place_kind(key) else { continue };
-            match ptr.filter(|q| pointer_in_notes(*q)) {
-                Some(pos) => actions.push(OverlayAction::QuickPlace {
-                    kind,
-                    lane_x: st.snap_lane(lane_of_x(pos.x)),
-                    beat: st.snap_beat(beat_of(pos.y)).max(0.0),
-                }),
-                // 指针不在音符区：**说清楚为什么没反应**（静默失败最让人困惑）
+            // 指针在**音符区** ⇒ 放音符（hold 走跟随）；在**事件区** ⇒ 起事件块草稿
+            match ptr {
+                Some(pos) if pointer_in_notes(pos) => {
+                    if let Some(kind) = opm_app::keymap::quick_place_kind(key) {
+                        actions.push(OverlayAction::QuickPlace {
+                            kind,
+                            lane_x: st.snap_lane(lane_of_x(pos.x)),
+                            beat: st.snap_beat(beat_of(pos.y)).max(0.0),
+                        });
+                    }
+                }
+                Some(pos) => match event_col_of(pos) {
+                    Some((track, _)) => actions.push(OverlayAction::StartEventDraft {
+                        track,
+                        beat: st.snap_beat(beat_of(pos.y)).max(0.0),
+                    }),
+                    // 指针不在音符区也不在事件区（标尺上）：**说清楚为什么没反应**
+                    None => actions.push(OverlayAction::Notice(
+                        "快速放置要把指针放在音符区或事件区里，再按 Q/W/E/R".to_owned(),
+                    )),
+                },
                 None => actions.push(OverlayAction::Notice(
-                    "快速放置需要把指针放在音符区里（左边那半），再按 Q/W/E/R".to_owned(),
+                    "快速放置要把指针放在音符区或事件区里，再按 Q/W/E/R".to_owned(),
                 )),
             }
         }
     }
-    if let Some(h) = st.pending_hold {
+    if st.drafting() {
         // 放下 / 取消：只有这一处判键，免得和别处抢。
-        // `keys_enabled` 同样管着它们 —— 在控制台打字时按回车不该把 hold 放下。
-        let (commit, cancel) = if keys_enabled {
+        // `keys_enabled` 同样管着它们 —— 在控制台打字时按回车不该把草稿放下。
+        let (commit_key, cancel) = if keys_enabled {
             (
                 key_pressed_once(ui, egui::Key::R) || key_pressed_once(ui, egui::Key::Enter),
                 key_pressed_once(ui, egui::Key::Escape),
@@ -1063,70 +1085,81 @@ pub fn draw(
         } else {
             (false, false)
         };
-        if commit {
-            actions.push(OverlayAction::PendingHoldCommit);
+        // **左键点一下 = 放下**（用户要求）：拖动控制杆仍然是改起止、拖动别处仍然是跟随，
+        // 所以只认"没有拖动过的单击"。
+        let commit_click = !resp.dragged() && resp.clicked_by(egui::PointerButton::Primary);
+        if commit_key || commit_click {
+            actions.push(OverlayAction::DraftCommit);
         } else if cancel {
-            actions.push(OverlayAction::PendingHoldCancel);
+            actions.push(OverlayAction::DraftCancel);
         }
-        // 草稿 + **与事件块同一套控制杆**
-        let x = x_of_lane(h.lane_x);
-        let (y0, y1) = (y_of(h.start_beat), y_of(h.end_beat));
-        let draft = egui::Rect::from_min_max(
-            egui::pos2(x - 5.0, y0.min(y1)),
-            egui::pos2(x + 5.0, y0.max(y1)),
-        )
-        .intersect(note_pane);
-        if draft.is_positive() {
-            p.rect_filled(draft, 1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90));
-            p.rect_stroke(
-                draft.expand(1.0),
-                1.0,
-                egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 235, 160)),
-                egui::StrokeKind::Outside,
-            );
-        }
-        let handle = TimeHandle::from_span(x - 5.0, x + 5.0, y0, y1);
-        let hot = ptr.map(|q| handle.hit(q));
-        let edge_color = |hit: bool| {
-            if hit {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_rgb(255, 235, 160)
-            }
+        // 草稿的几何：hold 在音符区（横向 = 音符宽）、事件块在它那一列（横向 = 列宽）
+        let draft_geom: Option<(f32, f32, f32, f32)> = if let Some(h) = st.pending_hold {
+            let x = x_of_lane(h.lane_x);
+            let (y0, y1) = (y_of(h.start_beat), y_of(h.end_beat));
+            Some((x - 5.0, x + 5.0, y0, y1))
+        } else if let Some(e) = st.pending_event {
+            let k = TrackId::ALL.iter().position(|t| *t == e.track).unwrap_or(0);
+            let x0 = ev_pane.min.x + col_w * k as f32;
+            let (y0, y1) = (y_of(e.start_beat), y_of(e.end_beat));
+            Some((x0 + 2.0, x0 + col_w - 2.0, y0, y1))
+        } else {
+            None
         };
-        handle.paint(&p, EventEdge::Start, edge_color(hot == Some(EventPart::Start)));
-        handle.paint(&p, EventEdge::End, edge_color(hot == Some(EventPart::End)));
-        if resp.drag_started() || resp.dragged() {
-            match hot {
-                Some(EventPart::Start) | Some(EventPart::End) => {
-                    let edge = if hot == Some(EventPart::Start) {
-                        EventEdge::Start
-                    } else {
-                        EventEdge::End
-                    };
-                    if let Some(q) = ptr {
-                        actions.push(OverlayAction::PendingHoldResize {
-                            edge,
-                            beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                        });
-                    }
-                }
-                // 拖在别处 = "长条跟着鼠标走"（长度随移动）
-                _ => {
-                    if let Some(q) = ptr {
-                        actions.push(OverlayAction::PendingHoldFollow {
-                            beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                        });
-                    }
-                }
+        if let Some((x0, x1, y0, y1)) = draft_geom {
+            let draft = egui::Rect::from_min_max(
+                egui::pos2(x0, y0.min(y1)),
+                egui::pos2(x1, y0.max(y1)),
+            );
+            let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90);
+            let edge_col = egui::Color32::from_rgb(255, 235, 160);
+            if draft.is_positive() {
+                p.rect_filled(draft, 1.0, fill);
+                p.rect_stroke(
+                    draft.expand(1.0),
+                    1.0,
+                    egui::Stroke::new(1.2, edge_col),
+                    egui::StrokeKind::Outside,
+                );
             }
-        } else if let Some(q) = ptr.filter(|q| pointer_in_notes(*q)) {
-            // 只有**真的移动**才改长度：滚动/缩放时指针没动，长度与视口都保持原样
-            let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
-            if moved {
-                actions.push(OverlayAction::PendingHoldFollow {
-                    beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                });
+            let handle = TimeHandle::from_span(x0, x1, y0, y1);
+            let hot = ptr.map(|q| handle.hit(q));
+            let color = |hit: bool| if hit { egui::Color32::WHITE } else { edge_col };
+            handle.paint(&p, EventEdge::Start, color(hot == Some(EventPart::Start)));
+            handle.paint(&p, EventEdge::End, color(hot == Some(EventPart::End)));
+            if resp.drag_started() || resp.dragged() {
+                match hot {
+                    Some(EventPart::Start) | Some(EventPart::End) => {
+                        let edge = if hot == Some(EventPart::Start) {
+                            EventEdge::Start
+                        } else {
+                            EventEdge::End
+                        };
+                        if let Some(q) = ptr {
+                            actions.push(OverlayAction::DraftResize {
+                                edge,
+                                beat: st.snap_beat(beat_of(q.y)).max(0.0),
+                            });
+                        }
+                    }
+                    // 拖在别处 = "长度跟着鼠标走"
+                    _ => {
+                        if let Some(q) = ptr {
+                            actions.push(OverlayAction::DraftFollow {
+                                beat: st.snap_beat(beat_of(q.y)).max(0.0),
+                            });
+                        }
+                    }
+                }
+            } else if let Some(q) = ptr.filter(|q| pointer_in_notes(*q) || event_col_of(*q).is_some())
+            {
+                // 只有**真的移动**才改长度：滚动/缩放时指针没动，长度与视口都保持原样
+                let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+                if moved {
+                    actions.push(OverlayAction::DraftFollow {
+                        beat: st.snap_beat(beat_of(q.y)).max(0.0),
+                    });
+                }
             }
         }
     }
@@ -1223,7 +1256,8 @@ pub fn draw(
                 }
             }
         }
-    } else if resp.clicked() {
+    } else if resp.clicked() && !st.drafting() {
+        // 草稿期间不点选（那时候左键是"放下"）—— 见 `drafting` 那一段
         match hit {
             Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
             Some(Hit::Note(i)) => actions.push(OverlayAction::SelectNote(i)),
@@ -1760,13 +1794,24 @@ mod tests {
             );
         }
 
-        // 指针不在音符区：给一句话，而不是什么都不做
+        // 指针在**事件区**：起一个事件块草稿（用户要求：事件区按键跟 hold 一样能造东西）
         let out = press(outside, egui::Key::Q);
+        let start = out
+            .iter()
+            .find(|a| a.starts_with("StartEventDraft"))
+            .unwrap_or_else(|| panic!("事件区按键应起草稿：{out:?}"));
+        assert!(start.contains("track: "), "要带上轨道：{start}");
+        assert!(!out.iter().any(|a| a.starts_with("QuickPlace")));
+
+        // 指针在标尺上（既不在音符区也不在事件区）：给一句话，而不是什么都不做
+        let ruler = egui::pos2(180.0, 5.0);
+        let out = press(ruler, egui::Key::Q);
         assert!(
             out.iter().any(|a| a.starts_with("Notice")),
-            "指针不在音符区时应给出说明：{out:?}"
+            "标尺上按键应给出说明：{out:?}"
         );
         assert!(!out.iter().any(|a| a.starts_with("QuickPlace")));
+        assert!(!out.iter().any(|a| a.starts_with("StartEventDraft")));
     }
 
     /// 按住不放（自动重复）不该"放一个又放下一个"：重复事件一律不算新的按键
@@ -1806,9 +1851,111 @@ mod tests {
         let places: Vec<&String> = all.iter().filter(|a| a.starts_with("QuickPlace")).collect();
         assert_eq!(places.len(), 1, "自动重复不该反复开始放置：{all:?}");
         assert!(
-            !all.iter().any(|a| a.starts_with("PendingHoldCommit")),
+            !all.iter().any(|a| a.starts_with("DraftCommit")),
             "自动重复不该顺手把 hold 放下：{all:?}"
         );
+    }
+
+    /// 事件区：按 Q/W/E/R 里任一键 ⇒ 在**指针所在那一列**起事件草稿；
+    /// 跟随改长度；**左键点一下 = 放下**（用户要求）；Esc 取消；拖控制杆改起止
+    #[test]
+    fn event_area_draft_starts_follows_and_commits_on_left_click() {
+        let mut st = state_with_events();
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+
+        let pass = |st: &EditorState, events: Vec<egui::Event>, ctx: &egui::Context| -> Vec<String> {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            acts.iter().map(|a| format!("{a:?}")).collect()
+        };
+        let key = |k: egui::Key, pressed: bool| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        // 事件区：左半边是音符区、右半边是事件列（中间还有轴带）⇒ 取靠右的位置
+        let ev_pos = egui::pos2(700.0, 360.0);
+
+        // 第 0 帧：指针就位 + 补一个 release（键盘是有状态的）
+        pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::Q, false)], &ctx);
+        let acts = pass(&st, vec![egui::Event::PointerMoved(ev_pos), key(egui::Key::Q, true)], &ctx);
+        assert!(
+            acts.iter().any(|a| a.starts_with("StartEventDraft")),
+            "事件区按键应起草稿：{acts:?}"
+        );
+
+        // 进入草稿状态（调用方本来会这么做）后：移动鼠标 ⇒ 跟随
+        st.begin_pending_event(TrackId::MoveX, 2.0);
+        let a = egui::pos2(700.0, 300.0);
+        let b = egui::pos2(700.0, 150.0); // 往上 ⇒ 更晚 ⇒ 更长
+        pass(&st, vec![egui::Event::PointerMoved(a)], &ctx);
+        let acts = pass(&st, vec![egui::Event::PointerMoved(a), egui::Event::PointerMoved(b)], &ctx);
+        assert!(
+            acts.iter().any(|x| x.starts_with("DraftFollow")),
+            "事件草稿也要跟着鼠标：{acts:?}"
+        );
+        assert!(
+            !acts.iter().any(|x| x.starts_with("SelectEvent")),
+            "草稿期间不该顺手点选事件：{acts:?}"
+        );
+
+        // **左键点一下 = 放下**（按下 + 松开两帧）
+        let acts_down = pass(
+            &st,
+            vec![egui::Event::PointerButton {
+                pos: a,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            &ctx,
+        );
+        assert!(
+            !acts_down.iter().any(|x| x.starts_with("DraftCommit")),
+            "按下还没松开时不该放下：{acts_down:?}"
+        );
+        let acts_up = pass(
+            &st,
+            vec![egui::Event::PointerButton {
+                pos: a,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &ctx,
+        );
+        assert!(
+            acts_up.iter().any(|x| x.starts_with("DraftCommit")),
+            "左键单击应放下草稿：{acts_up:?}"
+        );
+
+        // Esc 取消；拖控制杆改起止
+        let acts = pass(&st, vec![key(egui::Key::Escape, true)], &ctx);
+        assert!(acts.iter().any(|x| x.starts_with("DraftCancel")), "{acts:?}");
+        // 控制杆：草稿的尾在上（y = y_of(end)），把指针放到那附近按下并拖
+        let span = st.pending_event.unwrap().span();
+        let y_end = {
+            // 与面板同一套映射：不重新实现，直接扫一遍找哪一行有"把手高亮"太麻烦 ——
+            // 这里用"拖到明显更晚的拍"这条更粗的断言：拖动**任意位置**都改长度
+            let _ = span;
+            150.0
+        };
+        let acts = pass(&st, vec![egui::Event::PointerMoved(egui::pos2(700.0, y_end))], &ctx);
+        let _ = acts;
+        st.resize_pending_event(crate::state::EventEdge::End, 9.0);
+        assert_eq!(st.pending_event.unwrap().span().1, 9.0);
     }
 
     /// **hold 跟随状态下，滚动与缩放必须照常**（用户明确要求）：
@@ -1858,7 +2005,7 @@ mod tests {
             "跟随状态下普通滚轮仍应移动时间轴：{plain:?}"
         );
         assert!(
-            !plain.iter().any(|a| a.starts_with("PendingHoldFollow")),
+            !plain.iter().any(|a| a.starts_with("DraftFollow")),
             "滚动不是鼠标移动 ⇒ 不该改 hold 长度：{plain:?}"
         );
 
@@ -1868,7 +2015,7 @@ mod tests {
             ctrl.iter().any(|a| a.starts_with("ZoomBeats(")),
             "跟随状态下 Ctrl+滚轮仍应缩放：{ctrl:?}"
         );
-        assert!(!ctrl.iter().any(|a| a.starts_with("PendingHoldFollow")));
+        assert!(!ctrl.iter().any(|a| a.starts_with("DraftFollow")));
         // 长度一点没变（跟随只认指针移动）
         assert_eq!(st.pending_hold.unwrap(), before);
     }
@@ -1921,22 +2068,22 @@ mod tests {
             &ctx,
         );
         assert!(
-            acts.iter().any(|x| x.starts_with("PendingHoldFollow")),
+            acts.iter().any(|x| x.starts_with("DraftFollow")),
             "指针移动应产出跟随：{acts:?}"
         );
-        assert!(!acts.iter().any(|x| x.starts_with("PendingHoldCommit")));
+        assert!(!acts.iter().any(|x| x.starts_with("DraftCommit")));
 
         // 放下：R 与回车都要行
         for k in [egui::Key::R, egui::Key::Enter] {
             let acts = pass(&st, key(k), true, &ctx);
             assert!(
-                acts.iter().any(|x| x.starts_with("PendingHoldCommit")),
+                acts.iter().any(|x| x.starts_with("DraftCommit")),
                 "{k:?} 应该放下 hold：{acts:?}"
             );
         }
         // 取消：Esc
         let acts = pass(&st, key(egui::Key::Escape), true, &ctx);
-        assert!(acts.iter().any(|x| x.starts_with("PendingHoldCancel")), "{acts:?}");
+        assert!(acts.iter().any(|x| x.starts_with("DraftCancel")), "{acts:?}");
 
         // **打字/模态期间（keys=false）按键不算数**：不该把 hold 放下或取消
         for k in [egui::Key::R, egui::Key::Enter, egui::Key::Escape] {

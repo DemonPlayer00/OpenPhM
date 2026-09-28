@@ -2312,3 +2312,27 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
   `artifacts/pending-hold-handles.png`（放大）——草稿从 0.0 拍到 4.0 拍，**头（下方，带短竖）与尾（上方）
   两个控制杆都在**，位置与左侧拍标注对齐。
 - 恢复后顺手复核了第 4~5 轮那三块（状态栏 / 属性编辑器 / 冲突浏览器）在真实窗口里正常。
+
+## 7.42 草稿也能造事件 + 左键确认（Linux 侧，2026-09-27 续）
+
+用户："**hold的确认放置方式添加鼠标左键；在事件区按可以跟hold一样创建事件。**"
+
+### 一个"草稿"概念，两处落点
+
+`hold` 与**事件块**的放置只有落点不同（音符区 / 事件列），流程完全一样：起点定在指针处 ⇒
+长度随鼠标 ⇒ 控制杆可拖 ⇒ `Esc` 取消 ⇒ **`R` / 回车 / 左键**放下。于是：
+
+| 层 | 变化 |
+|---|---|
+| `state` | 新增 `PendingEvent { track, layer, start, end }`；跟随/拖控制杆/取值三条规则抽成**自由函数**（`follow_span` / `resize_span` / `span_of`），`PendingHold` 与 `PendingEvent` 共用一份 —— 两份实现迟早会分叉（一份允许反向、一份不允许，用户就会觉得"手感时好时坏"）。`begin_*` 互相清除：**同时只放一个东西** |
+| `edit` | `place_event_command`（新事件是**平段**，不带跳变）+ `new_event_value`（**优先取该轨道此刻的值**，空轨道才用中性值：移动/旋转 0、透明度 1、流速 10 —— 依据 `state::TrackId` 里写的量纲） |
+| `overlay` | 动作从"hold 专用"改名成**草稿通用**（`DraftFollow/Resize/Commit/Cancel`）；新增 `StartEventDraft{track, beat}`；事件区按键取**指针所在那一列**的轨道；**左键单击 = 放下**（`clicked_by(Primary)` 且未拖动 —— 拖控制杆仍改起止、拖别处仍跟随）；草稿期间左键不再点选 |
+| `main.rs` | 施加：哪个草稿在跟随就改哪个；放下时按类型发 `add_note`(hold) 或 `add_event` |
+
+### 实测
+
+- `cargo test` **173 条全绿、0 警告**（本轮 +3：事件草稿规则与互斥、事件区起草稿/跟随/左键放下、
+  事件放置命令与初值）。
+- 截图（合成器已恢复）：`artifacts/pending-event.png` —— 草稿落在 **moveX 那一列**、2→6 拍，
+  头（下方，带短竖）与尾（上方）两个控制杆齐全；`artifacts/pending-hold.png` 是 hold 版。
+- 顺带把 `OPM_EDIT_AUTO` 扩成两式：`hold:<lane>,<start>,<end>` / `event:<track>,<start>,<end>`。

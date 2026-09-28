@@ -230,23 +230,50 @@ fn main() -> eframe::Result<()> {
         );
     }
     let mut state = EditorState::new(headless::chart_from_doc(core0.doc()));
-    // 自动化钩子（截图/自检用）：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>` 直接把
-    // "正在跟随鼠标的 hold"摆出来 —— 没人能往窗口里注入按键，这是唯一能把它拍下来的办法。
+    // 自动化钩子（截图/自检用）：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>` 或
+    // `OPM_EDIT_AUTO=event:<track>,<start>,<end>` —— 直接把"正在跟随鼠标的草稿"摆出来：
+    // 没人能往窗口里注入按键，这是唯一能把它拍下来的办法。
     // 与 `OPM_LAUNCH_AUTO` 同类：**只在启动时读一次**，不影响交互路径。
     if let Ok(spec) = std::env::var("OPM_EDIT_AUTO") {
-        if let Some(rest) = spec.trim().strip_prefix("hold:") {
-            let nums: Vec<f64> = rest.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-            if nums.len() == 3 {
-                state.pending_hold = Some(state::PendingHold::new(
-                    nums[0] as f32,
-                    nums[1],
-                    (nums[2] - nums[1]).abs().max(1e-3),
-                ));
+        let spec = spec.trim().to_owned();
+        let nums = |rest: &str| -> Vec<f64> {
+            rest.split(',').filter_map(|t| t.trim().parse().ok()).collect()
+        };
+        if let Some(rest) = spec.strip_prefix("hold:") {
+            let n = nums(rest);
+            if n.len() == 3 {
+                state.begin_pending_hold(n[0] as f32, n[1]);
                 if let Some(h) = state.pending_hold.as_mut() {
-                    h.end_beat = nums[2];
+                    h.end_beat = n[2];
                 }
-                println!("  待放置 hold       : lane {:.0}，{:.2} → {:.2} 拍（OPM_EDIT_AUTO）", nums[0], nums[1], nums[2]);
+                println!(
+                    "  待放置 hold       : lane {:.0}，{:.2} → {:.2} 拍（OPM_EDIT_AUTO）",
+                    n[0], n[1], n[2]
+                );
             }
+        } else if let Some(rest) = spec.strip_prefix("event:") {
+            let mut it = rest.splitn(2, ',');
+            let track = it.next().unwrap_or("").trim().to_owned();
+            let n = nums(it.next().unwrap_or(""));
+            let id = state::TrackId::ALL.iter().find(|t| t.key() == track).copied();
+            match (id, n.len()) {
+                (Some(id), 2) => {
+                    state.begin_pending_event(id, n[0]);
+                    if let Some(e) = state.pending_event.as_mut() {
+                        e.end_beat = n[1];
+                    }
+                    println!(
+                        "  待放置事件        : {}，{:.2} → {:.2} 拍（OPM_EDIT_AUTO）",
+                        id.key(),
+                        n[0],
+                        n[1]
+                    );
+                }
+                (None, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO：未知轨道 {track:?}（可选 moveX/moveY/rotate/alpha/speed）"),
+                (_, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO=event: 需要 `<track>,<start>,<end>`"),
+            }
+        } else {
+            eprintln!("  ⚠️ OPM_EDIT_AUTO：只认 hold:<lane>,<start>,<end> 或 event:<track>,<start>,<end>");
         }
     }
     state.show_boundary = args.boundary;
@@ -831,12 +858,53 @@ impl App {
                         ));
                     }
                 }
-                OverlayAction::PendingHoldFollow { beat } => self.state.follow_pending_hold(beat),
-                OverlayAction::PendingHoldResize { edge, beat } => {
-                    self.state.resize_pending_hold(edge, beat)
+                // ---- 事件区起草稿：与 hold 同一套跟随流程，只是落在某条轨道上 ----
+                OverlayAction::StartEventDraft { track, beat } => {
+                    self.state.begin_pending_event(track, beat);
+                    self.file_message = Some((
+                        true,
+                        format!(
+                            "正在放置事件（{}）：移动鼠标定长度，R/回车/左键放下，Esc 取消",
+                            track.key()
+                        ),
+                    ));
                 }
-                OverlayAction::PendingHoldCommit => {
-                    if let Some(h) = self.state.take_pending_hold() {
+                // ---- 草稿（hold 或事件块）：跟随 / 拖控制杆 / 放下 / 取消 ----
+                OverlayAction::DraftFollow { beat } => {
+                    if self.state.pending_event.is_some() {
+                        self.state.follow_pending_event(beat);
+                    } else {
+                        self.state.follow_pending_hold(beat);
+                    }
+                }
+                OverlayAction::DraftResize { edge, beat } => {
+                    if self.state.pending_event.is_some() {
+                        self.state.resize_pending_event(edge, beat);
+                    } else {
+                        self.state.resize_pending_hold(edge, beat);
+                    }
+                }
+                OverlayAction::DraftCommit => {
+                    if let Some(e) = self.state.take_pending_event() {
+                        let (start, end) = e.span();
+                        let value =
+                            opm_app::edit::new_event_value(&self.state, e.track, start);
+                        cmds.push(opm_app::edit::place_event_command(
+                            &self.state,
+                            e.track,
+                            e.layer,
+                            start,
+                            end,
+                            value,
+                        ));
+                        self.file_message = Some((
+                            true,
+                            format!(
+                                "放下事件（{}）：{start:.3} → {end:.3} 拍 = {value:.3}",
+                                e.track.key()
+                            ),
+                        ));
+                    } else if let Some(h) = self.state.take_pending_hold() {
                         let (start, end) = h.span();
                         cmds.push(opm_app::edit::place_note_command(
                             &self.state,
@@ -849,9 +917,9 @@ impl App {
                             Some((true, format!("放下 hold：{start:.3} → {end:.3} 拍")));
                     }
                 }
-                OverlayAction::PendingHoldCancel => {
-                    self.state.cancel_pending_hold();
-                    self.file_message = Some((true, "已取消放置 hold".to_owned()));
+                OverlayAction::DraftCancel => {
+                    self.state.cancel_pending();
+                    self.file_message = Some((true, "已取消放置".to_owned()));
                 }
                 OverlayAction::Notice(t) => {
                     self.file_message = Some((false, t));

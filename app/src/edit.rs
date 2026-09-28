@@ -14,6 +14,7 @@
 use serde_json::{json, Value};
 
 use crate::doc::NoteKind;
+use crate::perf;
 use crate::state::{EditorState, TrackId};
 
 /// 拖动中的音符 → `set_note`。
@@ -112,6 +113,51 @@ pub fn split_event_command(line: usize, track: &str, index: usize, at_beat: f64)
         "op": "split_event", "line": line, "layer": 0, "track": track,
         "index": index, "atBeat": milli_beat(at_beat),
     })
+}
+
+/// 新建一个事件块 → `add_event`（事件区按键放置走这里）。
+///
+/// 值取**平段**（`startValue == endValue`）：新事件不该带来跳变；要渐变就放好之后在属性编辑器里改。
+pub fn place_event_command(
+    st: &EditorState,
+    track: TrackId,
+    layer: usize,
+    start: f64,
+    end: f64,
+    value: f64,
+) -> Value {
+    json!({
+        "op": "add_event",
+        "line": st.selected_doc_line(),
+        "layer": layer,
+        "track": track.key(),
+        "startBeat": st.beat_json(start),
+        "endBeat": st.beat_json(end.max(start + 1e-3)),
+        "startValue": value,
+        "endValue": value,
+        "easing": "linear",
+    })
+}
+
+/// 该轨道"什么都不发生"的值：移动/旋转 0、透明度 1（全不透明）、流速 10（倍速基准）。
+///
+/// 依据是 `state::TrackId` 里写的量纲（`Alpha` 0–1、`Speed` ×10 = 基准）——
+/// **只在轨道上一条事件都没有时**才用得到；有事件时取"此刻的值"（见 [`new_event_value`]）。
+pub fn track_neutral_value(track: TrackId) -> f64 {
+    match track {
+        TrackId::Alpha => 1.0,
+        TrackId::Speed => 10.0,
+        TrackId::MoveX | TrackId::MoveY | TrackId::Rotate => 0.0,
+    }
+}
+
+/// 新事件块的初值：**优先取该轨道此刻的值**（放一条平段事件 ⇒ 画面不变），
+/// 轨道为空时才用 [`track_neutral_value`]。
+pub fn new_event_value(st: &EditorState, track: TrackId, beat: f64) -> f64 {
+    st.selected()
+        .map(|l| l.track(track))
+        .and_then(|t| perf::eval_events(&t.events, beat))
+        .unwrap_or_else(|| track_neutral_value(track))
 }
 
 /// 事件：删除
@@ -273,6 +319,45 @@ mod tests {
         let last = l.notes.last().expect("刚放的音符");
         assert_eq!(last.kind, NoteKind::Hold);
         assert_eq!(last.end_beat().to_f64(), 22.0);
+    }
+
+    /// 事件块放置：轨道/拍/平段值都要对；初值优先"此刻的值"，空轨道用中性值
+    #[test]
+    fn place_event_carries_track_span_and_value() {
+        let (mut c, mut st) = sample();
+        st.selected_line = 0;
+        st.selected_track = TrackId::MoveX;
+        // 样例里 moveX 在 0..4 拍从 0 渐变到 100 ⇒ 2 拍处此刻的值是 50
+        let v = new_event_value(&st, TrackId::MoveX, 2.0);
+        assert!((v - 50.0).abs() < 1e-6, "应取此刻的值，实际 {v}");
+
+        let cmd = place_event_command(&st, TrackId::MoveX, 0, 8.0, 12.0, v);
+        assert_eq!(cmd["op"], json!("add_event"));
+        assert_eq!(cmd["track"], json!("moveX"));
+        assert_eq!(cmd["layer"], json!(0));
+        assert_eq!(cmd["startBeat"], json!(st.beat_json(8.0)));
+        assert_eq!(cmd["endBeat"], json!(st.beat_json(12.0)));
+        assert_eq!(cmd["startValue"], json!(v));
+        assert_eq!(cmd["endValue"], json!(v), "新事件是**平段**，不该自带跳变");
+        assert_eq!(cmd["easing"], json!("linear"));
+
+        // 端到端：命令真的放进文档，且这条轨道现在有 2 条事件
+        let r = exec_ok(&mut c, cmd);
+        assert_eq!(r["ok"], json!(true));
+        let l = &c.doc().judge_lines[0];
+        let evs = l.layers[0].track("moveX").unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs.last().unwrap().start.to_f64(), 8.0);
+
+        // 空轨道 ⇒ 中性值（透明度 1、流速 10、移动 0）
+        assert_eq!(new_event_value(&st, TrackId::Alpha, 0.0), 1.0);
+        assert_eq!(new_event_value(&st, TrackId::Speed, 0.0), 10.0);
+        assert_eq!(new_event_value(&st, TrackId::Rotate, 0.0), 0.0);
+        assert_eq!(track_neutral_value(TrackId::MoveY), 0.0);
+        // 空轨道上真的能放出一条事件（不会因为"没有值"而失败）
+        let cmd = place_event_command(&st, TrackId::Alpha, 0, 0.0, 2.0, 1.0);
+        exec_ok(&mut c, cmd);
+        assert_eq!(c.doc().judge_lines[0].layers[0].track("alpha").unwrap().len(), 1);
     }
 
     /// 事务：一段拖拽用 begin/commit 包住 ⇒ 撤销一步（标签是人话，会出现在撤销提示里）

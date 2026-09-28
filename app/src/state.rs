@@ -511,6 +511,32 @@ pub struct PendingHold {
     pub end_beat: f64,
 }
 
+/// **草稿区间**的规则（hold 与事件块草稿共用一份实现）：
+/// 鼠标移动改**终点**（保底一个格点，反向拖不会把草稿拖没）、拖控制杆改一端且不许交叉。
+///
+/// 抽成自由函数而不是各写一遍：这两条规则是"手感"的全部，两份实现迟早会分叉
+/// （一份允许反向、一份不允许，用户就会觉得"有时能拖没有时不能"）。
+fn follow_span(start: &mut f64, end: &mut f64, beat: f64, min_len: f64) {
+    *end = beat.max(*start + min_len.max(1e-6));
+}
+
+fn resize_span(start: &mut f64, end: &mut f64, edge: EventEdge, beat: f64, min_len: f64) {
+    let min = min_len.max(1e-6);
+    match edge {
+        EventEdge::Start => *start = beat.min(*end - min),
+        EventEdge::End => *end = beat.max(*start + min),
+    }
+}
+
+/// 提交时的 `(起点, 终点)`（哪一头在前面都给出正序）
+fn span_of(start: f64, end: f64) -> (f64, f64) {
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
 impl PendingHold {
     /// 默认长度：一个格点（按下 R 的那一帧就至少这么长，免得"刚按下就零长"）
     pub fn new(lane_x: f32, start_beat: f64, min_len: f64) -> Self {
@@ -524,28 +550,64 @@ impl PendingHold {
 
     /// 鼠标移动：改**终点**。反向拖不会把长条拖没（保底 `start + min_len`）。
     pub fn follow(&mut self, beat: f64, min_len: f64) {
-        self.end_beat = beat.max(self.start_beat + min_len.max(1e-6));
+        follow_span(&mut self.start_beat, &mut self.end_beat, beat, min_len);
     }
 
     /// 拖控制杆：改起点或终点（另一个端点不动，且不许交叉）
     pub fn resize(&mut self, edge: EventEdge, beat: f64, min_len: f64) {
-        let min = min_len.max(1e-6);
-        match edge {
-            EventEdge::Start => self.start_beat = beat.min(self.end_beat - min),
-            EventEdge::End => self.end_beat = beat.max(self.start_beat + min),
-        }
+        resize_span(&mut self.start_beat, &mut self.end_beat, edge, beat, min_len);
     }
 
-    /// 提交时的 `(起点, 终点)`（哪一头在前面都给出正序）
+    /// 提交时的 `(起点, 终点)`
     pub fn span(&self) -> (f64, f64) {
-        if self.start_beat <= self.end_beat {
-            (self.start_beat, self.end_beat)
-        } else {
-            (self.end_beat, self.start_beat)
-        }
+        span_of(self.start_beat, self.end_beat)
     }
 
     /// 长度（拍）
+    pub fn len(&self) -> f64 {
+        (self.end_beat - self.start_beat).abs()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() <= 1e-9
+    }
+}
+
+/// 正在跟随鼠标的**事件块草稿**（在事件区按键之后、放下之前）。
+///
+/// 与 [`PendingHold`] 同一套流程（起点定在指针处、长度随鼠标、Esc 取消、R/回车/左键放下），
+/// 区别只是它落在**某条轨道**上 —— 轨道决定"改的是移动还是透明度"。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PendingEvent {
+    pub track: TrackId,
+    pub layer: usize,
+    pub start_beat: f64,
+    pub end_beat: f64,
+}
+
+impl PendingEvent {
+    pub fn new(track: TrackId, layer: usize, start_beat: f64, min_len: f64) -> Self {
+        let min = min_len.max(1e-6);
+        Self {
+            track,
+            layer,
+            start_beat,
+            end_beat: start_beat + min,
+        }
+    }
+
+    pub fn follow(&mut self, beat: f64, min_len: f64) {
+        follow_span(&mut self.start_beat, &mut self.end_beat, beat, min_len);
+    }
+
+    pub fn resize(&mut self, edge: EventEdge, beat: f64, min_len: f64) {
+        resize_span(&mut self.start_beat, &mut self.end_beat, edge, beat, min_len);
+    }
+
+    pub fn span(&self) -> (f64, f64) {
+        span_of(self.start_beat, self.end_beat)
+    }
+
     pub fn len(&self) -> f64 {
         (self.end_beat - self.start_beat).abs()
     }
@@ -572,6 +634,8 @@ pub struct EditorState {
     /// 按 R 之后正在跟随鼠标的 hold（`None` = 没有待放置的长条）。
     /// **视图状态**：Esc 取消、鼠标改长度都在这一层，不进文档。
     pub pending_hold: Option<PendingHold>,
+    /// 在事件区按键之后正在跟随鼠标的事件块草稿（与 hold **互斥**：同时只放一个东西）
+    pub pending_event: Option<PendingEvent>,
     /// 演奏区垂直可视范围（秒）：以播放头为基准往后看 `lookahead` 秒
     pub lookahead: f64,
     /// 是否绘制**窗口边界框**（RPE 的 ±675 × ±450，即 1350×900）
@@ -608,6 +672,7 @@ impl EditorState {
             selected_event: None,
             selected_note: None,
             pending_hold: None,
+            pending_event: None,
             lookahead: 2.0,
             show_boundary: true,
             line_half_w: RPE_LINE_HALF_W,
@@ -630,9 +695,49 @@ impl EditorState {
         1.0 / self.effective_beat_div().max(1) as f64
     }
 
-    /// 开始放置一个 hold（按下 R）：起点取指针处，终点先给一个格点
+    /// 开始放置一个 hold（按下 R）：起点取指针处，终点先给一个格点。
+    /// **同时只允许一个草稿** —— 起 hold 就把事件草稿清掉。
     pub fn begin_pending_hold(&mut self, lane_x: f32, start_beat: f64) {
+        self.pending_event = None;
         self.pending_hold = Some(PendingHold::new(lane_x, start_beat, self.beat_step()));
+    }
+
+    /// 开始放置一个事件块（事件区按键）：落在 `track` 上，起点取指针处
+    pub fn begin_pending_event(&mut self, track: TrackId, start_beat: f64) {
+        self.pending_hold = None;
+        self.pending_event = Some(PendingEvent::new(track, 0, start_beat, self.beat_step()));
+    }
+
+    /// 鼠标移动 ⇒ 哪个草稿在跟随就改哪个的长度
+    pub fn follow_pending_event(&mut self, beat: f64) {
+        let step = self.beat_step();
+        if let Some(e) = self.pending_event.as_mut() {
+            e.follow(beat, step);
+        }
+    }
+
+    /// 拖时间控制杆（事件草稿）
+    pub fn resize_pending_event(&mut self, edge: EventEdge, beat: f64) {
+        let step = self.beat_step();
+        if let Some(e) = self.pending_event.as_mut() {
+            e.resize(edge, beat, step);
+        }
+    }
+
+    /// 取走事件草稿（提交用）
+    pub fn take_pending_event(&mut self) -> Option<PendingEvent> {
+        self.pending_event.take()
+    }
+
+    /// 现在有没有草稿（hold 或事件块）——面板用它决定"是不是在放置模式"
+    pub fn drafting(&self) -> bool {
+        self.pending_hold.is_some() || self.pending_event.is_some()
+    }
+
+    /// 取消任何草稿（Esc / 左键放下时都会走到这里）
+    pub fn cancel_pending(&mut self) {
+        self.pending_hold = None;
+        self.pending_event = None;
     }
 
     /// 鼠标移动：hold 的长度跟着走（保底一个格点）
@@ -881,6 +986,43 @@ mod tests {
         st.begin_pending_hold(0.0, 2.0);
         st.cancel_pending_hold();
         assert!(st.pending_hold.is_none());
+    }
+
+    /// 事件块草稿：与 hold 同一套规则（跟随改终点、控制杆不许交叉），且**两者互斥**
+    #[test]
+    fn pending_event_rules_and_mutual_exclusion() {
+        let mut st = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        let step = st.beat_step();
+        st.begin_pending_hold(100.0, 1.0);
+        assert!(st.drafting() && st.pending_hold.is_some());
+        // 起事件草稿 ⇒ hold 草稿被清掉（同时只放一个东西）
+        st.begin_pending_event(TrackId::Alpha, 4.0);
+        assert!(st.pending_hold.is_none(), "两个草稿不能同时存在");
+        let e = st.pending_event.unwrap();
+        assert_eq!((e.track, e.layer), (TrackId::Alpha, 0));
+        assert!((e.len() - step).abs() < 1e-9);
+
+        st.follow_pending_event(8.0);
+        assert_eq!(st.pending_event.unwrap().span(), (4.0, 8.0));
+        // 反向拖：保底一个格点
+        st.follow_pending_event(-100.0);
+        let e = st.pending_event.unwrap();
+        assert_eq!(e.start_beat, 4.0);
+        assert!((e.len() - step).abs() < 1e-9, "{e:?}");
+        // 控制杆
+        st.resize_pending_event(EventEdge::End, 12.0);
+        assert_eq!(st.pending_event.unwrap().span(), (4.0, 12.0));
+        st.resize_pending_event(EventEdge::Start, 9.0);
+        assert_eq!(st.pending_event.unwrap().span(), (9.0, 12.0));
+        st.resize_pending_event(EventEdge::Start, 99.0);
+        let e = st.pending_event.unwrap();
+        assert!(e.start_beat < e.end_beat, "{e:?}");
+        // 取走 / 取消
+        assert!(st.take_pending_event().is_some());
+        assert!(!st.drafting());
+        st.begin_pending_event(TrackId::MoveX, 0.0);
+        st.cancel_pending();
+        assert!(!st.drafting());
     }
 
     /// 可见区间：从播放头起、前瞻那么长，**在谱面末尾截断**（曲末不该显示到谱面之外）
