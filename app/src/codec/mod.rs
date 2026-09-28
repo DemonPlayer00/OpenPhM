@@ -64,7 +64,7 @@ pub struct Fidelity {
     /// **同类问题的合并计数**：真实谱面里每条线都有 `extended`/`*Control`，
     /// 逐条报警告会得到 34 行几乎一样的文字（Prismatic 实测），把真正该看的那几条淹掉。
     /// 这里按类别累计，`finalize()` 时合并成一行（带首次出现的指针）。
-    groups: Vec<(String, String, usize)>,
+    groups: Vec<(String, String, usize, String)>,
 }
 
 impl Fidelity {
@@ -85,17 +85,22 @@ impl Fidelity {
     }
     /// 同类警告合并计数（`key` 是类别名，`ptr` 是首次出现的 JSON 指针）
     pub fn warn_grouped(&mut self, key: &str, ptr: &str) {
+        self.warn_grouped_note(key, ptr, "opm v1 未建模，已原样保留");
+    }
+    /// 同上，但**自己写说明**：有些合并警告说的不是"未建模"，而是"已建模、按另一种口径求值"
+    /// （例：流速事件的缓动按 linear 求值，缓动名原样保留）。
+    pub fn warn_grouped_note(&mut self, key: &str, ptr: &str, note: &str) {
         match self.groups.iter_mut().find(|g| g.0 == key) {
             Some(g) => g.2 += 1,
-            None => self.groups.push((key.to_owned(), ptr.to_owned(), 1)),
+            None => self.groups.push((key.to_owned(), ptr.to_owned(), 1, note.to_owned())),
         }
     }
     /// 把合并计数落成警告行（导入/导出结束时各调一次）
     pub fn finalize(&mut self) {
         let groups = std::mem::take(&mut self.groups);
-        for (key, ptr, n) in groups {
+        for (key, ptr, n, note) in groups {
             self.warnings
-                .push(format!("{key}：共 {n} 处（首次于 {ptr}）—— opm v1 未建模，已原样保留"));
+                .push(format!("{key}：共 {n} 处（首次于 {ptr}）—— {note}"));
         }
     }
     pub fn is_lossless(&self) -> bool {

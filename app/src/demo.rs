@@ -104,7 +104,8 @@ fn plan_for_line(li: usize) -> [(&'static str, f64, f64, &'static str); 5] {
             ("moveY", -250.0, -250.0, "linear"),
             ("rotate", 0.0, 0.0, "linear"),
             ("alpha", 1.0, 0.25, "inOutQuad"),
-            ("speed", 6.0, 14.0, "inOutCubic"),
+            // 流速轨只按线性求值（`perf::speed_value`）⇒ 演示谱面也只用线性
+            ("speed", 6.0, 14.0, "linear"),
         ],
         _ => [
             ("moveX", -300.0, 300.0, "outBack"),

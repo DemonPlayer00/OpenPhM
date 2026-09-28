@@ -180,7 +180,7 @@ fn track_sampling_spans_event_boundaries() {
         Event::new(Beat::zero(), Beat::new(2, 1), json!(0.0), json!(10.0), "linear"),
         Event::new(Beat::new(2, 1), Beat::new(4, 1), json!(10.0), json!(0.0), "outBounce"),
     ];
-    let pts = sample_track(&ev, &tm, 4);
+    let pts = sample_track(&ev, &tm, 4, false);
     // 2 个事件 ×(4+1) 点
     assert_eq!(pts.len(), 10);
     // 时间单调不减，端点值正确
@@ -193,4 +193,26 @@ fn track_sampling_spans_event_boundaries() {
     // 手算 outBounce(0.5)=0.7655 ⇒ 10-10·0.7655≈2.34。采样必须反映非线性（若用线性插值会得 5.0）
     let mid = pts[7][1];
     assert!((mid - 2.343_75).abs() < 1e-3, "outBounce 中点应为 2.34，实际 {mid}");
+}
+
+/// **流速轨的曲线只按线性采**（`linear_only = true`）：它与求值同一条口径。
+///
+/// 这条是"时间轴画的形状"与"音符位置"必须一致的问题 —— 流速事件只按线性求值
+/// （见 `perf::speed_value`），曲线要是还按 `easing` 画，面板就会互相打脸。
+#[test]
+fn the_speed_curve_is_sampled_linearly() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry { start: Beat::zero(), bpm: 180.0, foreign: Default::default() }];
+    let tm = TimeMap::from_doc(&doc);
+    // 同一条事件：缓动写 outBounce，采样分别按"认缓动"和"只线性"
+    let ev = vec![Event::new(Beat::zero(), Beat::new(4, 1), json!(10.0), json!(0.0), "outBounce")];
+    let eased = sample_track(&ev, &tm, 4, false);
+    let linear = sample_track(&ev, &tm, 4, true);
+    assert_eq!(eased.len(), linear.len());
+    // 端点相同，中点不同：缓动版在中点已掉到 2.34，线性版是 5.0
+    assert!((eased[0][1] - linear[0][1]).abs() < 1e-6);
+    assert!((eased[4][1] - linear[4][1]).abs() < 1e-6, "两端必须一致");
+    let (mid_eased, mid_linear) = (eased[2][1], linear[2][1]);
+    assert!((mid_linear - 5.0).abs() < 1e-3, "只线性时中点应是 5.0，实际 {mid_linear}");
+    assert!(mid_eased < 3.0, "认缓动时中点应明显低于 5.0，实际 {mid_eased}");
 }

@@ -152,10 +152,26 @@ pub fn inspector_ui(
                 changed |= value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed;
                 changed |= value_field(ui, &mut sv, "值起 ", 0.5, None).changed;
                 changed |= value_field(ui, &mut ev, "值止 ", 0.5, None).changed;
-                // 缓动：**曲线 + in/out/io 两段**（用户要求）—— 29 个名字本来就是
-                // "曲线 × 变体"的笛卡尔积加一个线性，拆开选比在一长串里翻快得多。
-                // 拆分/拼回都在 `cmd`（有往返测试逐个钉住），这里只管画。
-                if let Some((curve, variant)) = cmd::split_easing(&easing) {
+                // ---- 流速轨：**不给缓动选择**（只按线性求值，见 `perf::speed_value`）----
+                //
+                // 给了也只会骗人：求值那边根本不看 `easing`。导入的 RPE 谱里若带着非线性缓动，
+                // 文档**原样保留**（不偷偷改写别人的文件），这里如实标出来。
+                if v.track == opm_app::state::TrackId::Speed {
+                    ui.horizontal(|ui| {
+                        ui.label("缓动");
+                        if easing == "linear" {
+                            ui.monospace("线性（流速只用线性求值）");
+                        } else {
+                            ui.colored_label(
+                                opm_app::dialog::WARN,
+                                format!("{easing} → 按线性求值"),
+                            )
+                            .on_hover_text(
+                                "流速事件只按线性求值（音符位置是它的积分，缓动会被积掉大半，\n                                 而线性有闭式积分、整条链路更简单）。\n                                 文件里这个缓动名**原样保留**，导出时照旧写回去。",
+                            );
+                        }
+                    });
+                } else if let Some((curve, variant)) = cmd::split_easing(&easing) {
                     let mut new_curve = curve;
                     egui::ComboBox::from_id_salt("ev_easing_curve")
                         .selected_text(curve.label())

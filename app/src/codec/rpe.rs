@@ -504,6 +504,15 @@ fn import_event(
             "judgeLineList[{li}].eventLayers[{gi}].speedEvents[{ei}] 标了贝塞尔 —— RPE 的流速事件不支持贝塞尔，已按普通缓动处理"
         ));
     }
+    // 流速轨只按线性求值（`perf::speed_value`）：缓动名**原样保留**（不偷偷改别人的文件），
+    // 但预览/求值走线性 —— 这件事必须写进保真度报告，否则"导入后位置和游戏不一样"会查无实据。
+    if track == "speed" && easing != "linear" {
+        fid.warn_grouped_note(
+            "流速事件的缓动",
+            &format!("/judgeLineList[{li}].eventLayers[{gi}].speedEvents[{ei}]"),
+            "opm 的流速事件只按 linear 求值（音符位置是它的积分，线性有闭式解）；缓动名原样保留、导出时照旧写回，但预览与音符位置按线性算",
+        );
+    }
     // 其它字段（easingLeft/easingRight/linkgroup/自定义）原样保留
     let known = [
         "startTime", "endTime", "start", "end", "easingType", "bezier", "bezierPoints",

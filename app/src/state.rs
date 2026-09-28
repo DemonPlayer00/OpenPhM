@@ -484,7 +484,8 @@ impl Line {
         if let Some(v) = crate::perf::eval_events(ev[3], beat) {
             p.alpha = (v as f32).clamp(0.0, 1.0);
         }
-        if let Some(v) = crate::perf::eval_events(ev[4], beat) {
+        // 流速轨只按线性（`track_value` 是"哪条轨道用哪种求值"的唯一判断处）
+        if let Some(v) = crate::perf::track_value("speed", ev[4], beat) {
             p.speed = v as f32;
         }
         p
@@ -558,8 +559,8 @@ impl Line {
     ///    没跟着变宽，本该看得见的音符整颗没有实例（与那个真 bug 同源）。
     pub fn set_tracks(&mut self, tracks: [TrackView; 5], tmap: &TimeMap) {
         let changed = first_speed_change(&self.tracks[4].events, &tracks[4].events);
-        self.min_speed_abs = crate::perf::min_speed_magnitude(&tracks[4].events, 16)
-            .unwrap_or(crate::perf::SPEED_DEFAULT);
+        self.min_speed_abs =
+            crate::perf::min_speed_magnitude(&tracks[4].events).unwrap_or(crate::perf::SPEED_DEFAULT);
         self.tracks = tracks;
         match changed {
             // 前缀积分：`beat` 之前的时刻只由它之前的事件决定 ⇒ 本线只有**它之后**的音符要重算
@@ -680,8 +681,8 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
         .fold(0.0_f64, f64::max);
     // 流速轨道上的最小量级（采样）；没有事件 ⇒ RPE 的默认 10
     let speed_events = crate::perf::track_events(src, "speed");
-    let min_speed_abs = crate::perf::min_speed_magnitude(&speed_events, 16)
-        .unwrap_or(crate::perf::SPEED_DEFAULT);
+    let min_speed_abs =
+        crate::perf::min_speed_magnitude(&speed_events).unwrap_or(crate::perf::SPEED_DEFAULT);
     Some(Line {
         index,
         name: src.name.clone(),
@@ -736,7 +737,8 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
             continue;
         }
         let (origins, events): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
-        let curve = sample_track(&events, tmap, 4);
+        // 流速轨只按线性求值 ⇒ 曲线也用线性采（否则面板显示的缓动与音符位置对不上）
+        let curve = sample_track(&events, tmap, 4, *id == TrackId::Speed);
         let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
         for p in &curve {
             min = min.min(p[1]);

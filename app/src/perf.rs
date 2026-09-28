@@ -93,6 +93,18 @@ impl TimeMap {
     pub fn seg_count(&self) -> usize {
         self.segs.len()
     }
+
+    /// 严格大于 `beat` 的**下一个 BPM 段起点**（没有 ⇒ `None`）。
+    ///
+    /// 流速积分要在这些点上**切开**：闭式积分 `(v₀+v₁)/2 × Δt` 只对"流速在**秒域**上线性"
+    /// 成立，而 BPM 变化处拍↔秒折了一下（流速在 *拍* 域是线性的，在秒域是折线）——
+    /// 在那个点上取端点平均就不准了。
+    pub fn next_seg_start(&self, beat: f64) -> Option<f64> {
+        self.segs
+            .iter()
+            .map(|s| s.0)
+            .find(|b| *b > beat + 1e-12)
+    }
 }
 
 // ---------------------------------------------------------------- 缓动
@@ -282,6 +294,42 @@ pub fn event_value(e: &Event, beat: f64) -> f64 {
     }
 }
 
+/// **流速事件的值：只按线性取**（`easing` 字段被忽略 —— 见模块头"只实现 linear"）。
+///
+/// 为什么可以这么简化：流速事件在两个端点之间按**线性**变化时，`∫v dτ` 有闭式
+/// `(v₀+v₁)/2 × Δt`（精确、无抽样），整条链路（检查点表、异步重算、现算兜底）都因此变简单；
+/// 而"缓动过的流速"在编辑器里既难看出差别（音符位置是它的**积分**，缓动会被积掉大半），
+/// 又让每次求值都要抽 8 个点。
+///
+/// 导入的谱面里若真有非线性缓动的流速事件，**文档原样保留**（`easing` 不改写），
+/// 只是预览/求值按线性算 —— 导入报告里会写明，检查器里也标出来。
+pub fn speed_value(e: &Event, beat: f64) -> f64 {
+    let (a, b) = (e.start.to_f64(), e.end.to_f64());
+    let span = (b - a).max(1e-9);
+    let t = ((beat - a) / span).clamp(0.0, 1.0);
+    let (v0, v1) = (as_f64(&e.start_value), as_f64(&e.end_value));
+    match (v0, v1) {
+        (Some(v0), Some(v1)) => v0 + (v1 - v0) * t,
+        (Some(v0), None) => v0,
+        (None, Some(v1)) => v1,
+        (None, None) => 0.0,
+    }
+}
+
+/// 一条轨道在拍 `beat` 处的值 —— **"哪条轨道用哪种求值"的唯一判断处**。
+///
+/// 流速轨（`"speed"`）走 [`speed_value`]（只线性），其余四条走 [`eval_events`]（事件自己的缓动）。
+/// 单独一个入口是为了不漏：树面板/检查器/时间轴/`lines` 各显示一个"此刻的值"，
+/// 谁要是直接调 `eval_events`，同一时刻就会显示两个不同的流速。
+pub fn track_value(track: &str, events: &[Event], beat: f64) -> Option<f64> {
+    if track == "speed" {
+        let e = events.iter().find(|e| beat >= e.start.to_f64() && beat <= e.end.to_f64())?;
+        Some(speed_value(e, beat))
+    } else {
+        eval_events(events, beat)
+    }
+}
+
 /// 空隙里"保持"的值：上一条已结束事件的终值（首条之前没有 ⇒ `None`）
 fn held_value(events: &[Event], beat: f64) -> Option<f64> {
     let mut held: Option<f64> = None;
@@ -319,9 +367,9 @@ pub const SPEED_DEFAULT: f64 = 10.0;
 ///
 /// 这是**直接查询**那一份（从 `from_sec` 起现积）：用途是"任意两时刻之间走了多远"，
 /// 以及**测试里的独立基准**（编辑器自己走的是 [`SpeedTable`] 的检查点查表，两者互为对账）。
-/// 实现：**事件边界**当必须的抽点，段内再等分抽 [`SPEED_SAMPLES_PER_SEGMENT`] 点走梯形法。
-/// 线性段因此是精确的（梯形法对线性就是精确积分），非线性缓动是高精度近似
-/// （prpr 对带缓动的事件同样是数值积分）。
+/// 实现：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt`（流速事件只按线性，见 [`speed_value`]）——
+/// 精确、无抽样。切点有两类：**事件边界**（段的划分）与 **BPM 段起点**
+/// （拍↔秒在那里折了一下，端点平均就不准了）。
 pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64) -> f64 {
     if !(to_sec > from_sec) {
         return 0.0;
@@ -338,35 +386,29 @@ pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64
     acc * SPEED_UNITS_PER_SEC
 }
 
-/// 流速轨道上 `|v|` 的**下界**（逐事件采样）—— 用来估算"音符穿过窗口要多久"。
+/// 流速轨道上 `|v|` 的**下界** —— 用来估算"音符穿过窗口要多久"（只在"还没重算"的兜底里用到）。
 ///
-/// **逐事件采样**（缓动可能在中途掉到很低，端点看不出来），不是解析求极值：
-/// 这个数只用来决定"往后看多久"，估小一点只是多算几个实例，估大了会**漏画本该看得见的音符**。
+/// **解析求，不抽样**：流速事件是线性的，所以 `|v|` 在一段上的最小值只可能在**端点**；
+/// 端点异号则中间必然穿过 0 ⇒ 下界就是 **0**（"穿过窗口要多久"发散，调用方夹到上限）。
 ///
-/// **速率为 0 的穿越点必须算进去**（所以这里不设"最小量级"门槛）：流速过零时音符会在判定线
-/// 附近**长时间逗留**（偏移 ≈ 0，一直在窗口里），此时"穿过窗口要多久"是发散的 ——
-/// 调用方会把它夹到上限。踩过的坑：早先按 |v| ≥ 0.05 过滤，于是斜坡过零的那种谱面
-/// 下界取成了 1.25 ⇒ 窗口只有 3.4 秒 ⇒ 3.45 秒外那颗**就贴在判定线上**的音符整颗没有实例。
+/// **过零必须算进去**：流速过零时音符会在判定线附近**长时间逗留**（偏移 ≈ 0，一直在窗口里）——
+/// 踩过的坑：早先按 `|v| ≥ 0.05` 过滤，于是斜坡过零的那种谱面下界取成 1.25 ⇒ 窗口只有 3.4 秒
+/// ⇒ 3.45 秒外那颗**就贴在判定线上**的音符整颗没有实例。
 /// 返回 `None` = 没有流速事件（调用方按 `SPEED_DEFAULT` 处理）。
-pub fn min_speed_magnitude(events: &[Event], samples_per_event: usize) -> Option<f64> {
+pub fn min_speed_magnitude(events: &[Event]) -> Option<f64> {
     if events.is_empty() {
         return None;
     }
-    let n = samples_per_event.max(1);
     let mut best = f64::INFINITY;
     for e in events {
-        let (a, b) = (e.start.to_f64(), e.end.to_f64());
-        for k in 0..=n {
-            let beat = a + (b - a) * k as f64 / n as f64;
-            best = best.min(event_value(e, beat).abs());
-        }
+        let a = e.start.to_f64();
+        let b = e.end.to_f64();
+        let (v0, v1) = (speed_value(e, a), speed_value(e, b));
+        let m = if v0 * v1 < 0.0 { 0.0 } else { v0.abs().min(v1.abs()) };
+        best = best.min(m);
     }
     best.is_finite().then_some(best)
 }
-
-/// 每一段里抽几个点走梯形法。
-/// 每一段里抽几个点走梯形法。线性段与常值段不需要抽（见 [`integrate_until`]）。
-pub const SPEED_SAMPLES_PER_SEGMENT: usize = 8;
 
 /// 一段流速的求值方式：走在某条事件的缓动上（**记下标**：检查点表要把"哪一段"存下来，
 /// 跨帧、跨查询用），或"保持"某个定值（空隙里 / 首尾之外）。
@@ -380,7 +422,7 @@ impl SpeedSeg {
     fn at(self, events: &[Event], beat: f64) -> f64 {
         match self {
             SpeedSeg::Hold(v) => v,
-            SpeedSeg::Eased(i) => events.get(i).map(|e| event_value(e, beat)).unwrap_or(0.0),
+            SpeedSeg::Eased(i) => events.get(i).map(|e| speed_value(e, beat)).unwrap_or(0.0),
         }
     }
 }
@@ -408,9 +450,8 @@ fn seg_at(events: &[Event], idx: usize, at_beat: f64) -> SpeedSeg {
 /// 两处乘 120）。每走到一段就回调一次 `on_seg(段起点拍, 段起点处的 acc, 这一段怎么求值)` ——
 /// [`SpeedTable`] 靠它记检查点，其余调用方传一个空闭包。
 ///
-/// 抽点方式：**事件边界**当必须的抽点，段内再等分抽 [`SPEED_SAMPLES_PER_SEGMENT`] 点走梯形法。
-/// 线性段因此是精确的（梯形法对线性就是精确积分），非线性缓动是高精度近似
-/// （prpr 对带缓动的事件同样是数值积分）。
+/// 切点：**事件边界**（段的划分）与 **BPM 段起点**（闭式积分只对"秒域线性"成立）。
+/// 段内积分见 [`integrate_seg`] —— 流速只按线性 ⇒ 那个式子是精确值，没有采样误差。
 fn walk_speed(
     events: &[Event],
     tmap: &TimeMap,
@@ -436,21 +477,34 @@ fn walk_speed(
             (Some(e), _) => (e.start.to_f64(), false),
             (None, _) => (b_to, false),
         };
+        // 这一段到哪里为止：段尾 / `b_to` / **下一个 BPM 段的起点**，取最近的那个。
+        // BPM 变化处必须切开（闭式积分只对"秒域线性"成立，见 `TimeMap::next_seg_start`）。
         // `max(at_beat)`：病态输入（后一条事件整条包在前一条里）下 `seg_end` 会落在身后，
         // 夹一下保证这一步**永远向前**（走法单调 ⇒ 不会原地打转，也不会重复积分）
-        let stop = seg_end.min(b_to).max(at_beat);
+        let bpm_cut = tmap.next_seg_start(at_beat).unwrap_or(f64::INFINITY);
+        let prev = at_beat;
+        let stop = seg_end.min(b_to).min(bpm_cut).max(at_beat);
         acc += integrate_seg(tmap, events, &seg, at_beat, stop);
         at_beat = stop;
+        if stop >= b_to - 1e-12 {
+            break; // 到目标了
+        }
         if stop >= seg_end - 1e-12 {
             if consumed {
-                idx += 1;
-            } else if ev.is_none() {
-                break; // 末尾之后：`held` 会一直保持，没有下一段了
+                idx += 1; // 事件段走完 ⇒ 换下一条
+                continue;
             }
-            // 空隙走完（`stop == ev.start`）：idx 不动 —— 下一轮 `seg_at` 看到 `start <= at_beat`，
-            // 这条事件就成了当前段
-        } else {
-            break; // 到 b_to 了
+            if ev.is_none() {
+                break; // 末尾之后：`held` 一直保持，只有 `b_to` 能叫停
+            }
+            // 空隙走完（`stop == ev.start`）：**idx 不动**，继续下一轮 ——
+            // 那时 `seg_at` 看到 `start <= at_beat`，这条事件就成了当前段
+            // （这里必须 `continue`：`stop` 与 `at_beat` 此刻正好相等，落到下面那道
+            //  "没前进就收手"的守卫上会把走法**停在这里**，于是表里缺了这一段之后的切点）
+            continue;
+        }
+        if stop <= prev {
+            break; // **相对上一轮**没前进（零长段 / 病态输入）⇒ 收手，别打转
         }
     }
     (idx, at_beat, acc)
@@ -468,32 +522,39 @@ fn integrate_until(
     walk_speed(events, tmap, idx, at_beat, acc, b_to, |_, _, _| {})
 }
 
-/// 一段（值函数恒定或走单条事件的缓动）的积分：梯形法。
+/// 在**一段之内**从 `b_from` 积到 `b_to`，遇到 BPM 段起点就切开。
+///
+/// 闭式积分只对"流速在**秒域**上线性"成立，而 BPM 变化处拍↔秒折了一下 ——
+/// 查表路径（[`SpeedTable::h_at_hinted`]）的"段内余下那一小截"也必须按 BPM 切开，
+/// 否则表与"从 0 整条走一遍"就会在 BPM 变化点上分家（实测：差 24 单位）。
+fn integrate_span(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
+    let mut acc = 0.0;
+    let mut from = b_from;
+    while from < b_to {
+        let stop = tmap.next_seg_start(from).map_or(b_to, |c| c.min(b_to));
+        acc += integrate_seg(tmap, events, seg, from, stop);
+        from = stop;
+    }
+    acc
+}
+
+/// 一段的积分：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt`。
+///
+/// 流速事件只按线性（见 [`speed_value`]）⇒ 这个式子是**精确值**，不是近似：
+/// 不需要抽点、没有采样误差。代价是调用方必须保证"这一段里流速在**秒域**上线性" ——
+/// BPM 变化处由 [`walk_speed`] 切开（`TimeMap::next_seg_start`）。
 ///
 /// **返回 `∫v dτ`（流速单位 × 秒），不乘 120** —— 换算成 RPE y 单位只在
 /// [`speed_travel`] 与 [`SpeedTable::h_at_hinted`] 那两处发生，免得两条路径各乘一次或漏乘。
-///
-/// 秒域长度一律用 `tmap` 换算 —— BPM 变过的时间段里 `(b1−b0)/bpm` 是错的。
 fn integrate_seg(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
     if !(b_to > b_from) {
         return 0.0;
     }
-    // 常值段：一次乘法就够（不必抽点）
-    if let SpeedSeg::Hold(v) = seg {
-        return v * (tmap.sec(b_to) - tmap.sec(b_from));
+    let dt = tmap.sec(b_to) - tmap.sec(b_from);
+    match seg {
+        SpeedSeg::Hold(v) => v * dt,
+        SpeedSeg::Eased(_) => 0.5 * (seg.at(events, b_from) + seg.at(events, b_to)) * dt,
     }
-    let n = SPEED_SAMPLES_PER_SEGMENT.max(1);
-    let mut prev_b = b_from;
-    let mut prev_v = seg.at(events, prev_b);
-    let mut acc = 0.0;
-    for k in 1..=n {
-        let b = b_from + (b_to - b_from) * k as f64 / n as f64;
-        let v = seg.at(events, b);
-        acc += 0.5 * (prev_v + v) * (tmap.sec(b) - tmap.sec(prev_b));
-        prev_b = b;
-        prev_v = v;
-    }
-    acc
 }
 
 /// 流速积分的**分段检查点**：每个段起点上的 `H`（`H = 120 ∫ v dτ`，从谱面 0 秒起）。
@@ -556,7 +617,7 @@ impl SpeedTable {
             // 退回直接积分。两条路径的值相同（共用走法与段内积分），只是慢。
             return (speed_travel(events, tmap, 0.0, sec), 0);
         };
-        (h + integrate_seg(tmap, events, &seg, beat, b) * SPEED_UNITS_PER_SEC, i)
+        (h + integrate_span(tmap, events, &seg, beat, b) * SPEED_UNITS_PER_SEC, i)
     }
 
     /// `beat` 落在第几段：`hint` 命中就 O(1)（升序查询的顺序），否则二分
@@ -673,11 +734,17 @@ pub fn perf_at(tracks: &[Vec<Event>; 5], tmap: &TimeMap, sec: f64) -> LinePerf {
     p
 }
 
-/// 把一条轨道采样成折线（供时间轴画曲线）：每个事件按缓动取 `per_event+1` 个点。
+/// 把一条轨道采样成折线（供时间轴画曲线）：每个事件取 `per_event+1` 个点。
 ///
 /// 线性缓动其实只需两端点，但 29 个缓动里有非线性/回弹（elastic/bounce），
 /// 少采样会让曲线形状骗人 —— 显示用 N 点采样，求值仍走 [`eval_events`] 的精确公式。
-pub fn sample_track(events: &[Event], tmap: &TimeMap, per_event: usize) -> Vec<[f32; 2]> {
+/// `linear_only` 给流速轨用（它只按线性求值，见 [`speed_value`]）。
+pub fn sample_track(
+    events: &[Event],
+    tmap: &TimeMap,
+    per_event: usize,
+    linear_only: bool,
+) -> Vec<[f32; 2]> {
     let mut out: Vec<[f32; 2]> = Vec::new();
     let n = per_event.max(1);
     for e in events {
@@ -685,7 +752,13 @@ pub fn sample_track(events: &[Event], tmap: &TimeMap, per_event: usize) -> Vec<[
         for k in 0..=n {
             let t = k as f64 / n as f64;
             let beat = a + (b - a) * t;
-            let v = eval_events(std::slice::from_ref(e), beat).unwrap_or(0.0);
+            // `linear_only` = 流速轨：曲线要与求值**同一条口径**（只用线性），
+            // 否则时间轴画的是缓动、音符位置却是线性积分 —— 两个面板互相打脸
+            let v = if linear_only {
+                speed_value(e, beat)
+            } else {
+                eval_events(std::slice::from_ref(e), beat).unwrap_or(0.0)
+            };
             out.push([tmap.sec(beat) as f32, v as f32]);
         }
     }
@@ -713,7 +786,7 @@ mod speed_tests {
         ev_ease(from_beat, to_beat, from, to, "linear")
     }
 
-    /// 同上，但指定缓动（非线性缓动是段内梯形法唯一会被看出来的地方）
+    /// 同上，但指定缓动名（**流速轨不认它** —— 见 `speed_events_ignore_their_easing`）
     fn ev_ease(from_beat: f64, to_beat: f64, from: f64, to: f64, easing: &str) -> Event {
         Event::new(
             Beat::new((from_beat * 4.0) as i64, 4),
@@ -758,7 +831,7 @@ mod speed_tests {
         assert_eq!(SPEED_UNITS_PER_SEC, 120.0);
     }
 
-    /// 缓动段走**积分**而不是"两端平均 × 时长"的近似：线性段梯形法精确，
+    /// 缓动段（= 线性）走**积分**而不是"取此刻的瞬时值"：
     /// 于是 0→10 的斜坡在 1 秒里积出 5（平均值）—— 若用"取此刻的瞬时值"就会是 0 或 10。
     #[test]
     fn a_ramp_integrates_instead_of_sampling_one_instant() {
@@ -805,10 +878,90 @@ mod speed_tests {
         assert!(speed_travel(&events, &tmap, 1.0, 1.5).abs() < 1e-6);
     }
 
+    /// **流速事件只按线性取**：`easing` 字段被忽略，且闭式积分是**精确值**（无抽样误差）。
+    ///
+    /// 记一条 `outElastic` 的流速事件，`H` 必须与记成 `linear` 的**一模一样**。
+    #[test]
+    fn speed_events_ignore_their_easing() {
+        let tmap = tmap120();
+        let eased = vec![ev_ease(0.0, 8.0, 0.0, 20.0, "outElastic")];
+        let linear = vec![ev(0.0, 8.0, 0.0, 20.0)];
+        let t_eased = SpeedTable::build(&eased, &tmap, 20.0);
+        let t_linear = SpeedTable::build(&linear, &tmap, 20.0);
+        for k in 0..=100 {
+            let sec = k as f64 * 0.1;
+            let (a, b) = (
+                t_eased.h_at(&eased, &tmap, sec),
+                t_linear.h_at(&linear, &tmap, sec),
+            );
+            assert_eq!(a, b, "t={sec} 缓动过的流速事件必须与线性完全相同（{a} ≠ {b}）");
+        }
+        // 闭式积分对线性是精确的：0→20 用 4 秒 ⇒ H(4s) = 平均 10 × 4 × 120
+        assert!((t_eased.h_at(&eased, &tmap, 4.0) - 10.0 * 4.0 * 120.0).abs() < 1e-9);
+    }
+
+    /// **BPM 变化点上的闭式积分**：流速在拍域线性，BPM 一变拍↔秒就折了 ——
+    /// 积分必须在那个点上切开，否则端点平均是错的。
+    ///
+    /// 手算：BPM 120（0~4 拍 = 0~2 秒）→ BPM 240（4~8 拍 = 2~3 秒）；
+    /// 流速事件 0~8 拍从 0 线性升到 20（拍域）。两段的平均值不同：
+    /// 第一段 v(0)=0、v(4拍)=10 ⇒ 10×... 正确算法：段内线性 ⇒ 各段用各自的端点平均 × 该段秒长。
+    /// 0~2 秒：平均 5 ⇒ 10；2~3 秒：起点 v=10、终点 v=20 ⇒ 平均 15 ⇒ 15 ⇒ 合计 25（流速单位 × 秒）。
+    #[test]
+    fn the_closed_form_splits_at_bpm_changes() {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![
+            BpmEntry { start: Beat::zero(), bpm: 120.0, foreign: Default::default() },
+            BpmEntry { start: Beat::new(4, 1), bpm: 240.0, foreign: Default::default() },
+        ];
+        let tmap = TimeMap::from_doc(&doc);
+        let events = vec![ev(0.0, 8.0, 0.0, 20.0)];
+        let want = 25.0 * 120.0;
+        let got = speed_travel(&events, &tmap, 0.0, 3.0);
+        assert!((got - want).abs() < 1e-6, "整段应为 {want}（各段各自平均），实际 {got}");
+        // 查表路径必须与它一致（这正是"表与整条走一遍分家"的那个点）
+        let table = SpeedTable::build(&events, &tmap, 16.0);
+        for sec in [0.5, 1.5, 2.0, 2.5, 3.0] {
+            let a = table.h_at(&events, &tmap, sec);
+            let b = speed_travel(&events, &tmap, 0.0, sec);
+            assert!((a - b).abs() < 1e-6, "t={sec}：查表 {a} ≠ 直积 {b}");
+        }
+    }
+
+    /// `|v|` 的下界是**解析**求的：线性段的最小值在端点；端点异号 ⇒ 中间过零 ⇒ 0
+    #[test]
+    fn min_speed_magnitude_is_analytic() {
+        let no = |v: f64| vec![ev(0.0, 8.0, v, v)];
+        assert_eq!(min_speed_magnitude(&[]), None);
+        assert_eq!(min_speed_magnitude(&no(10.0)), Some(10.0));
+        assert_eq!(min_speed_magnitude(&no(-4.0)), Some(4.0), "负流速取绝对值");
+        // 斜坡 2 → 8：最小在起点
+        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, 2.0, 8.0)]), Some(2.0));
+        // 斜坡 −3 → +5：中间穿过 0 ⇒ 下界是 0（"穿过窗口要多久"发散 ⇒ 调用方夹到上限）
+        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, -3.0, 5.0)]), Some(0.0));
+        // 多事件取最小
+        let two = vec![ev(0.0, 4.0, 20.0, 20.0), ev(4.0, 8.0, 5.0, 0.5)];
+        assert_eq!(min_speed_magnitude(&two), Some(0.5));
+    }
+
+    /// **`track_value`：流速轨只线性，其余四条照旧认缓动**（"哪条轨道用哪种求值"的唯一判断处）
+    #[test]
+    fn track_value_is_linear_for_speed_only() {
+        let tmap = tmap120();
+        let eased = vec![ev_ease(0.0, 8.0, 0.0, 20.0, "outBounce")];
+        let beat = tmap.beat(2.0); // 0→20 走 4 秒，第 2 秒是拍 4
+        let sp = track_value("speed", &eased, beat).unwrap();
+        let mx = track_value("moveX", &eased, beat).unwrap();
+        assert!((sp - 10.0).abs() < 1e-9, "流速按线性 ⇒ 中点 10，实际 {sp}");
+        assert!(mx > 10.0, "outBounce 中点应明显高于线性中点，实际 {mx}");
+        // 认不出的轨道名 = 非流速 ⇒ 认缓动
+        assert_eq!(track_value("alpha", &eased, beat), Some(mx));
+    }
+
     /// **检查点表 = 逐段直接积分**：几百个时刻（事件中间、空隙里、末尾之后）逐一对账。
     ///
     /// 这条是"预算好的位置"与"现算的位置"能互为基准的前提 —— 两条路径共用同一份段划分与段内积分。
-    /// 四种形状都过一遍：缓动斜坡、负流速、带空隙、没有事件（默认流速 10）。
+    /// 四种形状都过一遍：缓动斜坡（缓动被忽略 ⇒ 线性）、负流速、带空隙、没有事件（默认流速 10）。
     #[test]
     fn the_checkpoint_table_agrees_with_direct_integration() {
         let tmap = tmap120();
@@ -825,8 +978,9 @@ mod speed_tests {
                 let sec = k as f64 * 0.05; // 0 … 20 秒
                 let want = speed_travel(&events, &tmap, 0.0, sec);
                 let got = table.h_at(&events, &tmap, sec);
+                // 闭式积分（不是抽样近似）⇒ 两条路应当**完全一致**，容差只留浮点噪声
                 assert!(
-                    (got - want).abs() < 1e-6,
+                    (got - want).abs() < 1e-9,
                     "事件 {} 条：t={sec} 查表 {got} ≠ 直积 {want}",
                     events.len()
                 );
@@ -886,3 +1040,4 @@ mod speed_tests {
         assert_eq!(table.h_at(&events, &tmap, 0.0), 0.0);
     }
 }
+

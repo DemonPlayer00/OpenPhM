@@ -244,6 +244,11 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"del_event","line":0,"track":"speed","index":0}` | |
 | `{"op":"split_event","line":0,"track":"moveX","index":0,"atBeat":[2,1]}` | 在中点按线性插值切分（有缓动时先近似，随后用 `set_event` 修正） |
 | `{"op":"set_track_constant","line":0,"track":"speed","value":10}` | **一步满足轨道不变量**：清空该轨并铺一条覆盖全谱的恒定事件。**流速的默认/基准值是 10**（RPE 口径：1 单位流速 = 120 RPE y 单位/秒 ⇒ 10 = 1× = 1200 单位/秒 = 0.75 秒划过 900 高的窗口）；**整条轨道没有流速事件时预览也按 10 走** |
+
+⚠️ **流速轨只按 `linear` 求值**（音符位置是流速的积分，线性有闭式解 —— 见 README「下落速度」）。
+给 `speed` 事件写别的 `easing` **不报错、也不改写**（原样保留、导出照旧写回），
+但**预览与音符位置按线性算**；`opm-ctl --file F lines` 的 `valueAt` 与检查器显示的也是线性值。
+所以 agent 想控制音符位置时，直接改 `startValue`/`endValue`/起止拍即可，不必绕缓动。
 | `{"op":"normalize"}` | 排序 / 补空隙 / 裁重叠 / 首事件回退到 ≤0 / 末事件延到谱末之后 |
 
 ⚠️ **事件索引是"图层内下标"，而 GUI 的编辑区用的是"合并视图下标"** —— 两者只有在单图层时相同。

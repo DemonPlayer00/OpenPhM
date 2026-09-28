@@ -33,7 +33,7 @@ pub fn lines_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
                     serde_json::json!({
                         "track": id.key(),
                         "events": t.events.len(),
-                        "valueAt": crate::perf::eval_events(&t.events, tmap.beat(playhead_sec)),
+                        "valueAt": crate::perf::track_value(id.key(), &t.events, tmap.beat(playhead_sec)),
                     })
                 })
                 .collect();
