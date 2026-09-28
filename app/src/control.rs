@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 控制通道：让 `opm-ctl` **接进正在运行的 GUI 进程**，操作同一个编辑会话。
 //!
 //! 协议极简：Unix socket 上跑**行分隔 JSON**，一问一答。

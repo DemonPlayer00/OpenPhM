@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 格式编解码层（codec）：编辑器只认 opm 数据模型，格式差异全部收敛在这里。
 //!
 //! 三条规范要求（`spec/opm-format.md` §8–§9）在这里落地：

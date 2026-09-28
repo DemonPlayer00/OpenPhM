@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 最小 ZIP 读写（**自研，不引依赖**）—— opm 的容器形态需要它。
 //!
 //! 为什么自己写：本机对 crates.io 不可达（`cargo add flate2` 拿不到包），而 opm 的容器格式是

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 自截屏（`--shot`）的**决策逻辑**，抽成纯函数。
 //!
 //! 为什么值得单独一个模块：这段逻辑原来是内联在 `App::ui` 里的（带一个 `if shot.is_some()` 守卫），

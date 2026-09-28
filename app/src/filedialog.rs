@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 系统文件对话框 —— "打开/另存为"要走**桌面自己的文件管理器对话框**，不是自绘一个。
 //!
 //! 为什么是 `kdialog`/`zenity` 而不是 `rfd` 或 `org.freedesktop.portal.FileChooser`：

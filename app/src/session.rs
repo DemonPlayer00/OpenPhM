@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **单会话**（同一时刻只允许一个 OpenPhM）与「上次没退干净」的判定。
 //!
 //! 两件事是同一个问题的两面：解压缓存目录是**进程独占**的（一个进程至多留一份，退出即清），

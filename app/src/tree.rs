@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **判定线树**（左侧面板）：判定线 → 事件轨道 → 事件 → 子音符。
 //!
 //! 它只读 `&EditorState`，把用户点的东西写成 [`TreeAction`]（**面板自己不施加动作**）：

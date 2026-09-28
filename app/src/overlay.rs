@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 编辑区叠加层：**拍为纵轴**，左半音符 / 右半事件，叠在演奏区上。
 //!
 //! 为什么单独一层而不是又一个面板：演奏区是"游戏里会变成什么样"的唯一视图，

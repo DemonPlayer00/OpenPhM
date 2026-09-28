@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! OpenPhM —— 制谱器核心库。
 //!
 //! 模块职责：

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **测试公用件**（只在 `cfg(test)` 下编译，见 `lib.rs`）。
 //!
 //! 为什么要有这个模块：有几段测试助手本来在三个文件里各抄一份 —— "一帧里画出来的所有文本"、

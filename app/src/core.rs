@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 编辑核心：**CLI 与 GUI 共享的同一个编辑会话**，也是唯一的可写方。
 //!
 //! 数据流（单向）：

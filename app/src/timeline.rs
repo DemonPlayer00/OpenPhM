@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **底部时间轴**：几何、读数、绘制。
 //!
 //! 为什么单独一个模块（用户："重写时间轴代码"）：

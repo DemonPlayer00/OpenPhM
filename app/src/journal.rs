@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 更改日志（记录更改模式的撤销/重做）。
 //!
 //! 与"快照式"的区别：**内存随改动量增长，而不是随文档大小增长**。

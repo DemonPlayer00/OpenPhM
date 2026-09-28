@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! RPE（Re:PhiEdit / Phira）谱面编解码 —— **自研实现，不链接 `prpr`**（`prpr` 是 GPL-3.0，见提案 D1）。
 //!
 //! 字段语义来源：`Phigros-规则速查.md` §4（RPE 与 PEC 格式）与 `spec/opm-format.md` §9（与 RPE 的映射），

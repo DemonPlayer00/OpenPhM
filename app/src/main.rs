@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! OpenPhM 制谱器 —— UI 骨架（Linux 优先，Windows 兼容测试待后）
 //!
 //! 布局：顶部菜单 / 底部状态栏 / 左侧音符列表（虚拟化）/ 右侧属性检查器 /

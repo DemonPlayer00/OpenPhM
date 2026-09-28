@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! codec 的可执行断言：枚举表以 `spec/*.json` 为单一数据源、RPE 导入必须产出**合法** opm、
 //! 以及"导入→导出→再导入"不许漂。
 //!

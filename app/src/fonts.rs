@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! CJK 字体装载：**自带一份**，不依赖系统字体。
 //!
 //! 为什么要自带（2026-09-28，用户："自带cjk字体以防止文字变为方块"）：

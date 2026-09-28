@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **视图模型**：给界面用的派生快照（"当前该显示什么"），全部是**纯函数**。
 //!
 //! 为什么放在库里而不是 `main.rs` 里：

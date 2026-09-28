@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **显卡选择策略（Linux 混显笔记本）**。
 //!
 //! 背景：开发机是 AMD 核显 + NVIDIA 独显的混显本（具体型号不写进代码）。wgpu 的默认电源偏好是

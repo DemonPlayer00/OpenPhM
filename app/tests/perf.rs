@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 表演求值的验收：29 个缓动的端点与已知值、多 BPM 时间映射、事件求值（含非线性缓动）。
 
 use opm_app::doc::{Beat, Document, Event, BpmEntry, JudgeLine};

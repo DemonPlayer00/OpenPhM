@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! opm 的**容器形态**：`.opm` 是一个 ZIP，里面是谱面 + 音乐 + 曲绘等资源。
 //!
 //! 布局（沿用 `spec/opm-format.md` 第 172 行的约定：根目录 `opm.json` + 资源）：

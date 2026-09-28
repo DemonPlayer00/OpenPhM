@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 广播机制的验收测试：**改完必须广播；话题不命中的订阅者必须收不到**。
 //!
 //! 这两条是"GUI 不私自更新、无关控件不参与更新"这条架构要求的可执行证据。

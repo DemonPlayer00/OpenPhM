@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **边界测试**：EditCore 只管"会写进谱面文件的数据"，界面内部规则归界面自己。
 //!
 //! 用户定的规则原话：*editcore 只管最终会保存到谱面文件的数据，gui 不能私自更新可能未到 editcore 的数据，

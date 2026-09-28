@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **RPE 谱面包**（`.pez` / 无压缩文件夹）：`info.yml` + 核心谱面 + 音乐 + 曲绘。
 //!
 //! 形态依据（不是我们自己发明的）：Phira 的[谱面标准]规定"谱面包是一个压缩包，解压后**直接**包含

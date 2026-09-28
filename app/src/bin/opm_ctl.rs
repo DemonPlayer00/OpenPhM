@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! `opm-ctl` —— 给 agent 用的编辑入口。
 //!
 //! 两种工作方式，**操作的是同一套编辑核心**：

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 编辑器状态与**线优先**的视图模型。
 //!
 //! 依赖方向（这是本模块存在的理由）：

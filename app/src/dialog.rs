@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **模态对话框的统一外观**。
 //!
 //! 同一件事不该有三种长相：「新建谱面」原先在启动页里是**单独一屏**（整屏换掉），

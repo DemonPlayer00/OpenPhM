@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **编辑意图 → 命令**：把界面上的手势（拖动音符、拖事件头尾、双击放音符…）翻成
 //! `EditCore` 的命令 JSON。
 //!

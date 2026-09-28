@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **演示谱面**（`--notes N` 用的那套负载）：按需造一份"有判定线、有事件、有音符"的文档。
 //!
 //! 它走 **`EditCore` 的命令路径**（不是直接构造 `Document`）："文档只有核心能写"这条边界对

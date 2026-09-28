@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **右侧属性检查器**（线 → 轨道 → 事件 → 音符）。从 `main.rs` 搬出来，因为它有一个
 //! 必须一眼看清的契约：**面板只产出命令，不碰文档**（文档数据只能由 `EditCore` 写）。
 //!

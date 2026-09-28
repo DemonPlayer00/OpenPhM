@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **命令行参数**：解析是纯函数（不吃 `argv`、不打印、不退出），于是能单测。
 //!
 //! 为什么值得单独一层：这串参数是 **agent 与 CI 唯一的入口**（`--doc` / `--shot` / `--control` /

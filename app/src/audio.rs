@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 音频播放：**播放头跟着音频时钟走**，而不是跟着墙钟。
 //!
 //! 为什么必须这样：谱面与音乐一旦各走各的时钟，误差会一直累积（S2 spike 实测音频时钟相对墙钟

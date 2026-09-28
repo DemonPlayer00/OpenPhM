@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 判定线是父对象、音符是子对象 —— 这条依赖关系的可执行断言。
 //!
 //! 覆盖三件事：

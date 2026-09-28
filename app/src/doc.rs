@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! opm 文档模型（对齐 `spec/opm-format.md` v0.1）。
 //!
 //! 三条来自规范的硬约束在这里落地：

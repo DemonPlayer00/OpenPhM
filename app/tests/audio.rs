@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 音频模块的验收：WAV 解码、声道/采样率对齐、以及**帧/样本单位**（那个 2× bug 的回归测试）。
 //!
 //! 这里不打开真实输出设备（CI/无声环境也要能跑）：只测纯函数与解码。

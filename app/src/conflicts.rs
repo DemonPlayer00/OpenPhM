@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **冲突浏览器**：列出 `EditCore` 报出来的事件重叠，点一下跳到那里。
 //!
 //! 面板只做两件事：把 [`Overlap`] 画成可点的行、把点击变成 [`ConflictJump`]。

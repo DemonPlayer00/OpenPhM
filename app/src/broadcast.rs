@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 更新广播与**细粒度话题**。
 //!
 //! 设计目标（按用户要求）：

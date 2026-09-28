@@ -196,6 +196,8 @@ cargo build --target x86_64-pc-windows-gnu --release   # 交叉编译 Windows ex
 
 **GNU General Public License v3.0 或更高版本**（GPL-3.0-or-later）。全文见 [`LICENSE`](LICENSE)
 （GPL-3.0 标准文本，674 行 / 35147 字节，未作任何修改）；`app/Cargo.toml` 的 `license` 字段同此声明。
+每个 Rust / Python 源文件顶部都带 SPDX 头（`// SPDX-License-Identifier: GPL-3.0-or-later` +
+版权行）——`git grep -l SPDX-License-Identifier` 可以核对，不用逐个翻文件。
 
 ```text
 Copyright (C) 2026 DemonPlayer

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **广播话题 → 面板脏位**的唯一映射表。
 //!
 //! "只重建脏掉的那块"这句话的全部实现就是这里：`EditCore` 发出带话题的广播，

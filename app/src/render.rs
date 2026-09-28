@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 演奏区渲染：自研 wgpu 实例化管线，经 `egui_wgpu::CallbackTrait` 挂进 egui 的同一个 render pass。
 //!
 //! 与 S1b spike 的关键差别：**用回调矩形的 viewport 把演奏区映射到自己的坐标空间**，

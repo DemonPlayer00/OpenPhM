@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 DemonPlayer
 """OpenPhM 脏位落点验收：**每条话题到底重建了哪几个面板**。
 
 为什么要有它：README 里那张"命令 → 话题 → Δ整表/属性/音符/轨道/检查"的表是**量出来的**，

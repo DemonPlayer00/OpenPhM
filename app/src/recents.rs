@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **起始界面**（最近打开的谱面 + 新建谱面表单 + 缺 7z 的门槛提示）。
 //!
 //! 这一屏只有**一个整屏布局**（列表）；"新建谱面"与"缺少 7z"都是盖在它上面的**模态**

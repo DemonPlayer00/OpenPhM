@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 DemonPlayer
 """opm 谱面校验器 v0.1 —— 仅标准库，无第三方依赖。
 
 实现规范 spec/opm-format.md 第 8 节的规范性约束。

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 快捷键的**状态规则**（纯逻辑，与 egui/winit 无关，可单测）。
 //!
 //! 目前只有空格键的"自动播放"语义，但它有四种组合（停/播 × 单点/长按），

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 DemonPlayer
 """OpenPhM 更新广播验收：话题分级 + 端到端延迟。
 
 直接说 UDS 上的行分隔 JSON（第二份客户端实现，顺带验证协议），

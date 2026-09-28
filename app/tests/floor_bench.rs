@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! **音符位置缓存的实测台**（默认 `#[ignore]`：它不是断言，是量尺）。
 //!
 //! 跑法：

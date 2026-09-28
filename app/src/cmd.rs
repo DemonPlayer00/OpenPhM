@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 命令解析与校验（**不再持有会话** —— 编辑会话在 [`crate::core::EditCore`]）。
 //!
 //! 这里只保留三件与状态无关的事：

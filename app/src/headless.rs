@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 DemonPlayer
 //! 无头渲染：把 opm 文档在指定播放头位置渲染成 PNG。
 //!
 //! 这是给 **agent 的"眼睛"**：无头 CLI 改完谱后可直接出图，再由 agent 读取图片核对结果
