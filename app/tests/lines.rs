@@ -6,7 +6,7 @@
 //! 3. **无关性**：改一条线的表演，不动另一条线的音符实例。
 
 use opm_app::doc::{Beat, BpmEntry, Document, Event, JudgeLine, Note as DocNote, NoteKind as DocKind};
-use opm_app::render::build_instances;
+use opm_app::render::{build_instances, NoteInstance};
 use opm_app::state::{chart_from_doc, EditorState, TrackId};
 use serde_json::json;
 
@@ -261,6 +261,187 @@ fn a_note_speed_multiplies_its_distance() {
     build_instances(&st, &mut inst);
     // 0.25 s × 1200 单位/秒 × 3 = 900 —— 已经出窗口了（这正是"乘距离"的直接后果）
     assert_eq!(inst.len(), 1, "speed=3 的音符 0.25 秒就跑出窗口了");
+}
+
+/// 一份"一条线 + 若干音符"的谱面，流速恒 10（RPE 默认 = 1× = 1200 单位/秒），BPM 120（一拍 0.5 秒）。
+fn one_line_doc(notes: &[(DocKind, f64, Option<f64>, bool)]) -> Document {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    l.layers[0].track_mut("speed").unwrap().push(Event::new(
+        Beat::zero(),
+        Beat::new(4096, 1),
+        json!(10.0),
+        json!(10.0),
+        "linear",
+    ));
+    for (kind, start, end, fake) in notes {
+        let mut n = DocNote::new(*kind, Beat::new((start * 4.0) as i64, 4), 0.0);
+        n.end = end.map(|e| Beat::new((e * 4.0) as i64, 4));
+        n.is_fake = *fake;
+        l.notes.push(n);
+    }
+    doc.judge_lines.push(l);
+    doc
+}
+
+/// 白色闪光的实例数（击中效果的探针：闪光就是纯白，音符/判定线都不是）
+fn flash_count(inst: &[NoteInstance]) -> usize {
+    inst.iter()
+        .filter(|i| i.color()[0] > 0.99 && i.color()[1] > 0.99 && i.color()[2] > 0.99)
+        .count()
+}
+
+/// Tap 音符本体的实例数（按 `NoteKind::Tap` 的颜色认 —— 击中效果的环是"提亮过的"颜色，认不出来）
+fn tap_quad_count(inst: &[NoteInstance]) -> usize {
+    inst.iter()
+        .filter(|i| {
+            let c = i.color();
+            (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
+        })
+        .count()
+}
+
+/// **音符到达判定线后出现击中效果并消失**（用户要求）：
+/// 到线前正常下落 → 到线那一下闪一次（且音符停在线上收缩）→ 收缩完音符没了、闪光还在 → 效果也结束。
+#[test]
+fn a_note_hits_the_judge_line_then_vanishes() {
+    use opm_app::render::{HIT_FADE_SEC, HIT_FX_SEC};
+    let doc = one_line_doc(&[(DocKind::Tap, 2.0, None, false)]); // 2 拍 = 1.0 秒
+    let t_hit = 1.0_f64;
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+
+    let mut count_at = |t: f64| {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(&st, &mut inst);
+        inst
+    };
+
+    // 到线之前：只有"线本体 + 音符"，没有闪光，而且**音符是它本来的大小与亮度**
+    // （这里钉的是一个真 bug：消失进度没夹到 0 ⇒ 未来的音符被放大到 2.8 倍、alpha ×5.5）
+    let before = count_at(t_hit - 0.1);
+    assert_eq!(before.len(), 2, "到线前 = 线本体 + 1 个音符");
+    assert_eq!(flash_count(&before), 0, "还没到线，不该有击中效果");
+    let fresh = before.iter().find(|i| i.half()[0] < 100.0).expect("音符本体");
+    assert!(
+        (fresh.half()[0] - 46.0).abs() < 1e-3 && (fresh.half()[1] - 13.0).abs() < 1e-3,
+        "还没到线的音符应保持原尺寸，实际 {:?}",
+        fresh.half()
+    );
+    assert!(
+        (fresh.color()[3] - 1.0).abs() < 1e-3,
+        "还没到线的音符 alpha 应为 1，实际 {}",
+        fresh.color()[3]
+    );
+
+    // 到线那一下：音符还在（停在线上收缩）+ 闪光出现（1 白闪 + 4 条扩散边）
+    let at = count_at(t_hit);
+    assert_eq!(flash_count(&at), 1, "到线当帧应闪一下");
+    assert!(at.len() >= 1 + 5, "线本体 + 音符 + 5 个效果实例，实际 {}", at.len());
+    let note_quad = at
+        .iter()
+        .find(|i| i.color()[0] < 0.99 && i.half()[0] > 3.0)
+        .expect("音符本体");
+    assert!(
+        (note_quad.center()[1] - 0.0).abs() < 1e-3,
+        "到线之后音符应**停在判定线上**，而不是继续往下掉：{}",
+        note_quad.center()[1]
+    );
+
+    // 收缩完：音符本体没了，闪光还在
+    let after_fade = count_at(t_hit + HIT_FADE_SEC + 0.01);
+    assert_eq!(flash_count(&after_fade), 1, "闪光还在场上");
+    assert_eq!(tap_quad_count(&after_fade), 0, "音符本体应该在收缩结束之后消失");
+
+    // 效果结束：只剩判定线本体
+    let after_fx = count_at(t_hit + HIT_FX_SEC + 0.01);
+    assert_eq!(after_fx.len(), 1, "效果结束、音符也没了 ⇒ 只剩线本体");
+    assert_eq!(flash_count(&after_fx), 0);
+}
+
+/// **hold 击中后立即播一次，之后每 3 拍再播一次**（用户要求）
+#[test]
+fn a_hold_pulses_a_hit_effect_every_three_beats() {
+    use opm_app::render::{HIT_FX_SEC, HOLD_PULSE_BEATS};
+    // 0 拍起、12 拍止（BPM 120 ⇒ 一拍 0.5 秒 ⇒ 0..6 秒）
+    let doc = one_line_doc(&[(DocKind::Hold, 0.0, Some(12.0), false)]);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    let at = |st: &mut EditorState, t: f64| {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(st, &mut inst);
+        flash_count(&inst)
+    };
+    // 击中当帧**立即**闪一次
+    assert_eq!(at(&mut st, 0.0), 1, "hold 击中后应立即播一次击中效果");
+    // 半个脉冲之后不闪（效果早已结束）
+    assert_eq!(at(&mut st, 0.5 * HOLD_PULSE_BEATS - HIT_FX_SEC - 0.02), 0);
+    // 第 3、6、9 拍各闪一次（都在 hold 之内）
+    for beats in [3.0, 6.0, 9.0] {
+        let t = beats * 0.5;
+        assert_eq!(at(&mut st, t), 1, "{beats} 拍处应再闪一次");
+        assert_eq!(at(&mut st, t + HIT_FX_SEC + 0.01), 0, "{beats} 拍的效果应结束");
+    }
+    // 尾巴之后不再闪
+    assert_eq!(at(&mut st, 6.5), 0, "hold 结束后不该再有脉冲");
+    assert_eq!(at(&mut st, 12.0), 0, "12 拍（超出一个脉冲）也不该有");
+}
+
+/// 按住期间**被吃掉的那一段不再画**：hold 的身子从判定线起算，而不是从头起算
+#[test]
+fn a_held_hold_body_starts_at_the_judge_line() {
+    let doc = one_line_doc(&[(DocKind::Hold, 0.0, Some(8.0), false)]); // 0..4 秒
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    // 1 秒时：头（0 秒）已经过去 1 秒 ⇒ 身子应从判定线（本地 y=0）起算
+    st.playhead = 1.0;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    // 身子那块的半高 = 剩余长度的一半，中心在剩余长度的一半处 ⇒ 下端正好落在 y=0
+    let body = inst
+        .iter()
+        .find(|i| i.half()[1] > 20.0)
+        .expect("hold 的身子");
+    let bottom = body.center()[1] - body.half()[1];
+    assert!(bottom.abs() < 1.0, "身子下端应贴着判定线，实际 {bottom}");
+}
+
+/// **长 hold 在头被击中之后仍然可见**（`visible_range_of` 以前只按时间回退 0.15s ⇒
+/// 身子还在窗口里、却整条不再上报实例 —— 自动播放时表现为"长条一到线就消失"）
+#[test]
+fn a_long_hold_stays_visible_after_its_head_is_hit() {
+    // 0 拍起、40 拍止（20 秒）：播放头在 10 秒，头早已过去、身子还有 10 秒
+    let doc = one_line_doc(&[(DocKind::Hold, 0.0, Some(40.0), false)]);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    st.playhead = 10.0;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    assert!(
+        inst.iter().any(|i| i.half()[1] > 20.0),
+        "被按住的那一段身子必须还在画：{:?}",
+        inst.iter().map(|i| i.half()).collect::<Vec<_>>()
+    );
+}
+
+/// **假音符没有击中效果**（它没有判定，游戏里也不会闪）
+#[test]
+fn a_fake_note_does_not_flash() {
+    let doc = one_line_doc(&[(DocKind::Tap, 2.0, None, true)]);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    st.playhead = 1.0; // 正好是打击时刻
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    assert_eq!(flash_count(&inst), 0, "假音符不该有击中效果");
 }
 
 #[test]

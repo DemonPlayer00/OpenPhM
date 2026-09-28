@@ -10,6 +10,85 @@ use opm_app::cmd;
 use opm_app::state::EditorState;
 use opm_app::view::Inspector;
 
+/// **数值字段的提交时机：只在回车 / 失焦**（用户要求）。
+///
+/// 单独抽成一个函数，是因为它是一条**规则**而不是"顺手补的一个 flag"：
+/// `DragValue` 默认 `update_while_editing(true)` —— 每敲一个键就把值写回（并让调用方发命令），
+/// 而检查器是**每次广播都重建**的 ⇒ 你敲 "12"，第一个字符就被快照里的旧值冲掉，
+/// 字段变成 "1"、再敲变 "11" …… 数值输入根本没法用。
+///
+/// `update_while_editing(false)` 正是要的语义（egui 文档："值只在回车或取消选择时更新"，
+/// Esc 取消）。**鼠标拖动仍然实时** —— 拖就是在调值，那是另一件事。
+///
+/// 一个数值字段这一帧的结果
+pub struct ValueField {
+    /// 底层响应（要矩形/焦点时用；**别用它的 `changed()` 当"该发命令了"**）。
+    /// 生产代码只用 `changed`，`resp` 是给测试拿控件矩形用的。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub resp: egui::Response,
+    /// **值真的变了没有** —— 该不该发命令只看它
+    pub changed: bool,
+}
+
+/// 数值字段：**提交时机只有回车 / 失焦**（用户要求），返回"值真的变了没有"。
+///
+/// 每个字段都必须经过这里：以后谁再加一个字段，也不会悄悄回到"每敲一键提交一次"。
+///
+/// 判据为什么不是 `Response::changed()`（实测踩到的）：编辑态下 `DragValue` 返回的是**内部
+/// TextEdit** 的响应，敲第一个字符那一帧它就是真，而值纹丝不动（要等回车/失焦才写回）。
+/// 拿它当判据会在打字期间发一串**旧值**命令、把撤销栈灌满。用"值变了没有"则两种情形都对：
+/// 打字期间不变（不发）、回车那一下变了（发一次）、鼠标拖动每帧都变（照旧实时）。
+pub fn value_field<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    v: &mut N,
+    prefix: &str,
+    speed: f64,
+    range: Option<std::ops::RangeInclusive<N>>,
+) -> ValueField {
+    let before = *v;
+    let mut w = egui::DragValue::new(v)
+        .update_while_editing(false)
+        .prefix(prefix)
+        .speed(speed);
+    if let Some(r) = range {
+        w = w.range(r);
+    }
+    let resp = ui.add(w);
+    ValueField { resp, changed: *v != before }
+}
+
+/// **文本字段的提交时机：与数值同一套（回车 / 失焦）**。
+///
+/// 编辑期间那份文本放在 egui 的临时内存里，**不用每帧重建的快照去覆盖它** ——
+/// 那正是"输入被自动填充（敲一个字就被旧值冲掉）"的来源。没在编辑时永远显示文档里的值，
+/// 于是撤销/外部改动照常立刻反映出来。
+///
+/// 返回 `Some(新值)` 只在"刚刚提交且确实变了"的那一帧（调用方据此发命令）。
+pub fn text_field(ui: &mut Ui, key: &str, current: &str, width: f32) -> Option<String> {
+    let id = egui::Id::new(("opm_insp_text", key));
+    let editing = ui.memory(|m| m.has_focus(id));
+    let mut buf = if editing {
+        ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| current.to_owned())
+    } else {
+        current.to_owned()
+    };
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .id(id)
+            .desired_width(width),
+    );
+    let value = buf.trim().to_owned();
+    if resp.lost_focus() {
+        // 回车、Tab、点到别处都会走到这里（Esc 取消编辑时 egui 已经回滚了文本）
+        ui.data_mut(|d| d.remove::<String>(id));
+        return (!value.is_empty() && value != current).then_some(value);
+    }
+    if editing {
+        ui.data_mut(|d| d.insert_temp(id, buf));
+    }
+    None
+}
+
 /// 画属性编辑器，返回**要发的命令**（空 = 这一帧没改动）。
 ///
 /// 只读 `st`（网格吸附/选中项）与快照 `insp`；命令怎么拼在 `opm_app::edit`（有单测）。
@@ -25,17 +104,15 @@ pub fn inspector_ui(
             let line_doc = v.line_index;
             ui.horizontal(|ui| {
                 ui.label("线名");
-                let mut name = v.name.clone();
-                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(110.0)).changed()
-                    && !name.is_empty()
-                {
-                    ec.push(opm_app::edit::set_line_command(line_doc, serde_json::json!({"name": name})));
+                if let Some(name) = text_field(ui, "line-name", &v.name, 110.0) {
+                    ec.push(opm_app::edit::set_line_command(
+                        line_doc,
+                        serde_json::json!({"name": name}),
+                    ));
                 }
             });
             let mut z = v.z_order;
-            if ui
-                .add(egui::DragValue::new(&mut z).prefix("zOrder ").speed(0.2))
-                .changed()
+            if value_field(ui, &mut z, "zOrder ", 0.2, None).changed
             {
                 ec.push(opm_app::edit::set_line_command(line_doc, serde_json::json!({"zOrder": z})));
             }
@@ -44,9 +121,7 @@ pub fn inspector_ui(
                 ec.push(opm_app::edit::set_line_command(line_doc, serde_json::json!({"isCover": cover})));
             }
             let mut bf = v.bpm_factor;
-            if ui
-                .add(egui::DragValue::new(&mut bf).prefix("线速 ").speed(0.01).range(0.01..=8.0))
-                .changed()
+            if value_field(ui, &mut bf, "线速 ", 0.01, Some(0.01..=8.0)).changed
             {
                 ec.push(opm_app::edit::set_line_command(line_doc, serde_json::json!({"bpmFactor": bf})));
             }
@@ -73,18 +148,10 @@ pub fn inspector_ui(
                 let mut sv = e.start_value;
                 let mut ev = e.end_value;
                 let mut easing = e.easing.clone();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut sb).prefix("起 ").speed(0.05).range(0.0..=1e6))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut eb).prefix("止 ").speed(0.05).range(0.0..=1e6))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut sv).prefix("值起 ").speed(0.5))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut ev).prefix("值止 ").speed(0.5))
-                    .changed();
+                changed |= value_field(ui, &mut sb, "起 ", 0.05, Some(0.0..=1e6)).changed;
+                changed |= value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed;
+                changed |= value_field(ui, &mut sv, "值起 ", 0.5, None).changed;
+                changed |= value_field(ui, &mut ev, "值止 ", 0.5, None).changed;
                 egui::ComboBox::from_id_salt("ev_easing")
                     .selected_text(easing.clone())
                     .width(110.0)
@@ -143,32 +210,24 @@ pub fn inspector_ui(
                     set.insert("kind".into(), serde_json::json!(kind));
                 }
                 let mut sb = n.start_beat;
-                if ui
-                    .add(egui::DragValue::new(&mut sb).prefix("拍 ").speed(0.05).range(0.0..=1e6))
-                    .changed()
+                if value_field(ui, &mut sb, "拍 ", 0.05, Some(0.0..=1e6)).changed
                 {
                     set.insert("startBeat".into(), serde_json::json!(st.beat_json(sb)));
                 }
                 if let Some(eb0) = n.end_beat {
                     let mut eb = eb0;
-                    if ui
-                        .add(egui::DragValue::new(&mut eb).prefix("止 ").speed(0.05).range(0.0..=1e6))
-                        .changed()
+                    if value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed
                     {
                         set.insert("endBeat".into(), serde_json::json!(st.beat_json(eb)));
                     }
                 }
                 let mut lane = n.lane_x;
-                if ui
-                    .add(egui::DragValue::new(&mut lane).prefix("laneX ").speed(1.0).range(-675.0..=675.0))
-                    .changed()
+                if value_field(ui, &mut lane, "laneX ", 1.0, Some(-675.0..=675.0)).changed
                 {
                     set.insert("laneX".into(), serde_json::json!(st.snap_lane(lane)));
                 }
                 let mut alpha = n.alpha as i64;
-                if ui
-                    .add(egui::DragValue::new(&mut alpha).prefix("alpha ").speed(1.0).range(0..=255))
-                    .changed()
+                if value_field(ui, &mut alpha, "alpha ", 1.0, Some(0..=255)).changed
                 {
                     set.insert("alpha".into(), serde_json::json!(alpha));
                 }
@@ -177,23 +236,17 @@ pub fn inspector_ui(
                     set.insert("isFake".into(), serde_json::json!(fake));
                 }
                 let mut sp = n.speed;
-                if ui
-                    .add(egui::DragValue::new(&mut sp).prefix("speed ").speed(0.01).range(0.01..=20.0))
-                    .changed()
+                if value_field(ui, &mut sp, "speed ", 0.01, Some(0.01..=20.0)).changed
                 {
                     set.insert("speed".into(), serde_json::json!(sp));
                 }
                 let mut ws = n.width_scale;
-                if ui
-                    .add(egui::DragValue::new(&mut ws).prefix("宽度 ").speed(0.01).range(0.01..=10.0))
-                    .changed()
+                if value_field(ui, &mut ws, "宽度 ", 0.01, Some(0.01..=10.0)).changed
                 {
                     set.insert("widthScale".into(), serde_json::json!(ws));
                 }
                 let mut yo = n.y_offset;
-                if ui
-                    .add(egui::DragValue::new(&mut yo).prefix("yOffset ").speed(0.5))
-                    .changed()
+                if value_field(ui, &mut yo, "yOffset ", 0.5, None).changed
                 {
                     set.insert("yOffset".into(), serde_json::json!(yo));
                 }
@@ -296,6 +349,85 @@ mod tests {
     }
 
     /// 面板真的把该画的东西画出来了（这条是"面板还在、没被改哑"的回归网）
+    /// **数值字段只在回车/失焦时提交**（用户要求）。
+    ///
+    /// 这条必须真的驱动一遍控件：`DragValue` 默认"每敲一键就写回"，而检查器每次广播都重建
+    /// ⇒ 打字期间被快照里的旧值冲掉，输入根本没法用。测试点进字段、敲三个字符、
+    /// 断言期间**一次都没有提交**，回车才变成 123。
+    ///
+    /// 顺带钉住第二条（踩出来的）：提交判据**不能**用 `Response::changed()`
+    /// —— 编辑态返回的是内部 TextEdit 的响应，敲第一个字符那一帧它为真、而值纹丝不动。
+    /// 用"值变了没有"才对，所以这里同时断言两件事。
+    #[test]
+    fn value_fields_commit_only_on_enter() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 120.0));
+        let mut v: f64 = 1.0;
+        let mut rect: Option<egui::Rect> = None;
+        // (值, 真身报的"变了没有", Response 报的 changed)
+        let mut commits: Vec<(f64, bool, bool)> = Vec::new();
+        let run = |events: Vec<egui::Event>,
+                   v: &mut f64,
+                       rect: &mut Option<egui::Rect>,
+                       log: &mut Vec<(f64, bool, bool)>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let r = value_field(ui, v, "拍 ", 0.05, Some(0.0..=1e6));
+                *rect = Some(r.resp.rect);
+                log.push((*v, r.changed, r.resp.changed()));
+            });
+            out.textures_delta.clear();
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // 帧 1：铺出来，拿到字段矩形
+        run(vec![], &mut v, &mut rect, &mut commits);
+        let c = rect.expect("字段矩形").center();
+        // 点进去（进入编辑态）
+        run(vec![egui::Event::PointerMoved(c), click(c, true)], &mut v, &mut rect, &mut commits);
+        run(vec![click(c, false)], &mut v, &mut rect, &mut commits);
+        // 敲三个字符：**一次都不该提交**
+        for ch in ["1", "2", "3"] {
+            run(vec![egui::Event::Text(ch.to_owned())], &mut v, &mut rect, &mut commits);
+            assert_eq!(v, 1.0, "打字期间不该提交（敲到 {ch} 就变了）");
+            assert!(!commits.last().unwrap().1, "打字期间不该报「变了」");
+        }
+        // 回车：提交
+        run(
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            &mut v,
+            &mut rect,
+            &mut commits,
+        );
+        assert_eq!(v, 123.0, "回车才提交（三个字符拼成 123）");
+        assert!(commits.last().unwrap().1, "回车那一下要报「变了」");
+        assert_eq!(
+            commits.iter().filter(|(_, real, _)| *real).count(),
+            1,
+            "整段只有回车那一次提交"
+        );
+        // 而 `Response::changed()` 在打字期间就是真 —— 这就是"不能拿它当判据"的原因
+        assert!(
+            commits.iter().any(|(_, real, resp)| !*real && *resp),
+            "应有「值没变但 Response 说变了」的帧（否则这条测试就白写了）"
+        );
+    }
+
+
     #[test]
     fn inspector_draws_the_line_track_event_and_note() {
         let (_c, st, insp) = sample();

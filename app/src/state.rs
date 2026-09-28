@@ -168,6 +168,13 @@ pub struct Line {
     pub notes: Vec<Note>,
     /// 五条事件轨道
     pub tracks: [TrackView; 5],
+    /// 这条线上**最长的音符时长**（秒，等于 `max(end − time)`；全是 tap 时是 0）。
+    ///
+    /// 只为"可见区间该从多早开始"服务：一条长 hold 的头可能远在窗口之前、身子还在窗口里，
+    /// 而音符是按**时间**排序的 ⇒ 只按时间取连续区间会把它的身子漏掉（长条在头被击中后
+    /// 立刻消失）。用"最长时长"当回退量是个**正确**的下界：任何 `end ≥ 窗口起点` 的音符
+    /// 都必然满足 `time ≥ 窗口起点 − 最长时长`。
+    pub max_note_sec: f64,
 }
 
 impl Line {
@@ -273,14 +280,20 @@ impl Chart {
 /// 由 opm 文档构建**一条判定线**的视图（只含属性 + 音符，不含轨道）—— 结构重建用
 pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> {
     let src = doc.judge_lines.get(index)?;
+    let notes = notes_of(doc, index, tmap);
+    let max_note_sec = notes
+        .iter()
+        .map(|n| (n.end - n.time).max(0.0))
+        .fold(0.0_f64, f64::max);
     Some(Line {
         index,
         name: src.name.clone(),
         z_order: src.z_order,
         is_cover: src.is_cover,
         bpm_factor: src.bpm_factor,
-        notes: notes_of(doc, index, tmap),
+        notes,
         tracks: Default::default(),
+        max_note_sec,
     })
 }
 
@@ -1224,15 +1237,28 @@ impl EditorState {
         }
     }
 
-    /// 某条线在可见窗口内的音符下标区间（半开）
+    /// 某条线在可见窗口内的音符下标区间（半开）。
+    ///
+    /// 上界按"还没到"取（`time < 播放头 + lookahead`）；下界**必须按最长音符回退**：
+    /// 一条长 hold 的头在窗口之前、身子还在窗口里，而音符是按**时间**排序的 ——
+    /// 只看时间会让长条在头被击中后立刻消失（自动播放时最明显）。
+    /// 回退量 = `max_note_sec`（正确的下界，见 `Line::max_note_sec`）+ 一点余量
+    /// （刚过去的音符还要画"到线收缩"与击中效果）。
     pub fn visible_range_of(&self, line: usize) -> std::ops::Range<usize> {
         let Some(l) = self.chart.lines.get(line) else {
             return 0..0;
         };
-        let lo = l.notes.partition_point(|n| n.time < self.playhead - 0.15);
+        let back = Self::PAST_NOTE_MARGIN_SEC + l.max_note_sec;
+        let lo = l.notes.partition_point(|n| n.time < self.playhead - back);
         let hi = l.notes.partition_point(|n| n.time < self.playhead + self.lookahead);
         lo..hi
     }
+
+    /// 播放头**之前**还要送进渲染管线的余量（秒）。
+    ///
+    /// 刚到达判定线的音符还要画"到线收缩 + 击中效果"，所以不能一到播放头就不见了。
+    /// 取值要点：≥ 击中效果的时长（`render::HIT_FX_SEC`），否则效果会被截尾。
+    pub const PAST_NOTE_MARGIN_SEC: f64 = 0.25;
 }
 
 // ------------------------------------------------- 事件边界的抓取规则

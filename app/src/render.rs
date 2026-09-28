@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::doc::Event;
 use crate::perf;
-use crate::state::{Chart, EditorState, NoteKind, RPE_WINDOW_HALF_H};
+use crate::state::{Chart, EditorState, Note, NoteKind, RPE_WINDOW_HALF_H};
 
 pub const RPE_W: f32 = 1350.0;
 pub const RPE_H: f32 = 900.0;
@@ -425,6 +425,112 @@ pub fn push_window_frame(out: &mut Vec<NoteInstance>, alpha: f32) {
     }
 }
 
+// ---------------------------------------------------------------- 击中效果
+
+/// 音符到达判定线之后的**收缩消失**时长（秒）。
+///
+/// 游戏里是"到线即消失 + 闪光"；给一小段收缩只是让"消失"看起来发生在一个瞬间里，
+/// 而不是凭空少了一个方块。
+pub const HIT_FADE_SEC: f64 = 0.06;
+
+/// **击中效果**的持续时间（秒）：白闪 + 一圈向外扩散的方框。
+pub const HIT_FX_SEC: f64 = 0.22;
+
+/// hold 在按住期间每隔几拍再播一次击中效果（用户要求：每 3 拍 1 次）
+pub const HOLD_PULSE_BEATS: f64 = 3.0;
+
+/// 这颗音符**此刻**有没有击中效果在场？有就给出它的进度 `0..1`（`0` = 刚击中）。
+///
+/// 该在哪些时刻闪：
+/// · `k = 0` —— 音符的**打击时刻**。hold 也一样：**击中后立即播一次**（用户明确要求，
+///   不能等 3 拍才闪第一下）；
+/// · `k ≥ 1` —— hold 按住期间每 [`HOLD_PULSE_BEATS`] 拍一次，直到它的尾巴为止。
+///
+/// 假音符没有判定 ⇒ 没有击中效果（它在游戏里也不该有）。
+pub fn hit_fx_progress(note: &Note, tmap: &perf::TimeMap, playhead: f64) -> Option<f32> {
+    if note.is_fake {
+        return None;
+    }
+    let pulse = tmap.sec(tmap.beat(note.time) + HOLD_PULSE_BEATS) - note.time;
+    // 每帧最多一个效果在场（脉冲间隔 ≥ 一拍 ≫ HIT_FX_SEC），所以只需看两个候选：
+    // 当前落在哪一格、以及上一格（浮点边界上不会漏掉刚触发的那一次）。
+    let k_now = if pulse > 1e-9 {
+        ((playhead - note.time) / pulse).floor() as i64
+    } else {
+        0
+    };
+    for k in [k_now, k_now - 1] {
+        if k < 0 {
+            continue;
+        }
+        let at = if k == 0 {
+            note.time
+        } else {
+            if note.kind != NoteKind::Hold {
+                continue; // 只有 hold 有后续脉冲
+            }
+            tmap.sec(tmap.beat(note.time) + HOLD_PULSE_BEATS * k as f64)
+        };
+        // 尾巴之后不再闪（hold 结束就是结束）
+        if k > 0 && at >= note.end {
+            continue;
+        }
+        let age = playhead - at;
+        if (0.0..HIT_FX_SEC).contains(&age) {
+            return Some((age / HIT_FX_SEC) as f32);
+        }
+    }
+    None
+}
+
+/// 画一次击中效果：`t` 是进度 `0..1`。
+///
+/// 判定线上那一点（音符的 `laneX`、线本地 y = 0）闪一下 —— 白闪 + 一圈向外扩散的方框。
+/// 渲染层只有实例化的方块可用，所以"环"是**四条细边拼的空心方框**（跟着判定线一起转）。
+/// 颜色取音符类型的颜色（环）与白色（闪），与游戏里"打击点亮一下"的观感一致。
+fn push_hit_fx(
+    out: &mut Vec<NoteInstance>,
+    perf: &perf::LinePerf,
+    lane_x: f32,
+    angle: f32,
+    rgb: [f32; 3],
+    alpha: f32,
+    t: f32,
+) {
+    let t = t.clamp(0.0, 1.0);
+    // ① 白闪：一开始最大最亮，迅速收小淡出（"啪"那一下）
+    let flash = 1.0 - t;
+    let fw = NOTE_W * 0.5 * (1.0 + 1.8 * t);
+    out.push(NoteInstance::new(
+        perf.apply([lane_x, 0.0]),
+        [fw, fw * (NOTE_H / NOTE_W)],
+        [1.0, 1.0, 1.0, 0.85 * flash * alpha],
+        angle,
+    ));
+    // ② 扩散的方框：向外扩到约 3 倍，同时淡出
+    let half = NOTE_W * 0.5 * (1.1 + 2.2 * t);
+    let w = 1.7_f32;
+    let ring = [
+        rgb[0] * 0.35 + 0.65,
+        rgb[1] * 0.35 + 0.65,
+        rgb[2] * 0.35 + 0.65,
+        0.9 * (1.0 - t) * alpha,
+    ];
+    for (dx, dy, hx, hy) in [
+        (0.0, half, half, w),
+        (0.0, -half, half, w),
+        (half, 0.0, w, half),
+        (-half, 0.0, w, half),
+    ] {
+        out.push(NoteInstance::new(
+            perf.apply([lane_x + dx, dy]),
+            [hx, hy],
+            ring,
+            angle,
+        ));
+    }
+}
+
 /// 构建演奏区实例（CPU 侧）。
 ///
 /// 顺序即绘制顺序：`Chart.lines` 已按 zOrder 排好（小的先画、大的盖在上面）。
@@ -476,16 +582,40 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             // 音符自身的 speed（文档字段，默认 1.0）乘在**离判定线的距离**上：
             // RPE/prpr 就是这么用的（它不改到达时刻，只改"落多远"）。
             let spd = (note.speed as f64).abs().max(1e-3);
-            let y_local = (walk.to(note.time) * spd) as f32;
+            let lead = (walk.to(note.time) * spd) as f32;
+            // **到线之后就不再往下走**：音符停在判定线上收缩消失（游戏里就是这样，
+            // 而不是从判定线下面继续往下掉）。`age > 0` = 已经到达判定线。
+            let age = state.playhead - note.time;
+            let y_local = if age > 0.0 { 0.0 } else { lead };
+            // 到达之后 0→1 的消失进度；`>= 1` 就彻底没了（只剩击中效果在场）。
+            // **必须夹到 0**：`age < 0` 是"还没到"（绝大多数音符），不夹就成了负进度 ⇒
+            // 音符被放大到 2.8 倍、alpha 乘到 5.5（实测：一个 510×144 的亮蓝块挂在窗口顶上）。
+            let gone = if age > 0.0 {
+                (age / HIT_FADE_SEC).min(1.0) as f32
+            } else {
+                0.0
+            };
             let hold_dy = if note.kind == NoteKind::Hold {
                 (perf::speed_travel(speed_events, &state.chart.tmap, note.time, note.end) * spd) as f32
             } else {
                 0.0
             };
-            // 整条都在窗口上方很远 ⇒ 不必建实例（GPU 那边本来也会裁掉，省下来的是带宽）
-            let top = y_local.max(y_local + hold_dy);
-            if top > RPE_WINDOW_HALF_H + 60.0 {
+            // 整条都在窗口上方很远 ⇒ 不必建实例（GPU 那边本来也会裁掉，省下来的是带宽）。
+            // 判据取**最低的那一端**：长 hold 的尾巴可能远在窗口之上，而身子正从判定线穿过去
+            // （取"最高的一端"会把它整条裁掉 —— 那是"长条一到线就消失"的另一个成因）。
+            let tail_y = lead + hold_dy;
+            if y_local.min(tail_y) > RPE_WINDOW_HALF_H + 60.0 {
                 continue;
+            }
+
+            // ---- 击中效果 ----
+            //
+            // 用户要求：音符**到达判定线后出现击中效果并消失**；hold **击中后立即播一次**，
+            // 之后按住期间每 3 拍再播一次。渲染是每帧重算的（没有"事件"这个对象），所以
+            // "播一次"落实成"在某个时刻之后的一小段窗口里画它" —— 见 `hit_fx_progress`。
+            if let Some(t) = hit_fx_progress(note, &state.chart.tmap, state.playhead) {
+                let c = note.kind.color();
+                push_hit_fx(out, &perf, note.lane_x, angle, [c[0], c[1], c[2]], perf.alpha, t);
             }
 
             let mut color = note.kind.color();
@@ -495,31 +625,42 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 color = [1.0, 1.0, 1.0, perf.alpha];
             }
 
+            // ---- hold 的身子：被"按住"吃掉的那一段不再画（从判定线往上到尾巴）----
             if note.kind == NoteKind::Hold {
-                let dy = hold_dy;
-                let mid_local = [note.lane_x, y_local + dy * 0.5];
-                let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
-                if hold_selected {
-                    hc = [1.0, 1.0, 1.0, 0.7];
+                // 到线之前身子是 [头, 尾]；到线之后头那一段已经被吃掉 ⇒ 身子从**判定线**起算
+                let body_lo = y_local;
+                let dy = tail_y - body_lo;
+                if dy > 1.0 {
+                    let mid_local = [note.lane_x, body_lo + dy * 0.5];
+                    let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
+                    if hold_selected {
+                        hc = [1.0, 1.0, 1.0, 0.7];
+                    }
+                    out.push(NoteInstance::new(
+                        perf.apply(mid_local),
+                        [HOLD_W * 0.5, dy * 0.5],
+                        hc,
+                        angle,
+                    ));
                 }
+            }
+
+            // ---- 音符本体：到线之后收缩淡出，`HIT_FADE_SEC` 之后不再画 ----
+            if gone < 1.0 {
+                let k = (1.0 - gone).max(0.0);
+                let (w, h) = match note.kind {
+                    NoteKind::Hold => (HOLD_W, NOTE_H),
+                    _ => (NOTE_W, NOTE_H),
+                };
+                let mut c = color;
+                c[3] *= k;
                 out.push(NoteInstance::new(
-                    perf.apply(mid_local),
-                    [HOLD_W * 0.5, (dy.abs() * 0.5).max(1.0)],
-                    hc,
+                    perf.apply([note.lane_x, y_local]),
+                    [w * 0.5 * k.max(0.15), h * 0.5 * k.max(0.15)],
+                    c,
                     angle,
                 ));
             }
-
-            let (w, h) = match note.kind {
-                NoteKind::Hold => (HOLD_W, NOTE_H),
-                _ => (NOTE_W, NOTE_H),
-            };
-            out.push(NoteInstance::new(
-                perf.apply([note.lane_x, y_local]),
-                [w * 0.5, h * 0.5],
-                color,
-                angle,
-            ));
         }
     }
 }
