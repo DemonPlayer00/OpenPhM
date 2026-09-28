@@ -23,9 +23,9 @@ const USAGE: &str = r#"opm-ctl —— opm 谱面编辑入口（无头 / 附着�
   opm-ctl convert IN [--to opm|opm-dir|rpe|rpe-dir] [--out PATH] [--rpe-version N] [--quiet]
   opm-ctl --file FILE [--cmd JSON]... [--script FILE] [--stdin] [--save] [--json] [--quiet] [--atomic]
   opm-ctl --attach [SOCKET|auto] [--cmd JSON]... [--script FILE] [--stdin] [--json]
-  opm-ctl --file FILE validate [--json]
-  opm-ctl --file FILE lines [--at SEC] [--json]
-  opm-ctl --file FILE overlaps [--json]      # 事件重叠（0 处 → 退出码 0；有 → 4）
+  opm-ctl [--json] --file FILE validate       # 注意：--json 要写在子命令**之前**（解析在遇到子命令时停止）
+  opm-ctl [--json] --file FILE lines [--at SEC]
+  opm-ctl [--json] --file FILE overlaps       # 事件重叠（0 处 → 退出码 0；有 → 4）
   opm-ctl --file FILE summary | dump | journal
   opm-ctl --file FILE render [--at SEC] [--lookahead SEC] [--width W] [--height H] --out PNG
   opm-ctl help

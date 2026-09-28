@@ -1684,10 +1684,13 @@ Rust 侧验收：`cargo test --test broadcast`（只命中相关订阅者 / 失�
 3. **剪贴板**：日志出现 `Failed to initialize arboard clipboard: X11 server connection timed out`（Wayland 会话下 arboard 尝试连 X11）。文本框复制粘贴需要在 Wayland 上单独验证。
 4. ~~撤销/重做~~、~~工程文件读写~~、~~音频时钟接入~~ **已接入**：播放头以音频游标为主时钟（见上文实测）。
 5. ~~多 BPM 的时间映射未完成~~ → **已补**（`perf::TimeMap` 分段线性，`tests/perf.rs` 有往返断言）。
-6. **codec 未接**：RPE / 官谱导入导出尚未实现，目前只读写 opm 原生 JSON。
+6. ~~codec 未接~~ → **RPE 导入/导出已接**（`.pez` 谱面包、RPE 文件夹、裸 RPE JSON；容器 `.opm` 与文件夹形态都能读写）。
+   **仍未接的只有官谱（official）格式**。
 7. ~~音频只支持 WAV~~ → **已支持 wav/flac/mp3/ogg-vorbis/m4a-aac/alac/adpcm**（symphonia，见上文表格）。
-8. ~~GUI 里不能点一下放置/拖动音符~~ → **已实现**：编辑区可拖动音符（横向/纵向吸附）与双击放置 Tap。
-   仍未做：拖动**事件**边界、框选多选、拖动时显示数值提示（现在只有松手后的结果）。
+8. ~~GUI 里不能点一下放置/拖动音符~~ → **已实现**：编辑区可拖动音符（横向/纵向吸附）、双击放置 Tap、
+   `Q/W/E/R` 快速放置（含 hold 跟随草稿）。~~拖动事件边界~~、~~框选多选~~ **也已实现**
+   （`resize_event` + `Shift`+拖动框选，见使用教程 §5）。
+   仍未做：拖动过程中的数值提示（现在只有松手后的结果）。
 9. **演奏区的 `speed` 只是预览约定**：游戏内语义留给播放器（与"变速 hold 交播放器"同一个判断）。
 10. **换预览音频会卡住一帧**：`Audio::load`（symphonia 解码 + 声道/采样率对齐 + 建流）跑在 UI 线程上，
     实测 60 s 文件解码约 0.1~0.45 s（wav 358 ms / ogg 647 / flac 444 / mp3 756 / m4a 446，含进程启动），
