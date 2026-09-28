@@ -988,3 +988,100 @@ fn notes_inside_the_window_are_drawn_however_far_they_are_from_the_line() {
         }
     }
 }
+
+/// **hold 的尾巴位置必须按当前时刻推算**（用户发现："没有给 hold 尾部推算位置"）。
+///
+/// 曾经算成"头的偏移 + 整段时长"，而头的偏移来自**单调累加器**（`SpeedAccum` 只往前走，
+/// 查询过去的时刻一律返回当前累计值 0）⇒ 被按住时尾巴被钉死在"头 + 全长"上：
+/// 身子不随按住而缩短，尾巴过去之后也永远不消失。
+#[test]
+fn a_held_hold_tail_follows_the_current_time() {
+    // 0..4 拍（BPM 120 ⇒ 0..2 秒），流速 10 ⇒ 1200 单位/秒 ⇒ 全长 2400
+    let doc = one_line_doc_speed(10.0, &[(DocKind::Hold, 0.0, Some(4.0), 0.0)]);
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+
+    // 身子的**上端**（= 尾巴的偏移；判定线在原点时中心 + 半高就是它）
+    let body_top = |st: &mut EditorState, t: f64| -> Option<f32> {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(st, &mut inst);
+        inst.iter()
+            .find(|q| {
+                let c = q.color();
+                (c[0] - 0.75).abs() < 0.02
+                    && (c[1] - 0.90).abs() < 0.02
+                    && (c[2] - 1.0).abs() < 0.02
+                    && c[3] < 0.9
+            })
+            .map(|q| q.center()[1] + q.half()[1])
+    };
+
+    // 尾巴离判定线多远 = H(t_尾) − H(t_此刻) = 1200 × (2 − t)
+    for (t, want) in [(0.0, 2400.0), (0.5, 1800.0), (1.0, 1200.0), (1.5, 600.0), (1.9, 120.0)] {
+        let got = body_top(&mut st, t).unwrap_or_else(|| panic!("t={t}：身子不该缺席"));
+        assert!(
+            (got - want).abs() < 1.0,
+            "t={t}：尾巴应在 {want}，实际 {got}（这正是「没给尾巴推算位置」的样子）"
+        );
+    }
+    // **第二次打击动画那一帧**（3 拍 = 1.5 秒）：身子与效果必须同时在
+    // （用户报的就是这一帧"hold 会消失"）
+    st.playhead = 1.5;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    assert!(flash_count(&inst) > 0, "第二次打击动画要播");
+    assert!(body_top(&mut st, 1.5).is_some(), "动画播放时 hold 的身子不该消失");
+    // 尾巴过去之后：身子必须消失（旧代码在这里会一直留着一条全长身子）
+    assert_eq!(body_top(&mut st, 2.05), None, "尾巴过去之后身子必须消失");
+    assert_eq!(body_top(&mut st, 4.0), None, "更晚也一样");
+}
+
+/// 广撒网：**各种流速 / 音符 speed / 时长**下，按住期间身子都必须一直在，
+/// 且尾部之后必须消失（上一版逐条查"缺哪几帧"找出来的 bug，收成一条回归测试）。
+#[test]
+fn a_held_hold_body_never_vanishes_mid_way() {
+    for speed in [10.0_f64, 1.0, -10.0] {
+        for note_speed in [1.0_f32, 2.0] {
+            for hold_beats in [1.0_f64, 4.0, 12.0] {
+                let mut doc =
+                    one_line_doc_speed(speed, &[(DocKind::Hold, 0.0, Some(hold_beats), 0.0)]);
+                doc.judge_lines[0].notes[0].speed = note_speed;
+                let mut st = EditorState::new(chart_from_doc(&doc));
+                st.selected_line = usize::MAX;
+                let hold_sec = hold_beats * 0.5; // BPM 120
+                let mut t = 0.0;
+                while t < hold_sec - 0.05 {
+                    st.playhead = t;
+                    let mut inst = Vec::new();
+                    build_instances(&st, &mut inst);
+                    assert!(
+                        inst.iter().any(|q| {
+                            let c = q.color();
+                            (c[0] - 0.75).abs() < 0.02
+                                && (c[1] - 0.90).abs() < 0.02
+                                && (c[2] - 1.0).abs() < 0.02
+                                && c[3] < 0.9
+                        }),
+                        "流速 {speed}、音符 speed {note_speed}、长 {hold_beats} 拍：t={t} 身子不见了"
+                    );
+                    t += 0.05;
+                }
+                // 尾巴之后：一律没有身子
+                st.playhead = hold_sec + 0.1;
+                let mut inst = Vec::new();
+                build_instances(&st, &mut inst);
+                assert!(
+                    !inst.iter().any(|q| {
+                        let c = q.color();
+                        (c[0] - 0.75).abs() < 0.02
+                            && (c[1] - 0.90).abs() < 0.02
+                            && (c[2] - 1.0).abs() < 0.02
+                            && c[3] < 0.9
+                    }),
+                    "流速 {speed}、长 {hold_beats} 拍：尾巴过去了身子还在"
+                );
+            }
+        }
+    }
+}

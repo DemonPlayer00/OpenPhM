@@ -604,10 +604,20 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             } else {
                 0.0
             };
-            let hold_dy = if note.kind == NoteKind::Hold {
-                (perf::speed_travel(speed_events, &state.chart.tmap, note.time, note.end) * spd) as f32
+            // ---- hold 的**尾巴**：位置按**当前时刻**推算，不是"头的位置 + 全长" ----
+            //
+            // 这里修的是一个真 bug：尾巴曾经算成 `头的偏移 + 整段时长`，而"头的偏移"来自
+            // **单调累加器**（`SpeedAccum`）——它只会往前走，查询过去的时刻一律返回当前累计值
+            // （0）。于是被按住时尾巴停在"头 + 全长"上：身子不会随按住而缩短，
+            // 尾巴过去之后也永远不消失。
+            //
+            // 正确写法与头部同源：尾巴此刻的偏移 = `H(t_尾) − H(t_此刻)`
+            // （`speed_travel(此刻 → 尾)`，尾巴已经过去时它给 0）。
+            let tail_y = if note.kind == NoteKind::Hold {
+                (perf::speed_travel(speed_events, &state.chart.tmap, state.playhead, note.end) * spd)
+                    as f32
             } else {
-                0.0
+                lead
             };
             // ---- 可见性判据：**按屏幕上的位置**，不是"离判定线多远" ----
             //
@@ -616,7 +626,6 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             // 的 y 是 **+360**（明明在窗口里），却被当成"离判定线太远"整颗丢掉；
             // 线旋转 90° 时，偏移 660 的音符落在屏幕上 x=-660（±675 之内）同样被丢掉。
             // 现在判据是"这颗音符（连它自己的半宽半高）在屏幕上的包围盒是否与窗口相交"。
-            let tail_y = lead + hold_dy;
             let (nw, nh) = match note.kind {
                 NoteKind::Hold => (HOLD_W, NOTE_H),
                 _ => (NOTE_W, NOTE_H),
@@ -653,20 +662,21 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 color = [1.0, 1.0, 1.0, perf.alpha];
             }
 
-            // ---- hold 的身子：被"按住"吃掉的那一段不再画（从判定线往上到尾巴）----
+            // ---- hold 的身子：被"按住"吃掉的那一段不再画（从判定线起算到尾巴）----
             if note.kind == NoteKind::Hold {
-                // 到线之前身子是 [头, 尾]；到线之后头那一段已经被吃掉 ⇒ 身子从**判定线**起算
-                let body_lo = y_local;
-                let dy = tail_y - body_lo;
-                if dy > 1.0 {
-                    let mid_local = [note.lane_x, body_lo + dy * 0.5];
+                // 到线之前身子是 [头, 尾]；到线之后头那一段已经被吃掉 ⇒ 身子从**判定线**起算。
+                // 段是**带符号**的：负流速时尾巴在判定线下面，段就画在线的下面。
+                let body_a = y_local;
+                let dy = tail_y - body_a;
+                if dy.abs() > 1.0 {
+                    let mid_local = [note.lane_x, body_a + dy * 0.5];
                     let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
                     if hold_selected {
                         hc = [1.0, 1.0, 1.0, 0.7];
                     }
                     out.push(NoteInstance::new(
                         perf.apply(mid_local),
-                        [HOLD_W * 0.5, dy * 0.5],
+                        [HOLD_W * 0.5, dy.abs() * 0.5],
                         hc,
                         angle,
                     ));
