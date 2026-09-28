@@ -11,6 +11,7 @@
 //! · [`cmd`]    命令解析与校验（无状态）
 //! · [`state`]  编辑器视图状态（播放头、可见区间等）
 //! · [`render`] 演奏区渲染（wgpu 实例化，viewport 映射）
+//! · [`gpu`]    显卡选择策略（Linux 混显：默认核显，prime-run/显式开关才用独显）
 //! · [`headless`] 无头渲染出图（给 agent 用：改完谱能自己"看"结果）
 //! · [`fonts`]  CJK 字体装载
 //! · [`codec`]  格式编解码（opm 原生 + RPE 导入导出；枚举表以 `spec/*.json` 为单一数据源）
@@ -41,6 +42,7 @@ pub mod journal;
 pub mod keymap;
 pub mod filedialog;
 pub mod fonts;
+pub mod gpu;
 pub mod headless;
 pub mod perf;
 pub mod recents;

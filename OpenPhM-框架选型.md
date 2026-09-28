@@ -2336,3 +2336,46 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 - 截图（合成器已恢复）：`artifacts/pending-event.png` —— 草稿落在 **moveX 那一列**、2→6 拍，
   头（下方，带短竖）与尾（上方）两个控制杆齐全；`artifacts/pending-hold.png` 是 hold 版。
 - 顺带把 `OPM_EDIT_AUTO` 扩成两式：`hold:<lane>,<start>,<end>` / `event:<track>,<start>,<end>`。
+
+## 7.43 显卡策略：默认核显，独显只在显式指定时用（Linux 侧，2026-09-28）
+
+用户："**在linux上让显卡调用策略遵循prime-run，不要在没有指定的情况下去调用功耗更高的nvidia显卡。**"
+
+先说现状（实测）：启动日志里 `适配器: NVIDIA GeForce RTX 5070 Laptop GPU [Vulkan/DiscreteGpu]` ——
+**什么都没设，程序就在用独显**。根因在 wgpu/egui-wgpu 的默认值：
+`WgpuSetupCreateNew::from_env_or_default()` 里 `power_preference` = `WGPU_POWER_PREF` 解析值，
+**没有就是 `HighPerformance`**。
+
+### 做法：自己当"适配器选择器"
+
+`WgpuSetupCreateNew.native_adapter_selector`（`Arc<dyn Fn(&[Adapter], Option<&Surface>) -> Result<Adapter, String>>`）
+可以完全接管选卡，而且**比 `power_preference` 更可控**：它拿到全部候选，能按策略挑、能把决定打出来。
+于是策略判定收进库里 `opm_app::gpu`（纯逻辑，不依赖 wgpu 类型 ⇒ 可单测），`main.rs` 只做
+"`wgpu::DeviceType` → `GpuKind`"的映射与选卡闭包。
+
+| 输入 | 策略 |
+|---|---|
+| `OPM_GPU=discrete|integrated` | 明确要独显 / 核显（优先级最高） |
+| `__NV_PRIME_RENDER_OFFLOAD=1`、`__VK_LAYER_NV_optimus=NVIDIA_only`、`__GLX_VENDOR_LIBRARY_NAME=nvidia`、`DRI_PRIME≠0` | 独显（**这就是 prime-run**） |
+| `WGPU_POWER_PREF=high|low|none` | 独显 / 核显 / 不干预（尊重 wgpu 自己的变量） |
+| 都没有（Linux） | **核显优先** |
+| 非 Linux | 不干预（交给平台默认） |
+
+打分表保证"没有核显的机器仍然用独显"（核显 4 / 独显 3 / 虚拟 2 / 其它 1 / **软件渲染 0**）——
+"默认不用独显"不等于"宁可用 llvmpipe 也不给用硬件"。选择器还会先过滤掉
+`!adapter.is_surface_supported(surface)` 的候选（选一个不能呈现的等于自找黑屏）。
+
+### 实测（用启动日志核对，不靠猜）
+
+| 场景 | 选中的适配器 |
+|---|---|
+| 默认 | **AMD Radeon 610M（RADV，IntegratedGpu）** |
+| `DRI_PRIME=1` | NVIDIA RTX 5070（DiscreteGpu） |
+| `OPM_GPU=discrete` | NVIDIA RTX 5070 |
+| `OPM_GPU=integrated` | AMD Radeon 610M |
+| `prime-run`（系统真脚本） | NVIDIA RTX 5070（日志里还能看到 GL 那条 NVIDIA 适配器被标"不能出图到这个 surface"而被排除） |
+
+候选清单也一并打出来（`适配器候选: [i] 名字 [后端/类型]`），谁都能核对程序为什么挑它。
+**只验证了"用了哪块卡"，没量功耗** —— 功耗差别是常识判断，不是本次实测数据。
+
+`cargo test` 新增 4 条（策略判定：默认/prime-run 标记/开关优先级/挑卡打分），共 **177 条全绿、0 警告**。

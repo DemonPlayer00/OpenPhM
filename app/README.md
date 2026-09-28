@@ -465,6 +465,24 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
   （`start_screen_drawn_width_is_stable_across_frames`：真实那段 UI 连跑 12 帧、量每帧画出来的宽度）。
 - 打开或保存成功后自动记一条（去重、最近在前、最多 20 条；相对路径会绝对化，避免同一条目出现两次）。
 
+## 显卡选择（Linux 混显笔记本）：默认核显，独显要显式指定
+
+wgpu 的默认电源偏好是 `HighPerformance`，于是**什么都不设**时程序会去开独显。编谱是 2D、几十个实例的
+活儿，核显足够，而独显（这台机器上是 RTX 5070 Max-Q）的功耗与发热高得多 —— 所以这里改成
+**核显优先，独显只在显式指定时才用**：
+
+| 怎么指定 | 结果 |
+|---|---|
+| 什么都不设 | **核显优先**（本机实测：AMD Radeon 610M / IntegratedGpu） |
+| `prime-run opm-app …` | 独显（prime-run 设的 `__NV_PRIME_RENDER_OFFLOAD=1` / `__VK_LAYER_NV_optimus=NVIDIA_only` / `__GLX_VENDOR_LIBRARY_NAME=nvidia` 就是"我要独显"） |
+| `DRI_PRIME=1` | 独显（Mesa 那套写法；`DRI_PRIME=0` 表示"不要"，不算指定） |
+| `OPM_GPU=discrete` / `OPM_GPU=integrated` | 明确要独显 / 明确要核显（程序自己的开关，优先级最高） |
+| `WGPU_POWER_PREF=high|low|none` | 尊重 wgpu 自己的偏好变量 |
+
+**只有独显的机器不受影响**（核显优先在"没有核显"时仍然用独显；软件渲染 llvmpipe 排最后）。
+非 Linux 平台不干预（Windows/macOS 的高性能/省电由系统设置决定）。启动日志会把
+`显卡策略` / 每个`适配器候选` / `显卡选用` 三行打出来 —— 用了哪块卡、为什么，一眼可核对。
+
 ## 快速放置音符：Q/W/E/R（hold 跟随鼠标）
 
 在编辑区里把指针放到音符区，按一个键就放下一个音符 —— 不用先点工具栏选类型：

@@ -50,6 +50,19 @@ use state::EditorState;
 /// 抽成纯读函数是因为它有两个调用点（`App::new` 的初值、`refresh_file_badge` 的事件刷新），
 /// 而"怎么拼这行字"只该有一份 —— 上一版把逻辑写在方法里，`--doc FILE` 那条启动路径
 /// 没有经过任何刷新点，于是已载入的文件被显示成"尚未保存"。
+/// wgpu 的 `DeviceType` → `opm_app::gpu::GpuKind`（库里的策略是纯逻辑，不依赖 wgpu 类型）
+fn gpu_kind_of(t: eframe::wgpu::DeviceType) -> opm_app::gpu::GpuKind {
+    use eframe::wgpu::DeviceType as T;
+    use opm_app::gpu::GpuKind as K;
+    match t {
+        T::IntegratedGpu => K::Integrated,
+        T::DiscreteGpu => K::Discrete,
+        T::Cpu => K::Cpu,
+        T::VirtualGpu => K::Virtual,
+        T::Other => K::Other,
+    }
+}
+
 fn file_badge_of(core: &core::SharedCore) -> (String, bool, bool) {
     let c = core.lock().unwrap();
     let name = c
@@ -387,11 +400,61 @@ fn main() -> eframe::Result<()> {
     if let Some((x, y)) = args.pos {
         vp = vp.with_position([x, y]);
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: vp,
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // ---- 显卡策略：**默认走核显**，独显只在显式指定时才用（见 `opm_app::gpu`）----
+    //
+    // 为什么要自己选：wgpu 的默认电源偏好是 `HighPerformance` ⇒ 什么都不设时会去开独显，
+    // 而编谱这种 2D 活儿核显足够，独显白烧功耗与发热（用户明确要求）。
+    // 选择器拿到的是**全部候选适配器**，所以能按策略挑，并把决定打出来（谁都能核对）。
+    let (gpu_policy, gpu_why) =
+        opm_app::gpu::policy_from_env(cfg!(target_os = "linux"), &|k| std::env::var(k).ok());
+    println!("  显卡策略          : {}", opm_app::gpu::describe(gpu_policy, gpu_why));
+    if gpu_policy != opm_app::gpu::GpuPolicy::Default {
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(cfg_new) = &mut options.wgpu_options.wgpu_setup
+        {
+            cfg_new.native_adapter_selector = Some(std::sync::Arc::new(
+                move |adapters: &[eframe::wgpu::Adapter],
+                      surface: Option<&eframe::wgpu::Surface<'_>>| {
+                    // 只考虑"能出图到这个 surface"的适配器（选一个不能呈现的等于自找黑屏）
+                    let usable: Vec<usize> = adapters
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| surface.map(|s| a.is_surface_supported(s)).unwrap_or(true))
+                        .map(|(i, _)| i)
+                        .collect();
+                    for (i, a) in adapters.iter().enumerate() {
+                        let info = a.get_info();
+                        println!(
+                            "  适配器候选        : [{}] {} [{:?}/{:?}]{}",
+                            i,
+                            info.name,
+                            info.backend,
+                            info.device_type,
+                            if usable.contains(&i) { "" } else { "（不能出图到这个 surface）" }
+                        );
+                    }
+                    let kinds: Vec<opm_app::gpu::GpuKind> =
+                        usable.iter().map(|i| gpu_kind_of(adapters[*i].get_info().device_type)).collect();
+                    let pick = opm_app::gpu::pick_index(gpu_policy, &kinds)
+                        .ok_or_else(|| "没有可用的图形适配器".to_owned())?;
+                    let chosen = usable[pick];
+                    let info = adapters[chosen].get_info();
+                    println!(
+                        "  显卡选用          : {} [{:?}/{:?}]（{}）",
+                        info.name,
+                        info.backend,
+                        info.device_type,
+                        gpu_policy.label()
+                    );
+                    Ok(adapters[chosen].clone())
+                },
+            ));
+        }
+    }
 
     let a = args.clone();
     let r = eframe::run_native(
