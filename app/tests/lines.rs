@@ -1448,3 +1448,70 @@ fn the_integral_keeps_going_after_a_gap() {
         );
     }
 }
+
+/// **连着两个负流速事件，各算各的**（用户报"第二个负变速事件似乎不生效"的那条口径的数值验收）。
+///
+/// 谱面（BPM 120 ⇒ 1 拍 = 0.5 秒）：流速 0~2 秒 = 10、2~4 秒 = **−10**、4~6 秒 = **−20**。
+/// 手算 `H(t) = 120 ∫₀ᵗ v dτ`：
+///
+/// ```text
+///   H(1.0) = 1200 ｜ H(2.0) = 2400 ｜ H(2.5) = 1800 ｜ H(4.0) = 0 ｜ H(4.5) = −1200 ｜ H(5.5) = −3600
+/// ```
+///
+/// 第二个负事件（−20）**必须**在 H 上留下痕迹：4.0 → 4.5 秒那 0.5 秒走的是 −1200，不是 −600。
+/// 同一段也能用"直接积分"独立问一遍（`perf::speed_travel(4.0 → 4.5)`），两条路必须一致。
+#[test]
+fn two_negative_speed_events_each_count() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    let beat = |b: f64| Beat::new((b * 4.0).round() as i64, 4);
+    for (a, b, v) in [(0.0, 4.0, 10.0), (4.0, 8.0, -10.0), (8.0, 12.0, -20.0)] {
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            beat(a),
+            beat(b),
+            json!(v),
+            json!(v),
+            "linear",
+        ));
+    }
+    // 音符：负流速段里放一颗（4.5 秒），用来断言"线下一律不画"在这条路上也成立
+    l.notes.push(DocNote::new(DocKind::Tap, beat(9.0), 0.0));
+    doc.judge_lines.push(l);
+
+    let chart = chart_from_doc(&doc);
+    let tmap = chart.tmap.clone();
+    let line = &chart.lines[0];
+    for (sec, want) in [
+        (1.0, 1200.0),
+        (2.0, 2400.0),
+        (2.5, 1800.0),
+        (4.0, 0.0),
+        (4.5, -1200.0),
+        (5.5, -3600.0),
+    ] {
+        let got = line.h_at(sec, &tmap);
+        assert!((got - want).abs() < 1e-6, "H({sec}) 应为 {want}，实际 {got}");
+    }
+    // 独立基准：两点之间直接积分
+    let events = line.tracks[4].events.clone();
+    let seg = opm_app::perf::speed_travel(&events, &tmap, 4.0, 4.5);
+    assert!((seg + 1200.0).abs() < 1e-6, "4.0→4.5 秒应为 −1200（走的是第二个负事件），实际 {seg}");
+
+    // 渲染侧：播放头 4.0 秒时，4.5 秒那颗在判定线**之下**（偏移 −1200）⇒ 一颗都不画
+    let mut st = EditorState::new(chart);
+    st.selected_line = usize::MAX;
+    st.playhead = 4.0;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    let drawn = inst.iter().any(|q| {
+        let c = q.color();
+        (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
+    });
+    assert!(!drawn, "负流速段里线下的音符不该被画出来，实际画了");
+}

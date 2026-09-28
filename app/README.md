@@ -113,7 +113,7 @@ CLI 完全没有这个能力 —— 同一件事两套实现，迟早出现"GUI 
 音符的类型/拍/时长/laneX/alpha/假音符/speed/宽度/yOffset 都能改。
 所有改动都走命令（`set_line` / `set_event` / `resize_event` / `set_note`）—— 文档数据只能由 EditCore 写，
 编辑器发出的命令与 agent 用 `--attach` 发的是同一套；改完靠广播刷新，编辑器自己不缓存文档。
-事件的头/尾改时间走 `resize_event`（会同步邻块），值/缓动走 `set_event`。
+事件的头/尾改时间走 `resize_event`（**只改这一个事件** —— 早先的版本会同步邻块，用户明确否掉了那个语义），值/缓动走 `set_event`。
 
 ### 输入时机：**只在回车 / 失焦时提交**（用户要求）
 
@@ -1400,12 +1400,20 @@ GUI 控制台 / 远端 opm-ctl
 |---|---|---|---|---|---|---|---|
 | `Meta` | — | — | — | — | ✅ | — | — |
 | `Bpm` / `LineList` | ✅ | — | ✅（全部线） | ✅（全部线） | ✅ | ✅ | ✅ |
-| `LineProps[i]` | — | ✅ | — | — | — | — | ✅ |
+| `LineProps[i]` | — | ✅ | — | — | — | ✅ | ✅ |
 | `Notes[i]` / `Note[i]` | — | — | ✅ | — | ✅ | ✅ | ✅ |
-| `Track[i]`（移动/透明度/流速） | — | — | — | ✅ | — | — | ✅ |
+| `Track[i]`（移动/透明度/流速） | — | — | — | ✅ | — | ✅ | ✅ |
 
-关键点：**改一条线的一部分，不动其他线、也不动其他面板**。改 `Track[3]` 只重建 3 号线的轨道缓存；
-3 号线的子音符缓存、4 条线的整表、音符列表、检查器全部跳过（计数可验证）。
+关键点：**改一条线的一部分，不动其他线**。改 `Track[3]` 只重建 3 号线的轨道缓存；
+3 号线的子音符缓存、4 条线的整表、音符列表全部跳过（计数可验证）。
+
+**检查器是唯一的例外：除了 `Meta`，它每条话题都要刷** —— 因为它显示并**可编辑**
+当前选中对象（选中事件时是它的起止拍/值/缓动；选中音符时是音符字段；选中线时是线名/zOrder）。
+漏刷的后果是实测到的（2026-09-28，用户报「第二个负变速事件似乎不生效 / 下拉选择框总选上一次选的」）：
+命令**改了文档**、左边的事件列表也换了新值，**只有检查器停在改之前那份快照上**
+（证据：`artifacts/inspector-stale-before-fix.png` vs `inspector-follows-track-edit.png`）。
+代价很小：检查器快照只是"锁一次文档 + 读选中项"，**不是**整表重建；音符列表那一半仍然是零。
+
 `LineProps` 会牵连 `bpmFactor`，因此事件话题**不得**附带 `LineProps`（见 §已知问题里的实测教训）。
 
 ### 观测：把"谁被更新了"暴露给外部
@@ -1459,13 +1467,15 @@ opm-app --control auto --shot /tmp/ui.png --shot-frame 40   # 也可以常驻着
 | 命令 | 话题 | Δ整表 | Δ属性 | Δ音符 | Δ轨道 | Δ检查 |
 |---|---|---|---|---|---|---|
 | `set_meta` | `Meta` | 0 | 0 | 0 | 0 | 0 |
-| `add_event`（0 号线 alpha） | `Track[0]` | 0 | 0 | 0 | **1** | 0 |
-| `set_track_constant`（3 号线 speed） | `Track[3]` | 0 | 0 | 0 | **1** | 0 |
+| `add_event`（0 号线 alpha） | `Track[0]` | 0 | 0 | 0 | **1** | **1** |
+| `set_track_constant`（3 号线 speed） | `Track[3]` | 0 | 0 | 0 | **1** | **1** |
 | `add_note`（2 号线） | `Notes[2],Note[2]` | 0 | 0 | **1** | 0 | **1** |
 | 远端 `undo` | `Notes[2],Note[2]` | 0 | 0 | **1** | 0 | **1** |
-| `set_line`（1 号线 zOrder） | `LineProps[1]` | 0 | **1** | 0 | 0 | 0 |
+| `set_line`（1 号线 zOrder） | `LineProps[1]` | 0 | **1** | 0 | 0 | **1** |
 
 **6 条改动，0 次整表重建**；每条改动只重建"它那条线的那一部分"。
+`Δ检查` 那一列全是 1 是**刻意的**：检查器显示选中对象的值，事件/属性话题不刷它就会停在旧快照上
+（上表是 2026-09-28 修好之后重测的；那时 `Track`/`LineProps` 两行还是 0）。
 
 延迟拆解（远端 `--attach` → GUI 已应用广播）：
 
@@ -1479,7 +1489,11 @@ opm-app --control auto --shot /tmp/ui.png --shot-frame 40   # 也可以常驻着
 `EditCore` 提交到广播投递、再到 GUI 应用，发生在同一帧内（微秒级）。
 远端改动之所以能立刻看到，是因为控制线程改完后调用了 `waker()`（`ctx.request_repaint()`）—— 否则空闲心跳下最多要等 1 秒。
 
-证据图：[`artifacts/broadcast-scoped-update.png`](./artifacts/broadcast-scoped-update.png)（最近广播是 `Track[0]`，但谱面/列表/检查器重建计数没动）。
+证据图：[`artifacts/broadcast-scoped-update.png`](./artifacts/broadcast-scoped-update.png)：一次 `add_event`（0 号线 alpha）之后，
+诊断面板里 `最近 #450 Remote add_event[0:alpha:1] → [Track[0]]`、`整表重建 0.000 ms`、
+`重建 整表0 属性0 音符0` / `重建 轨道1 检查1`（只有那条线的轨道缓存与检查器动了，
+音符/属性计数没动；同一张图里还有 `位置缓存 已算准（400 条）`）。
+表里的数字可以用 `scripts/measure-dirty.py` 重跑（GUI 带 `--control` 即可，脚本自己等广播落地）。
 Rust 侧验收：`cargo test --test broadcast`（只命中相关订阅者 / 失败不广播 / 事务与 abort / 撤销也广播）。
 
 ## 节奏控制（画面无更新时降为 1 帧，工作时按屏幕帧率）

@@ -4,9 +4,15 @@
 //! 这一层把话题翻成"哪些面板要重建"，GUI 再照着重建。
 //!
 //! 为什么放在库里：它是一条**纯函数**（话题列表 → 脏位），而且规则细微到踩过坑 ——
-//! 比如"改一次透明度/流速事件（`Track`）不该牵动音符列表与检查器"，
+//! 比如"改一次透明度/流速事件（`Track`）不该牵动**音符列表**"，
 //! 以及"`LineProps` 会牵连 `bpmFactor`，所以事件话题不得附带 `LineProps`"。
 //! 放在 `main.rs` 里它就永远只能靠肉眼看；放这里就能拿测试钉住每一条落点。
+//!
+//! **检查器（`inspector`）是个例外：它几乎每条话题都要刷。** 原因很实在：
+//! 检查器显示并**可编辑**当前选中对象的字段 —— 选中事件时显示它的起止拍/值/缓动，
+//! 选中音符时显示音符字段，选中线时显示线名/zOrder/bpmFactor。任何一条能改到这些字段的
+//! 广播不刷它，面板就会**停在你改之前的那份快照上**（用户报的"改完看不出来 /
+//! 下拉框总显示上一次选的"就是这个，2026-09-28 修）。
 
 use crate::broadcast::{Topic, TopicKind};
 
@@ -84,6 +90,8 @@ pub fn dirty_of_topics(topics: &[Topic]) -> Dirty {
                 } else {
                     d.structure = true;
                 }
+                // 检查器里显示着这条线的名字/zOrder/isCover/bpmFactor ⇒ 它也要跟着刷
+                d.inspector = true;
                 d.render = true;
             }
             TopicKind::Notes | TopicKind::Note => {
@@ -101,6 +109,11 @@ pub fn dirty_of_topics(topics: &[Topic]) -> Dirty {
                 } else {
                     d.structure = true;
                 }
+                // **检查器必须刷**：它显示（且可编辑）**选中事件**的起止拍/值/缓动 ——
+                // 少这一条，面板就会停在你改之前那份快照上（改完看不出来、
+                // 缓动下拉框"总显示上一次选的"，都是这一个原因）。
+                // 音符列表仍然不重建（事件话题改不到音符），那一半的代价还是零。
+                d.inspector = true;
                 d.render = true;
             }
         }
@@ -142,8 +155,9 @@ mod tests {
         let d = dirty_of_topics(&[t(TopicKind::LineProps, Some(3))]);
         assert_eq!(d.props, vec![3]);
         assert!(d.render);
+        assert!(d.inspector, "检查器显示线名/zOrder/isCover/bpmFactor ⇒ 必须跟着刷");
         assert!(!d.structure, "只改一条线的属性不该重建整表");
-        assert!(d.notes.is_empty() && d.tracks.is_empty() && !d.inspector);
+        assert!(d.notes.is_empty() && d.tracks.is_empty(), "属性话题不碰音符/事件轨道缓存");
 
         let d = dirty_of_topics(&[t(TopicKind::LineProps, None)]);
         assert!(d.structure && d.props.is_empty(), "没有线号 ⇒ 只能整表重建");
@@ -160,15 +174,18 @@ mod tests {
         }
     }
 
-    /// **Track 只落在那条线的事件轨道上**（这条是踩过坑的规则：改一次透明度/流速事件
-    /// 不该重建音符列表、也不该刷检查器 —— 重建代价应当是零）
+    /// **Track 落在那条线的事件轨道上 + 检查器**。
+    ///
+    /// 音符列表不重建（事件话题改不到音符，那一半的代价仍是零），但**检查器必须刷**：
+    /// 它显示并可编辑**选中事件**的起止拍/值/缓动 —— 漏了这一条，面板就停在改之前那份
+    /// 快照上（用户报的"改完看不出来 / 缓动下拉框总显示上一次选的"，2026-09-28）。
     #[test]
-    fn track_events_do_not_touch_notes_or_the_inspector() {
+    fn track_events_refresh_the_track_cache_and_the_inspector() {
         let d = dirty_of_topics(&[t(TopicKind::Track, Some(5))]);
         assert_eq!(d.tracks, vec![5]);
         assert!(d.render);
         assert!(d.notes.is_empty(), "事件轨道变化不该重建音符缓存");
-        assert!(!d.inspector, "事件轨道变化不该刷检查器");
+        assert!(d.inspector, "检查器显示选中事件的值 ⇒ 必须跟着刷");
         assert!(!d.structure && !d.meta && d.props.is_empty());
         // 没有线号的事件话题 ⇒ 整表
         assert!(dirty_of_topics(&[t(TopicKind::Track, None)]).structure);

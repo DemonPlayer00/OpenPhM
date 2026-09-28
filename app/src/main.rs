@@ -2170,6 +2170,10 @@ impl App {
             }
         }
         self.audio_drift = None;
+        // 检查器里那一段"**此刻**表演（事件求值）"是**快照**：不在这里刷，拖动时间轴时它会
+        // 停在旧的一刻上（而那一段的标题正是"此刻"）。seek 是离散动作（拖时间轴时每帧一次，
+        // 与拖事件同量级），刷一次快照 = 锁一次文档 + 读选中项，代价可以接受。
+        self.insp = self.build_inspector();
     }
 
     /// 取走控制通道投来的视图命令并执行
@@ -4023,6 +4027,42 @@ impl eframe::App for App {
             ui.monospace(format!("空闲   {} fps", self.args.idle_fps));
             ui.monospace(format!("工作区 {}", self.ws.label()));
             ui.separator();
+            ui.label("更新广播");
+            ui.monospace(format!("已应用 {} 条", self.applied_broadcasts));
+            ui.monospace(format!("最近 {}", self.last_broadcast));
+            ui.monospace(format!("话题 {}", self.last_topics.join(", ")));
+            ui.monospace(format!("整表重建 {:.3} ms", self.last_structure_ms));
+            // 检查器那一格是**必须跟着事件话题走的**（它显示选中事件的值）——
+            // 把它印出来，"改完面板没刷"这类 bug 就能在诊断里一眼看出来。
+            // 拆成两行是为了**截图里读得全**：面板窄，一长行会被折掉后半截
+            // （那几个数字正是"哪一块被重建了"的唯一证据）。
+            ui.monospace(format!(
+                "重建 整表{} 属性{} 音符{}",
+                self.builds_structure, self.builds_props, self.builds_notes
+            ));
+            ui.monospace(format!(
+                "重建 轨道{} 检查{}",
+                self.builds_tracks, self.builds_inspector
+            ));
+            ui.monospace(format!(
+                "跳过 整表{} 属性{} 音符{}",
+                self.skipped_structure, self.skipped_props, self.skipped_notes
+            ));
+            ui.monospace(format!(
+                "跳过 轨道{} 检查{}",
+                self.skipped_tracks, self.skipped_inspector
+            ));
+            // 音符位置缓存：待重算条数（0 = 全部算准）。这行是"异步补完了没有"的读数 ——
+            // 底栏那行字只在真的在补时出现，**补完就没了**，所以核对时要看这里。
+            match self.state.floor_rebuild() {
+                Some((done, total)) => {
+                    ui.monospace(format!("位置缓存 重算中 {done}/{total}"));
+                }
+                None => {
+                    ui.monospace(format!("位置缓存 已算准（{} 条）", self.state.floor_cached()));
+                }
+            }
+            ui.separator();
             ui.label("播放与音频");
             ui.monospace(format!(
                 "状态   {}",
@@ -4049,30 +4089,6 @@ impl eframe::App for App {
                         "（窗口 <3s，不给 ppm）".into()
                     }
                 ));
-            }
-            ui.separator();
-            ui.label("更新广播");
-            ui.monospace(format!("已应用 {} 条", self.applied_broadcasts));
-            ui.monospace(format!("最近 {}", self.last_broadcast));
-            ui.monospace(format!("话题 {}", self.last_topics.join(", ")));
-            ui.monospace(format!("整表重建 {:.3} ms", self.last_structure_ms));
-            ui.monospace(format!(
-                "重建 整表{}/属性{}/音符{}/轨道{}",
-                self.builds_structure, self.builds_props, self.builds_notes, self.builds_tracks
-            ));
-            ui.monospace(format!(
-                "跳过 整表{}/属性{}/音符{}/轨道{}",
-                self.skipped_structure, self.skipped_props, self.skipped_notes, self.skipped_tracks
-            ));
-            // 音符位置缓存：待重算条数（0 = 全部算准）。这行是"异步补完了没有"的读数 ——
-            // 底栏那行字只在真的在补时出现，**补完就没了**，所以核对时要看这里。
-            match self.state.floor_rebuild() {
-                Some((done, total)) => {
-                    ui.monospace(format!("位置缓存 重算中 {done}/{total}"));
-                }
-                None => {
-                    ui.monospace(format!("位置缓存 已算准（{} 条）", self.state.floor_cached()));
-                }
             }
             } // Debug 工作区结束
         });
@@ -4240,6 +4256,9 @@ impl eframe::App for App {
             let out = opm_app::timeline::draw(ui, &self.state, tl_rect, self.overlay.lead_beats);
             if let Some(t) = out.seek {
                 self.state.seek(t);
+                // 同一件事的另一条入口（`seek_to` 之外）：检查器里那段"**此刻**表演"是快照，
+                // 拖时间轴时不刷它就会停在旧的一刻上 —— 而那一段的标题正是"此刻"
+                self.insp = self.build_inspector();
             }
         });
 
