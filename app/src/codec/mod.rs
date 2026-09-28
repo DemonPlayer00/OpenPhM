@@ -277,6 +277,14 @@ pub fn beat_to_triple(b: Beat) -> Value {
 
 // ---------------------------------------------------------------- 规范化
 
+/// 一条**常量**事件 `[from, to)`，值取 `v`（规范化里所有"补一段"都用它）。
+///
+/// 单独一个构造函数是为了让"补的是常量事件"这件事在所有调用点长得一样 ——
+/// 测试与保真度报告都依赖"常量"这个性质（拉长它才是无损的）。
+pub fn const_hold(from: crate::doc::Beat, to: crate::doc::Beat, v: Value) -> crate::doc::Event {
+    crate::doc::Event::new(from, to, v.clone(), v, "linear")
+}
+
 /// 轨道规范化的统计（给保真度报告用）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NormalizeStats {
@@ -288,12 +296,19 @@ pub struct NormalizeStats {
     pub extended_to_end: bool,
 }
 
-/// 把"某格式语义下的事件轨道"规范化成 opm 轨道。
+/// 把"某格式语义下的事件轨道"规范化成 opm 轨道 —— **全工程唯一的规范化规则**。
 ///
-/// 语义依据（RPE 原义）：事件之间出现空隙时**保持前一条事件的终值**（解析延拓），
-/// 重叠时后一条事件覆盖前一条；最后一个事件之后一直保持它的终值。
-/// 于是规范化就是：排序 → 丢零长度 → 相邻处把 `end` 挪到下一个 `start` →
+/// 语义依据（RPE 原义，也是**运行时求值**的口径，见 `perf::active_event`）：
+/// · **空隙**：保持前一条事件的终值（解析延拓）；
+/// · **重叠**：后一条事件从**它的起点**起覆盖前一条（前一条到此为止，起点不被挪动）；
+/// · **末尾之后**：一直保持末事件的终值。
+///
+/// 于是规范化就是：排序 → 丢零长度 → 相邻处把**前一条的 `end`** 挪到下一个 `start` →
 /// 首个事件从拍 0 起（前面补一条常量事件）→ 末事件延拓到谱面结束。
+///
+/// **保值**是硬要求：一条**斜坡**事件（起值 ≠ 终值）被拉长会把斜率改掉 ——
+/// 那等于"重新加载之后谱面动得更慢"。所以延长只对**常量**事件直接改 `end`，
+/// 斜坡一律"原样 + 追加一条常量事件"（值取它的终值）。空隙与末尾延拓都走这条规则。
 ///
 /// `ptr` 是给报告用的 JSON 指针前缀（例如 `/judgeLineList[0].eventLayers[1].moveXEvents`）。
 pub fn normalize_track(
@@ -314,17 +329,32 @@ pub fn normalize_track(
 
     let mut out: Vec<crate::doc::Event> = Vec::with_capacity(events.len() + 1);
     for e in events {
-        if let Some(prev) = out.last_mut() {
+        let ns = e.start.to_f64();
+        // 上一条要止于哪里 —— 常量事件直接改 `end`（无损），斜坡要保住它**到该点为止的值**
+        if let Some(prev) = out.last().cloned() {
             let pe = prev.end.to_f64();
-            let ns = e.start.to_f64();
             if (ns - pe).abs() > 1e-9 {
                 if ns > pe {
+                    // 空隙：**前值延拓**到后一条的起点。拉长常量事件无损；
+                    // 斜坡拉长会把斜率改掉（= "重载之后谱面变慢"），所以补一条常量段
                     st.gaps += 1;
+                    if prev.start_value == prev.end_value {
+                        out.last_mut().expect("刚读过 last").end = e.start;
+                    } else {
+                        out.push(const_hold(prev.end, e.start, prev.end_value.clone()));
+                    }
                 } else {
+                    // 重叠：前一条止于后一条的起点，**并把终值改成它在该点的值**
+                    // （同一条斜坡在更短的跨度上重新插值会把斜率改掉）
                     st.overlaps += 1;
+                    let cut = serde_json::json!(crate::perf::event_value(&prev, ns));
+                    let trimmed = out.last_mut().expect("刚读过 last");
+                    trimmed.end = e.start;
+                    trimmed.end_value = cut;
+                    if trimmed.end <= trimmed.start {
+                        out.pop(); // 裁成零长度 ⇒ 丢掉（opm 不允许零长度事件）
+                    }
                 }
-                // 空隙：前值延拓到后一条的起点；重叠：裁到后一条的起点
-                prev.end = e.start;
             }
         }
         out.push(e);
@@ -332,23 +362,20 @@ pub fn normalize_track(
     // 首事件必须从拍 0（或更早）起：前面补一条常量事件，避免"谱面开头没有事件"
     if let Some(first) = out.first().cloned() {
         if first.start > Beat::zero() {
-            let hold = crate::doc::Event::new(
-                Beat::zero(),
-                first.start,
-                first.start_value.clone(),
-                first.start_value.clone(),
-                "linear",
-            );
+            let hold = const_hold(Beat::zero(), first.start, first.start_value.clone());
             out.insert(0, hold);
             st.prepended = true;
         }
     }
-    // 末事件延拓到谱面结束（否则官谱语义下会"谱面停顿"，校验器报错）
-    if let Some(last) = out.last_mut() {
-        if last.end < chart_end {
-            last.end = chart_end;
-            st.extended_to_end = true;
+    // 末事件延拓到谱面结束（否则官谱语义下会"谱面停顿"，校验器报错）—— 同样要**保值**
+    if out.last().is_some_and(|last| last.end < chart_end) {
+        let last = out.last().cloned().expect("刚判过非空");
+        if last.start_value == last.end_value {
+            out.last_mut().expect("刚判过非空").end = chart_end;
+        } else {
+            out.push(const_hold(last.end, chart_end, last.end_value.clone()));
         }
+        st.extended_to_end = true;
     }
 
     if st.dropped > 0 {

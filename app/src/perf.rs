@@ -254,27 +254,36 @@ fn as_f64(v: &Value) -> Option<f64> {
     }
 }
 
+/// **拍 `beat` 处生效的是哪条事件** —— 起点**不晚于** `beat` 的最后一条（`events` 按起点升序）。
+///
+/// 这一条是"运行时预览"与"重新加载之后的预览"必须一致的地方，规则直接取自导入侧的
+/// `codec::normalize_track`（排序 → 重叠时**保留后一条事件的起点** → 末事件延拓到谱尾）：
+///
+/// · **重叠**：后一条从它的起点起生效，前一条到此为止 —— 于是"往一条长事件里再放一条"
+///   立刻见效，不必重新加载（用户报的正是这个：安放第二个变速事件要重载才有变化）；
+/// · **空隙**：最后一条起点 ≤ `beat` 的事件仍生效，取值**夹在它自己的终点上**（= 前值延拓）；
+/// · **末尾之后**：同上，末事件的终值一直保持到谱尾（`normalize` 会把它延拓到谱尾）。
+///
+/// 返回 `None` 只在"`beat` 早于第一条事件"时发生 —— 调用方按"取首条的起始值"处理。
+pub fn active_event(events: &[Event], beat: f64) -> Option<usize> {
+    let i = events.partition_point(|e| e.start.to_f64() <= beat + 1e-12);
+    i.checked_sub(1)
+}
+
 /// 在给定**拍**处对一条事件轨道求值（用事件自己的缓动，不是线性插值）。
 ///
-/// 轨道不变量（无空隙无重叠）由 `set_track_constant`/`normalize` 保证；
-/// 这里对空隙/越界的处理是"取最近端点的值"，让编辑器不会因为半成品数据算不出东西。
+/// 生效的是 [`active_event`]（起点最晚且不晚于 `beat` 的那条），取值由 `event_value` 把
+/// `t` 夹到 `[0,1]` —— 于是"空隙里保持前值""末尾之后保持终值"自然成立，
+/// 而**重叠时后一条说了算**（与重新加载后 `normalize` 的结果一致）。
 pub fn eval_events(events: &[Event], beat: f64) -> Option<f64> {
     if events.is_empty() {
         return None;
     }
-    for e in events {
-        let (a, b) = (e.start.to_f64(), e.end.to_f64());
-        if beat >= a && beat <= b {
-            return Some(event_value(e, beat));
-        }
+    match active_event(events, beat) {
+        Some(i) => Some(event_value(&events[i], beat)),
+        // 第一条事件之前：取它的起始值（`normalize` 会在这里补一条常量事件，值相同）
+        None => as_f64(&events[0].start_value).or(Some(0.0)),
     }
-    // 不在任何事件里 —— **保持**最近一条事件的值，而不是"跳到最后一个事件"。
-    //
-    // 这里修的是一个会让判定线自己动的 bug：事件之间留了空隙时（比如 [0,10] 与 [20,30]），
-    // 拍 15 之前会走到下面 `beat >= events[0].start` 的分支，返回**最后一条事件的终值** ——
-    // 于是线在空隙里直接跳到终值，正是用户说的"某时间没有事件却移动了判定线"。
-    // 正确语义是"保持"：空隙里维持**前一条事件的终值**（首个事件之前则取它的起始值）。
-    held_value(events, beat).or_else(|| as_f64(&events[0].start_value)).or(Some(0.0))
 }
 
 /// 单条事件在拍 `beat` 处的值（按它自己的缓动）。
@@ -323,22 +332,11 @@ pub fn speed_value(e: &Event, beat: f64) -> f64 {
 /// 谁要是直接调 `eval_events`，同一时刻就会显示两个不同的流速。
 pub fn track_value(track: &str, events: &[Event], beat: f64) -> Option<f64> {
     if track == "speed" {
-        let e = events.iter().find(|e| beat >= e.start.to_f64() && beat <= e.end.to_f64())?;
-        Some(speed_value(e, beat))
+        let i = active_event(events, beat)?;
+        Some(speed_value(&events[i], beat))
     } else {
         eval_events(events, beat)
     }
-}
-
-/// 空隙里"保持"的值：上一条已结束事件的终值（首条之前没有 ⇒ `None`）
-fn held_value(events: &[Event], beat: f64) -> Option<f64> {
-    let mut held: Option<f64> = None;
-    for e in events {
-        if e.end.to_f64() <= beat {
-            held = as_f64(&e.end_value).or(held);
-        }
-    }
-    held
 }
 
 // ---------------------------------------------------------------- 流速（RPE 的 floor position）
@@ -379,8 +377,23 @@ pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64
         return (to_sec - from_sec) * SPEED_DEFAULT * SPEED_UNITS_PER_SEC;
     }
     let b_from = tmap.beat(from_sec);
-    let idx = events.partition_point(|e| e.end.to_f64() <= b_from);
-    let (_, _, acc) = integrate_until(events, tmap, idx, b_from, 0.0, tmap.beat(to_sec));
+    let b_to = tmap.beat(to_sec);
+    // 与检查点表**同一份分段**（`speed_segments`），只是这里顺着走一遍现算
+    let segs = speed_segments(events, tmap, b_to);
+    let mut acc = 0.0;
+    for (k, (a, seg)) in segs.iter().enumerate() {
+        let Some(next) = segs.get(k + 1).map(|(b, _)| *b) else {
+            break;
+        };
+        let lo = a.max(b_from);
+        let hi = next.min(b_to); // 最后一段可能伸出 `b_to` ⇒ 上界要夹住
+        if hi > lo {
+            acc += integrate_seg(tmap, events, seg, lo, hi);
+        }
+        if next >= b_to {
+            break;
+        }
+    }
     // 积分出来的 `acc` 是 `∫v dτ`（流速单位 × 秒）；换算成 RPE y 单位只在这里与
     // `SpeedTable::h_at_hinted` 两处乘法里发生
     acc * SPEED_UNITS_PER_SEC
@@ -427,115 +440,50 @@ impl SpeedSeg {
     }
 }
 
-/// 位置 `at_beat`、下一条还没走完的事件是 `events[idx]` 时，**这一段**怎么求值。
+/// 拍 `beat` 处**生效的那一段**：起点不晚于 `beat` 的最后一条事件（[`active_event`]）；
+/// 一条都没有（`beat` 早于首条）⇒ 保持首条的起始值。
 ///
-/// 判断只此一份：整条走一遍（[`walk_speed`]）与"从检查点往前外推"（[`SpeedTable`]）都从它拿值，
-/// 段怎么切才不会在两处慢慢分家。
-fn seg_at(events: &[Event], idx: usize, at_beat: f64) -> SpeedSeg {
-    match events.get(idx) {
-        // 事件覆盖着当前位置：值走它的缓动，段尾就是它的终点
-        Some(e) if e.start.to_f64() <= at_beat => SpeedSeg::Eased(idx),
-        // 空隙（或在首条事件之前）：保持"上一条的终值"（首条之前取它的起始值）
-        ev => SpeedSeg::Hold(
-            held_value(&events[..idx], at_beat)
-                .or_else(|| ev.and_then(|e| as_f64(&e.start_value)))
-                .unwrap_or(SPEED_DEFAULT),
+/// 与 [`eval_events`] 是同一条规则 —— 流速积分与事件求值**不能各有一套"谁生效"**，
+/// 否则预览里"线在哪"与"音符在哪"会来自两个不同的解释。
+fn active_speed_seg(events: &[Event], beat: f64) -> SpeedSeg {
+    match active_event(events, beat) {
+        Some(i) => SpeedSeg::Eased(i),
+        None => SpeedSeg::Hold(
+            events.first().and_then(|e| as_f64(&e.start_value)).unwrap_or(SPEED_DEFAULT),
         ),
     }
 }
 
-/// 流速积分的**唯一走法**：从 `(idx, at_beat, acc)` 一路积到 `b_to`。
+/// 流速轨的**分段表示**（唯一表示）：切点 = **事件起点 ∪ 事件终点 ∪ BPM 段起点**，
+/// 逐段给出那一段的流速来源。返回 `(段起点拍, 该段怎么求值)`，**按拍升序**，
+/// 最后一段一直延伸到查询的终点。
 ///
-/// `acc` 的单位是"流速单位 × 秒"（换算成 RPE y 单位只在 [`speed_travel`] 与 [`SpeedTable::build`]
-/// 两处乘 120）。每走到一段就回调一次 `on_seg(段起点拍, 段起点处的 acc, 这一段怎么求值)` ——
-/// [`SpeedTable`] 靠它记检查点，其余调用方传一个空闭包。
+/// 为什么这么切：段内"哪条事件生效"不变（[`active_event`] 只会在事件起点处换人），
+/// 值函数在秒域是线性的（事件线性 + 段内 BPM 不变）⇒ [`integrate_seg`] 的闭式是**精确值**。
+/// 事件终点也是切点：过了终点之后取值夹在终值上（= "前值延拓"，与 `normalize` 一致）。
 ///
-/// 切点：**事件边界**（段的划分）与 **BPM 段起点**（闭式积分只对"秒域线性"成立）。
-/// 段内积分见 [`integrate_seg`] —— 流速只按线性 ⇒ 那个式子是精确值，没有采样误差。
-fn walk_speed(
-    events: &[Event],
-    tmap: &TimeMap,
-    mut idx: usize,
-    mut at_beat: f64,
-    mut acc: f64,
-    b_to: f64,
-    mut on_seg: impl FnMut(f64, f64, SpeedSeg),
-) -> (usize, f64, f64) {
-    while at_beat < b_to {
-        let ev = events.get(idx);
-        let seg = seg_at(events, idx, at_beat);
-        on_seg(at_beat, acc, seg);
-        // 这一段到哪里为止：事件段到事件终点，空隙段到下一条事件的**起点**（没有下一条就到底）。
-        // `consumed` 区分两种"走到 seg_end"：事件段走完才换下一条事件；
-        // 空隙段走完时 `events[idx]` **还没被用过**（它正好从 `seg_end` 开始）⇒ idx 不许前进。
-        //
-        // 踩过的坑：早先两种情况一起 `idx += 1`，于是**空隙之后的那条事件被整条跳过** ——
-        // 积分在空隙之后永远保持空隙前的值（谱面里只要有一个空隙，后面全错）。
-        // 是 `tests/lines.rs` 里那条"独立基准对账"（直接积分 vs 前缀积分）把它抓出来的。
-        let (seg_end, consumed) = match (ev, &seg) {
-            (Some(e), SpeedSeg::Eased(_)) => (e.end.to_f64(), true),
-            (Some(e), _) => (e.start.to_f64(), false),
-            (None, _) => (b_to, false),
-        };
-        // 这一段到哪里为止：段尾 / `b_to` / **下一个 BPM 段的起点**，取最近的那个。
-        // BPM 变化处必须切开（闭式积分只对"秒域线性"成立，见 `TimeMap::next_seg_start`）。
-        // `max(at_beat)`：病态输入（后一条事件整条包在前一条里）下 `seg_end` 会落在身后，
-        // 夹一下保证这一步**永远向前**（走法单调 ⇒ 不会原地打转，也不会重复积分）
-        let bpm_cut = tmap.next_seg_start(at_beat).unwrap_or(f64::INFINITY);
-        let prev = at_beat;
-        let stop = seg_end.min(b_to).min(bpm_cut).max(at_beat);
-        acc += integrate_seg(tmap, events, &seg, at_beat, stop);
-        at_beat = stop;
-        if stop >= b_to - 1e-12 {
-            break; // 到目标了
-        }
-        if stop >= seg_end - 1e-12 {
-            if consumed {
-                idx += 1; // 事件段走完 ⇒ 换下一条
-                continue;
-            }
-            if ev.is_none() {
-                break; // 末尾之后：`held` 一直保持，只有 `b_to` 能叫停
-            }
-            // 空隙走完（`stop == ev.start`）：**idx 不动**，继续下一轮 ——
-            // 那时 `seg_at` 看到 `start <= at_beat`，这条事件就成了当前段
-            // （这里必须 `continue`：`stop` 与 `at_beat` 此刻正好相等，落到下面那道
-            //  "没前进就收手"的守卫上会把走法**停在这里**，于是表里缺了这一段之后的切点）
-            continue;
-        }
-        if stop <= prev {
-            break; // **相对上一轮**没前进（零长段 / 病态输入）⇒ 收手，别打转
-        }
+/// 有了它，[`speed_travel`]（现积）与 [`SpeedTable`]（检查点）走的是**同一份分段**，
+/// 原先那套"带着 idx 一段段往前挪"的走法（以及它在空隙/重叠上的三个 bug）整块删掉。
+fn speed_segments(events: &[Event], tmap: &TimeMap, b_to: f64) -> Vec<(f64, SpeedSeg)> {
+    let b0 = tmap.beat(0.0);
+    let mut cuts: Vec<f64> = vec![b0, b_to];
+    for e in events {
+        cuts.push(e.start.to_f64());
+        cuts.push(e.end.to_f64());
     }
-    (idx, at_beat, acc)
-}
-
-/// 同 [`walk_speed`]，但不记检查点（返回新的 `(idx, at_beat, acc)`）
-fn integrate_until(
-    events: &[Event],
-    tmap: &TimeMap,
-    idx: usize,
-    at_beat: f64,
-    acc: f64,
-    b_to: f64,
-) -> (usize, f64, f64) {
-    walk_speed(events, tmap, idx, at_beat, acc, b_to, |_, _, _| {})
-}
-
-/// 在**一段之内**从 `b_from` 积到 `b_to`，遇到 BPM 段起点就切开。
-///
-/// 闭式积分只对"流速在**秒域**上线性"成立，而 BPM 变化处拍↔秒折了一下 ——
-/// 查表路径（[`SpeedTable::h_at_hinted`]）的"段内余下那一小截"也必须按 BPM 切开，
-/// 否则表与"从 0 整条走一遍"就会在 BPM 变化点上分家（实测：差 24 单位）。
-fn integrate_span(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
-    let mut acc = 0.0;
-    let mut from = b_from;
-    while from < b_to {
-        let stop = tmap.next_seg_start(from).map_or(b_to, |c| c.min(b_to));
-        acc += integrate_seg(tmap, events, seg, from, stop);
-        from = stop;
+    // BPM 段起点：闭式积分只对"秒域线性"成立，BPM 一变拍↔秒就折了
+    let mut bpm = tmap.next_seg_start(b0);
+    while let Some(b) = bpm {
+        if b >= b_to {
+            break;
+        }
+        cuts.push(b);
+        bpm = tmap.next_seg_start(b);
     }
-    acc
+    cuts.retain(|c| c.is_finite());
+    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    cuts.into_iter().map(|c| (c, active_speed_seg(events, c))).collect()
 }
 
 /// 一段的积分：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt`。
@@ -584,14 +532,14 @@ impl SpeedTable {
     /// 最后一段之后不再有点：查表时用最后一段的求值方式外推（末尾之后是"保持"，
     /// 而事件段之后 `event_value` 自己就夹在终点值上 —— 与走一遍的语义一致）。
     pub fn build(events: &[Event], tmap: &TimeMap, b_end: f64) -> Self {
-        let at0 = tmap.beat(0.0);
-        let mut cuts: Vec<(f64, f64, SpeedSeg)> = Vec::new();
-        walk_speed(events, tmap, 0, at0, 0.0, b_end, |beat, acc, seg| {
-            cuts.push((beat, acc * SPEED_UNITS_PER_SEC, seg));
-        });
-        if cuts.is_empty() {
-            // 谱面长度为 0 的退化情形（走不进循环）：补第一段，照样能外推 —— 别 panic
-            cuts.push((at0, 0.0, seg_at(events, 0, at0)));
+        let segs = speed_segments(events, tmap, b_end);
+        let mut cuts: Vec<(f64, f64, SpeedSeg)> = Vec::with_capacity(segs.len());
+        let mut acc = 0.0; // `∫v dτ`（流速单位 × 秒）
+        for (k, (beat, seg)) in segs.iter().enumerate() {
+            cuts.push((*beat, acc * SPEED_UNITS_PER_SEC, *seg));
+            if let Some(next) = segs.get(k + 1).map(|(b, _)| *b) {
+                acc += integrate_seg(tmap, events, seg, *beat, next);
+            }
         }
         Self { cuts }
     }
@@ -614,10 +562,11 @@ impl SpeedTable {
         let i = self.seg_index(b, hint);
         let Some(&(beat, h, seg)) = self.cuts.get(i) else {
             // 表还没建（这条线是从 `line_shell` 造出来的、事件轨道还是空的）：
-            // 退回直接积分。两条路径的值相同（共用走法与段内积分），只是慢。
+            // 退回直接积分。两条路径的值相同（共用分段与段内积分），只是慢。
             return (speed_travel(events, tmap, 0.0, sec), 0);
         };
-        (h + integrate_span(tmap, events, &seg, beat, b) * SPEED_UNITS_PER_SEC, i)
+        // `[cut.beat, b]` 落在**一段之内**（BPM 段起点也是切点）⇒ 一次闭式就够
+        (h + integrate_seg(tmap, events, &seg, beat, b) * SPEED_UNITS_PER_SEC, i)
     }
 
     /// `beat` 落在第几段：`hint` 命中就 O(1)（升序查询的顺序），否则二分
@@ -878,6 +827,76 @@ mod speed_tests {
         assert!(speed_travel(&events, &tmap, 1.0, 1.5).abs() < 1e-6);
     }
 
+    /// **重叠的事件：起点最晚的那条生效**（与导入侧 `normalize_track` 的"裁重叠"同一条规则）。
+    ///
+    /// 用户报的 bug：运行中往一条长事件里再放一条速度事件，"和没放一样，得重新加载才有变化"。
+    /// 原因是求值取的是**第一条覆盖它的事件**（长条），而重新加载时 `normalize` 会把长条裁到
+    /// 后一条的起点 ⇒ 两条路给出两个结果。现在两处都是"起点最晚者赢"。
+    #[test]
+    fn overlapping_events_keep_the_later_start() {
+        let tmap = tmap120();
+        let events = vec![ev(0.0, 64.0, 10.0, 10.0), ev(4.0, 8.0, 30.0, 30.0)];
+        // 拍 2 在长条里 ⇒ 10；拍 6 已被后一条接管 ⇒ 30；**过了后一条的终点也还是 30**
+        // （`normalize` 会把末事件延拓到谱尾，而不是让长条"复活"）
+        assert_eq!(eval_events(&events, 2.0), Some(10.0));
+        assert_eq!(eval_events(&events, 6.0), Some(30.0));
+        assert_eq!(eval_events(&events, 20.0), Some(30.0));
+        assert_eq!(active_event(&events, 6.0), Some(1));
+        // 积分同样：H 与"规范化之后的轨道"必须逐点相同
+        let normalized = crate::codec::normalize_track(
+            events.clone(),
+            Beat::new(64, 1),
+            "/x",
+            &mut crate::codec::Fidelity::new("test", "v1".into()),
+        )
+        .0;
+        for k in 0..=200 {
+            let sec = k as f64 * 0.1;
+            let (a, b) = (
+                speed_travel(&events, &tmap, 0.0, sec),
+                speed_travel(&normalized, &tmap, 0.0, sec),
+            );
+            // 两条路的分段不同 ⇒ 只差浮点累加顺序（实测 ~4e-12）
+            assert!((a - b).abs() < 1e-6, "t={sec}：原始 {a} ≠ 规范化 {b}");
+        }
+    }
+
+    /// **空隙 / 重叠 / 末事件之后的取值，运行时求值 = 规范化之后的求值**（"不用重新加载"的总断言）
+    #[test]
+    fn raw_and_normalized_tracks_evaluate_the_same() {
+        let shapes: Vec<Vec<Event>> = vec![
+            // 重叠：后一条插在长条中间
+            vec![ev(0.0, 16.0, 10.0, 10.0), ev(4.0, 8.0, 30.0, 30.0)],
+            // 空隙：0~2 与 4~6 之间空一段
+            vec![ev(0.0, 2.0, 4.0, 4.0), ev(4.0, 6.0, 0.0, 0.0)],
+            // 首条晚于拍 0
+            vec![ev(2.0, 6.0, 3.0, 9.0)],
+            // 末条早于谱尾 + 斜坡
+            vec![ev(0.0, 4.0, 0.0, 10.0), ev(4.0, 6.0, 10.0, 0.0)],
+        ];
+        for events in shapes {
+            let normalized = crate::codec::normalize_track(
+                events.clone(),
+                Beat::new(32, 1),
+                "/x",
+                &mut crate::codec::Fidelity::new("test", "v1".into()),
+            )
+            .0;
+            for k in 0..=400 {
+                let beat = k as f64 * 0.1;
+                let (a, b) = (eval_events(&events, beat), eval_events(&normalized, beat));
+                match (a, b) {
+                    (Some(x), Some(y)) => assert!(
+                        (x - y).abs() < 1e-9,
+                        "拍 {beat}：原始 {x} ≠ 规范化 {y}（事件 {events:?}）"
+                    ),
+                    (None, None) => {}
+                    _ => panic!("拍 {beat}：一条给 {a:?}、另一条给 {b:?}"),
+                }
+            }
+        }
+    }
+
     /// **流速事件只按线性取**：`easing` 字段被忽略，且闭式积分是**精确值**（无抽样误差）。
     ///
     /// 记一条 `outElastic` 的流速事件，`H` 必须与记成 `linear` 的**一模一样**。
@@ -1040,4 +1059,5 @@ mod speed_tests {
         assert_eq!(table.h_at(&events, &tmap, 0.0), 0.0);
     }
 }
+
 

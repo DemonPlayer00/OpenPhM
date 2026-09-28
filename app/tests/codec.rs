@@ -192,12 +192,17 @@ fn tracks_are_normalized_on_import() {
             }
         }
     }
-    // 层 2 的零长度事件（[6,6]）被丢掉：首事件本来就在拍 0，所以没有补位，只剩一条并延拓到谱末
+    // 层 2：零长度事件（[6,6]）被丢掉，留下一条**斜坡**（0..4，inOutQuad）——
+    // 它**不能被拉长**（拉长会把斜率改掉 = "重载之后谱面变慢"），所以延拓是**另加一条常量段**
     let mx2 = &line.layers[2].move_x;
-    assert_eq!(mx2.len(), 1, "零长度事件丢弃后只剩一条");
+    assert_eq!(mx2.len(), 2, "原斜坡 + 一条常量延拓段");
     assert_eq!(mx2[0].start.to_f64(), 0.0);
-    assert_eq!(mx2[0].end, chart_end, "唯一的末事件要延拓到谱面结束");
+    assert_eq!(mx2[0].end.to_f64(), 4.0, "原斜坡的跨度不动");
     assert_eq!(mx2[0].easing, "inOutQuad", "留下的那条仍是原事件（缓动没被换掉）");
+    assert_eq!(mx2[1].start, mx2[0].end, "延拓段紧随其后（无空隙）");
+    assert_eq!(mx2[1].end, chart_end, "延拓段覆盖到谱面结束");
+    assert_eq!(mx2[1].start_value, mx2[1].end_value, "延拓段是常量");
+    assert_eq!(mx2[1].start_value, mx2[0].end_value, "值取原事件的终值（解析延拓）");
 }
 
 /// **导入 → 导出 → 再导入**：建模过的部分必须逐字段相同（这是"保存/加载"的底线）
@@ -219,12 +224,19 @@ fn rpe_roundtrip_preserves_modeled_data() {
         .find(|e| e["start"].as_f64() == Some(200.0))
         .expect("导出里应能找到 start=200 的那条");
     assert_eq!(e200["startTime"], json!([10, 0, 1]), "10 拍应写成三元组");
-    // 它的 endTime 已被规范化延拓到**谱面结束**（最后一个音符在拍 24），不是原来的 12
+    // **斜坡的跨度不动**：延拓是把"末事件之后"补成一条常量段，而不是把它拉长
+    // （拉长 = 改斜率 = 重新加载之后谱面动得更慢）
+    assert_eq!(e200["endTime"], json!([12, 0, 1]), "斜坡事件保持它自己的跨度");
+    let tail = mx
+        .iter()
+        .find(|e| e["startTime"] == json!([12, 0, 1]))
+        .expect("规范化为给它补了一条常量延拓段");
     assert_eq!(
-        e200["endTime"],
+        tail["endTime"],
         codec::beat_to_triple(rpe::chart_end(&doc1)),
-        "末事件应延拓到谱面结束"
+        "延拓段覆盖到谱面结束"
     );
+    assert_eq!(tail["start"].as_f64(), Some(300.0), "延拓段的值 = 原斜坡的终值");
     assert!(mx[0]["startTime"].is_array(), "补位事件也是三元组");
     // 音符时间默认也写三元组（实测：真实 RPE 谱面里 2591 个音符时间全是整数数组），
     // 这样 37+1/3 这种分母为 3 的时间才是**精确**的 —— 走浮点会退化成 37333333/1000000
@@ -442,3 +454,4 @@ fn load_into_broadcasts_all_topics() {
     assert!(core.last_fidelity().map(|f| !f.is_lossless()).unwrap_or(false));
     std::fs::remove_dir_all(&dir).ok();
 }
+

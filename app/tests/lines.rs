@@ -1577,3 +1577,83 @@ fn a_note_inside_the_window_is_drawn_even_when_the_flow_speed_changes_sign() {
     // 播放头 0.6 秒：H(0.6) = 720 ⇒ 偏移 −120（判定线**之下**）⇒ 按规则②不画
     assert!(at(&mut st, 0.6).is_none(), "判定线之下的音符不该被画出来");
 }
+
+/// **运行中安放第二个变速事件必须立刻见效**（用户报："没有变化，需要重新加载才行"）。
+///
+/// 场景就是他做的：谱面上已经有一条**覆盖全谱**的变速事件，再往里放一条 ——
+/// 两条**重叠**。运行时的求值原本取"第一条覆盖它的事件"（长条），而重新加载时
+/// `normalize` 会把长条**裁到后一条的起点** ⇒ 两条路给出两个结果，于是"重载才有变化"。
+/// 现在两处都是"**起点最晚的那条生效**"（`perf::active_event`）。
+#[test]
+fn placing_a_second_speed_event_takes_effect_without_reloading() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    let beat = |b: f64| Beat::new((b * 4.0).round() as i64, 4);
+    // 初始：整条轨道一条常量 0.5（时长很长，覆盖全谱）
+    l.layers[0].track_mut("speed").unwrap().push(Event::new(
+        beat(0.0),
+        beat(64.0),
+        json!(0.5),
+        json!(0.5),
+        "linear",
+    ));
+    l.notes.push(DocNote::new(DocKind::Tap, beat(5.0), 0.0)); // 2.5 秒
+    let doc0 = {
+        let mut d = doc.clone();
+        d.judge_lines.push(l.clone());
+        d
+    };
+
+    let mut st = EditorState::new(chart_from_doc(&doc0));
+    st.selected_line = usize::MAX;
+    let y_at = |st: &mut EditorState, t: f64| -> Option<f32> {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(st, &mut inst);
+        inst.iter()
+            .find(|q| {
+                let c = q.color();
+                (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
+            })
+            .map(|q| q.center()[1])
+    };
+    // 初始：2.5 秒 × 0.5 流速 × 120 = 150
+    let before = y_at(&mut st, 0.0).expect("初始那颗音符该在窗口里");
+    assert!((before - 150.0).abs() < 1.0, "初始应在 150，实际 {before}");
+
+    // 运行中"安放第二个变速事件"：2~4 秒（4~8 拍）流速 2 —— 与长条**重叠**。
+    // 这条命令就是编辑区按键放置发的 `add_event`。
+    let mut doc1 = doc0.clone();
+    doc1.judge_lines[0].layers[0].track_mut("speed").unwrap().push(Event::new(
+        beat(4.0),
+        beat(8.0),
+        json!(2.0),
+        json!(2.0),
+        "linear",
+    ));
+    // GUI 的局部重建路径：`tracks_of` → `Line::set_tracks`
+    let tmap = st.chart.tmap.clone();
+    let tracks = tracks_of(&doc1, 0, &tmap);
+    st.chart.lines[0].set_tracks(tracks, &tmap);
+
+    // 期望：0~2 秒 0.5、2~2.5 秒 2 ⇒ 120 + 120 = 240（**不重新加载就该变**）
+    let after = y_at(&mut st, 0.0).expect("安放之后那颗音符仍该在窗口里");
+    assert!(
+        (after - 240.0).abs() < 1.0,
+        "安放第二个变速事件之后应在 240（0.5×2s + 2×0.5s），实际 {after} —— 这就是「要重新加载才有变化」"
+    );
+    // 与"从头加载这份改过的谱面"完全一致（= 重载语义）
+    let mut fresh = EditorState::new(chart_from_doc(&doc1));
+    fresh.selected_line = usize::MAX;
+    let fresh_y = y_at(&mut fresh, 0.0).expect("重载之后那颗音符该在窗口里");
+    assert!(
+        (fresh_y - after).abs() < 1e-3,
+        "运行中安放的结果必须与重新加载一致：{after} vs {fresh_y}"
+    );
+}

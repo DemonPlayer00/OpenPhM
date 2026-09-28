@@ -4210,3 +4210,57 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
 
 - 证据：`artifacts/speed-easing-linear-only.png`；RPE 导入报告实测输出
   「⚠ 流速事件的缓动：共 1 处（首次于 …speedEvents[0]）—— opm 的流速事件只按 linear 求值…」。
+
+## 7.74 事件重叠：运行时的预览必须等于"重新加载之后"（用户报"安放第二个变速事件要重载才行"）（2026-09-28）
+
+用户原话：「发现在运行时安放第二个变速事件没有变化，需要重新加载才行。检查原因」。
+
+### 复现与定案
+
+按他的操作复刻：谱面上先有一条**覆盖全谱**的变速事件（`set_track_constant` 造的），
+再往里"安放第二个"（编辑区按键放置 = `add_event`）—— 两条**重叠**，
+冲突浏览器红着提示「⚠ 1 处事件重叠」，而**预览一点没变**（`--ws perform --overlay off` 逐字节比对：
+安放与不安放两张截图**完全相同**）。重载之后就对了。
+
+⇒ 病灶：**同一件事有两套"谁生效"的规则**
+
+| 路径 | 规则 | 结果 |
+|---|---|---|
+| 运行时求值（`eval_events`） | **第一条覆盖它的事件** | 长条 A[0,64] 一直赢，B[4,8] 完全不生效 |
+| 重新加载（`codec::normalize_track`） | **裁前一条到后一条的起点** | A 变成 [0,4]，B 生效 |
+
+而**重载**之所以"看起来是对的"，是因为导入侧的规范化会裁掉重叠 —— 于是"重载才有变化"。
+
+### 修法：一条规则，三处共用
+
+1. `perf::active_event(events, beat)` —— **起点 ≤ beat 的最后一条**（二分）。
+   它与 `normalize_track` 的规则逐条对应：重叠（后一条从它的起点起）✔、
+   空隙（最后一条仍生效，取值夹在它自己的终点上 = 前值延拓）✔、末尾之后（同上）✔。
+   `eval_events` 与流速积分的 `active_speed_seg` 都改走它。
+2. **求值入口收敛**：`perf::track_value(track, events, beat)` 是"哪条轨道用哪种求值"的唯一判断处，
+   而"谁生效"只有 `active_event` 一处 —— 树/检查器/时间轴/`lines`/新建事件取值全走它。
+3. **`normalize` 命令**（`core.rs`）删掉自己那份实现（它把**后一条挪到前一条的终点**，
+   与导入侧**相反**！），改成调用 `codec::normalize_track` —— 少 40 行重复逻辑，
+   而且"刚放好的事件不会被挪走"。
+4. **规范化改成保值**：延长只对**常量**事件直接改 `end`（无损、不新增事件）；
+   **斜坡**一律"原样 + 追加一条常量段"（拉长会改斜率 —— 那正是"重载之后谱面动得更慢"）。
+   空隙补齐同理；重叠裁剪时前一条的 `end_value` 也改成它在该点的值。
+
+### 验收
+
+- `perf::overlapping_events_keep_the_later_start`（手算：拍 2 走 A、拍 6 与拍 20 都走 B）
+  以及它与 `normalize_track` 结果的 H **逐点一致**；
+- `perf::raw_and_normalized_tracks_evaluate_the_same`：四种形状（重叠/空隙/首条晚于拍 0/末条早于谱尾），
+  原始轨道与规范化之后的轨道在 401 个拍点上求值相同 —— **这就是"不用重新加载"的总断言**；
+- `tests/lines.rs::placing_a_second_speed_event_takes_effect_without_reloading`：
+  0.5 流速的谱面里安放 2.0 的第二个事件 ⇒ 那颗音符从 **150** 走到 **240**，
+  且与"从头加载改过的谱面"逐位一致；
+- `core::tests::normalize_command_keeps_the_later_events_start`：
+  命令之后后一条仍在第 4 拍起、前一条被裁到 4 拍、无空隙无重叠；
+- 证据：`artifacts/speed-event-placed-ignored-before-fix.png` ↔ `speed-event-placed-runtime.png`。
+
+### 教训
+
+**"同一件事有两份实现"这次的表现是"同一个 bug 的三种形态"**：运行时一套、导入一套、命令一套。
+修的时候要顺手把**命令那份也收敛到唯一实现**，否则下一次用户会在 `normalize` 上再撞一次。
+另外：规范化必须**保值** —— "延拓"听起来无害，但对斜坡就是改斜率，而斜率就是谱面的手感。

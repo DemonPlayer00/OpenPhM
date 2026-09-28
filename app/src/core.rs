@@ -1965,6 +1965,13 @@ impl EditCore {
                 Ok(json!({"line": line_idx, "value": value, "span": [0.0, end.to_f64()]}))
             }
             "normalize" => {
+                // **规范化的唯一实现在 codec**（导入侧用的就是它）：排序 → 丢零长度 →
+                // 相邻处把**前一条**的 `end` 挪到下一个 `start`（重叠时后一条的起点**不动**）→
+                // 首事件补到拍 0 → 末事件延拓到谱面结束；延长只对常量事件直接改 `end`，
+                // 斜坡一律"原样 + 追加常量段"（拉长会改斜率）。
+                //
+                // 早先这里另有一份实现，规则**与导入侧相反**（把后一条事件挪到前一条的终点）——
+                // 于是同一个 bug 有第三种表现：刚放好的事件被 `normalize` 挪走。
                 let end = add_beat(self.doc.chart_end(), Beat::new(1024, 1)).ok_or("拍数溢出")?;
                 let mut fixes = 0usize;
                 let mut touched: Vec<(usize, usize, String, Vec<Event>, Vec<Event>)> = Vec::new();
@@ -1976,28 +1983,19 @@ impl EditCore {
                                 continue;
                             }
                             let before = list.clone();
-                            let mut after = before.clone();
-                            after.sort_by(|a, b| a.start.cmp(&b.start));
-                            for i in 1..after.len() {
-                                let prev_end = after[i - 1].end;
-                                if after[i].start != prev_end {
-                                    after[i].start = prev_end;
-                                    fixes += 1;
-                                }
-                                if after[i].end <= after[i].start {
-                                    after[i].end = add_beat(after[i].start, Beat::new(1, 1)).ok_or("拍数溢出")?;
-                                    fixes += 1;
-                                }
-                            }
-                            if after[0].start > Beat::zero() {
-                                after[0].start = Beat::zero();
-                                fixes += 1;
-                            }
-                            let last = after.len() - 1;
-                            if after[last].end < end {
-                                after[last].end = end;
-                                fixes += 1;
-                            }
+                            let mut fid = codec::Fidelity::new("normalize", String::new());
+                            let (after, st) = codec::normalize_track(
+                                before.clone(),
+                                end,
+                                &format!("/judgeLines[{li}].layers[{yi}].{track}"),
+                                &mut fid,
+                            );
+                            fixes += st.dropped
+                                + st.gaps
+                                + st.overlaps
+                                + usize::from(st.sorted)
+                                + usize::from(st.prepended)
+                                + usize::from(st.extended_to_end);
                             if after != before {
                                 touched.push((li, yi, track.to_owned(), before, after));
                             }
@@ -2013,8 +2011,7 @@ impl EditCore {
                         before,
                         after,
                     });
-                }
-                Ok(json!({"fixes": fixes, "chartEnd": self.doc.chart_end().to_f64()}))
+                }                Ok(json!({"fixes": fixes, "chartEnd": self.doc.chart_end().to_f64()}))
             }
             "set_bpm" => {
                 let index = usize_arg(c, "index")?;
@@ -2283,6 +2280,45 @@ mod tests {
         let r = c.exec(&cmd);
         assert_eq!(r["ok"], serde_json::json!(true), "命令失败：{cmd} → {r}");
         r
+    }
+
+    /// `normalize` 命令与**导入侧同一条规则**：重叠时**后一条的起点不动**，裁的是前一条；
+    /// 斜坡不被拉长（延拓是"另加一条常量段"）。
+    ///
+    /// 这条是人报的 bug 的第三种表现：早先命令的实现把**后一条挪到前一条的终点** ——
+    /// 于是"我把新事件放在第 4 拍"会被 `normalize` 悄悄挪走，而运行时预览又按另一个规则算。
+    #[test]
+    fn normalize_command_keeps_the_later_events_start() {
+        let mut c = EditCore::new();
+        // 一条长事件 [0,64] 常量 10 + 放进去的第二条 [4,8] 常量 30（重叠）
+        exec_ok(&mut c, serde_json::json!({"op": "set_track_constant", "line": 0, "track": "speed", "value": 10.0}));
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "speed",
+                               "startBeat": [4, 1], "endBeat": [8, 1],
+                               "startValue": 30.0, "endValue": 30.0, "easing": "linear"}),
+        );
+        exec_ok(&mut c, serde_json::json!({"op": "normalize"}));
+        let line = c.doc().judge_lines[0].clone();
+        let sp = &line.layers[0].speed;
+        // 规范化之后：无空隙无重叠，且**后一条仍在第 4 拍起**
+        assert!(
+            sp.windows(2).all(|w| w[0].end == w[1].start),
+            "规范化之后必须无空隙无重叠：{:?}",
+            sp.iter().map(|e| (e.start.to_f64(), e.end.to_f64())).collect::<Vec<_>>()
+        );
+        let second = sp.iter().find(|e| e.start_value == serde_json::json!(30.0)).expect("第二条还在");
+        assert_eq!(second.start.to_f64(), 4.0, "后一条事件的起点**不许被挪动**");
+        // 第一条被裁到第 4 拍（而不是把第二条推走）
+        let first = &sp[0];
+        assert_eq!(first.start.to_f64(), 0.0);
+        assert_eq!(first.end.to_f64(), 4.0, "裁的是前一条");
+        // 末事件延拓到谱尾之后（常量事件直接拉长是**无损**的；斜坡才会另加一段）
+        assert!(sp.last().unwrap().end.to_f64() > 64.0, "末事件要覆盖到谱面结束之后");
+        // 语义（值函数）不变：4 拍之前 10、之后 30
+        assert_eq!(crate::perf::eval_events(sp, 2.0), Some(10.0));
+        assert_eq!(crate::perf::eval_events(sp, 5.0), Some(30.0));
+        assert_eq!(crate::perf::eval_events(sp, 30.0), Some(30.0), "末尾之后保持末事件的终值");
     }
 
     /// **空话题的广播 = "什么都可能变了"**，必须送到每个订阅者手里。
