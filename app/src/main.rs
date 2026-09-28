@@ -96,12 +96,14 @@ fn file_badge_of(core: &core::SharedCore) -> (String, bool, bool) {
     )
 }
 
-/// 启动页（谱面列表）窗口的标题与尺寸。
+/// 启动页（谱面列表）的**标题**（尺寸与编辑页共用，见下）。
 ///
-/// **一屏一个尺寸**：启动页上的弹窗（新建谱面 / 缺少 7z）是**模态**，不再换整屏、也不再改窗口尺寸
-/// —— 换个尺寸会重建 wgpu surface，视觉上就是"切了个程序"，而弹窗只是"这一屏上的一个问题"。
+/// **两个页面共用一个窗口尺寸**（用户要求："将启动页的窗口大小调整为编辑器大小。
+/// 来回切换时不更改窗口大小"）。切换只换**标题**，不再发 `InnerSize` ——
+/// 改尺寸会重建 wgpu surface 并让整窗跳一下，而那只是"换了一屏内容"，不是换了个程序。
+///
+/// 启动页上的弹窗（新建谱面 / 缺少 7z）本来就是**模态**：底下那屏照画，尺寸更不该动。
 const LAUNCH_TITLE: &str = "OpenPhM — 选择谱面";
-const LAUNCH_SIZE: egui::Vec2 = egui::Vec2::new(980.0, 620.0);
 
 /// 启动页列表快照的最长寿命（秒）。
 ///
@@ -117,7 +119,7 @@ const STATS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// 关于"为什么不真的是两个并存窗口"：eframe 里只有根视口跑 pass（子视口都在根的 pass 里画），
 /// 关掉根 = 退出、隐藏根 = 完全不跑 pass。所以"启动窗口关掉、编辑窗口留下"这套在 eframe 里做不到；
-/// 启动页与编辑页因此是**同一个窗口的两个页面**，各自有自己的标题与尺寸。
+/// 启动页与编辑页因此是**同一个窗口的两个页面**：标题不同，**尺寸相同**（切换不发 `InnerSize`）。
 /// 启动页内部的那些问题（新建谱面、缺 7z）则是**模态**，见 `dialog`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchPhase {
@@ -460,8 +462,8 @@ fn main() -> eframe::Result<()> {
     }
 
     trace.mark("音频（--audio/谱面 meta.audio：解码 + 开输出设备）");
-    // 窗口的**初始标题与尺寸按启动阶段来**：启动页是小窗（"选择谱面"），进编辑页后再换成编辑尺寸。
-    // 启动页上的弹窗不改这两个值（模态不换屏，见 `LAUNCH_SIZE` 的注释）。
+    // 窗口**一开始就是编辑器尺寸**（两页共用），只有标题按启动阶段给：启动页是"选择谱面"，
+    // 进了编辑页再换成"曲名（文件）"（见 `enter_editor`）。
     let on_launcher = doc_arg.is_none() && !args.bench_only() && !args.stress;
     let launch_phase = if on_launcher {
         LaunchPhase::StartScreen
@@ -476,7 +478,7 @@ fn main() -> eframe::Result<()> {
             } else {
                 LAUNCH_TITLE
             },
-            LAUNCH_SIZE,
+            egui::vec2(args.width, args.height),
         ),
         LaunchPhase::Editor => ("OpenPhM", egui::vec2(args.width, args.height)),
     };
@@ -770,7 +772,7 @@ struct App {
     new_form: opm_app::recents::NewChartForm,
     /// 启动页上的「新建谱面」模态是否打开（模态不换屏：底下的列表照画，只是被压暗且吞掉输入）
     new_form_open: bool,
-    /// 待办的"回启动页并打开新建模态"（换窗口标题/尺寸要用 `Context`，只能在帧里做）。
+    /// 待办的"回启动页并打开新建模态"（换窗口标题要用 `Context`，只能在帧里做）。
     /// 编辑页的「文件 → 新建…」走这条：谱面的建立只发生在启动页（那里才有填写表信息的地方）。
     pending_launch_new: bool,
     /// 未保存守卫：有未保存改动时要执行的动作，等用户选「保存｜不保存｜返回」
@@ -2264,7 +2266,7 @@ impl App {
         }
     }
 
-    /// 处理"回启动页并摆出「新建谱面」模态"的待办（换标题与尺寸要 `Context`，只能在帧里做）。
+    /// 处理"回启动页并摆出「新建谱面」模态"的待办（换标题要 `Context`，只能在帧里做）。
     /// **启动分支与编辑页都要调** —— 启动分支早退，漏调就永远切不过去。
     fn pump_launch_new(&mut self, ctx: &egui::Context) {
         if !self.pending_launch_new {
@@ -2275,11 +2277,11 @@ impl App {
         self.new_form_open = true;
         // 回启动页 = 重新看到那份列表：顺手把快照刷新（列表内容可能已经变了）
         self.refresh_list_rows();
+        // **只换标题**：尺寸两页共用，来回切都不动窗口（用户要求）
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(LAUNCH_TITLE.to_owned()));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(LAUNCH_SIZE));
     }
 
-    /// 进编辑页：**同一个窗口**换标题与尺寸（见文件头关于 eframe 视口约束的说明）
+    /// 进编辑页：**同一个窗口**换标题（尺寸与启动页一致，刻意不动 —— 见 `LAUNCH_TITLE` 的说明）
     fn enter_editor(&mut self, ctx: &egui::Context) {
         self.phase = LaunchPhase::Editor;
         let (name, file) = {
@@ -2297,11 +2299,7 @@ impl App {
             None => format!("OpenPhM — {name}（未保存）"),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            self.args.width,
-            self.args.height,
-        )));
-        println!("  进入编辑页            : 是");
+        println!("  进入编辑页            : 是（窗口尺寸不变）");
     }
 
     /// 把统计写进共享槽（控制通道读它、调试面板显示它）。
@@ -2701,7 +2699,7 @@ impl eframe::App for App {
         }
         self.pump_launch_new(&ctx);
 
-        // **进编辑页先把整窗铺一层不透明底色**：启动页→编辑页会同时换内容与窗口尺寸，
+        // **进编辑页先把整窗铺一层不透明底色**：启动页→编辑页会换内容（尺寸不再变），
         // 而尺寸变化时 wgpu 的 surface 会重建、上一帧的像素可能还留在那里；只有面板覆盖的区域
         // 才会被重画，中央区就露馅（我截图时看到的"启动页糊在编辑页底下"就是这个）。
         // 一行底色把这件事一次性解决，也不依赖 eframe 的清屏时机。

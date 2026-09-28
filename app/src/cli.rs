@@ -358,7 +358,7 @@ OpenPhM —— Phigros 谱面编辑器（GUI）
   --autoplay            启动即播放
 
 窗口与视图
-  --width N --height N  编辑页窗口尺寸（默认 1600×900）
+  --width N --height N  窗口尺寸（启动页与编辑页**共用**，默认 1600×900）
   --scale F             像素缩放
   --pos X,Y             窗口位置提示（Wayland 下会被忽略）
   --ws compose|timeline|perform|debug   工作区预设
