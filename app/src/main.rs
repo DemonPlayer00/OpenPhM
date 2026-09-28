@@ -851,8 +851,15 @@ struct App {
     frame_log: Option<std::io::BufWriter<std::fs::File>>,
     /// 打不开就不每帧重试（路径写错时不该刷屏）
     frame_log_failed: bool,
-    /// 已经写下去的解压缓存快照次数（逐帧流水里的对照量：它一跳就是一次重活）
+    /// 已经**投出**的解压缓存快照次数（逐帧流水里的对照量：它一跳就是一次重活）
     snapshots: u64,
+    /// GUI 已经看到的**文档修订号**（广播到达时推进；`publish_stats` 每 100 ms 兜底对齐）。
+    /// 修订号是"文档变了"的权威口径 —— 每条成功的改动都会 `revision += 1` 并广播
+    /// （`EditCore::mutate` / `undo` / `redo` / `load` 都如此），`dump`/`summary` 这类查询不动它。
+    seen_rev: u64,
+    /// 已经**投出快照**的那个修订号。与 `seen_rev` 相等 ⇒ 没有新改动 ⇒ 一个字都不写
+    /// （快照的"事件驱动"就是这一条；见 [`opm_app::autosave::snapshot_due`]）
+    snapshotted_rev: u64,
     /// **快照的后台写手**：GUI 帧里只克隆文档（2~4.5 ms），序列化+落盘在别的线程
     /// （见 [`opm_app::autosave`] 与 [`App::maybe_snapshot`]）。
     autosave: opm_app::autosave::Autosave,
@@ -1068,6 +1075,8 @@ impl App {
         // 状态栏那份文档标识：**构造时算一次**（`--doc FILE` 直接进编辑页这条路径不经过
         // `sync_file_fields`，漏了就会把已载入的文件显示成"尚未保存"）
         let (file_badge, file_dirty, file_has_target) = file_badge_of(&core);
+        // 载入之后的修订号：快照的"看到的/写过的"两个计数从这里起手对齐（见 `seen_rev` 字段）
+        let core_rev = core.lock().map(|c| c.revision()).unwrap_or(0);
         // **加载时全量检测事件重叠**（之后每次改动只查动过的那条线）
         let conflicts: Vec<cmd::Overlap> = core
             .lock()
@@ -1103,6 +1112,10 @@ impl App {
             frame_log: None,
             frame_log_failed: false,
             snapshots: 0,
+            // 起手就把"看到的"和"写过的"对齐到载入后的修订号：载入那一下的缓存是**源**，
+            // 不需要立刻回写一份（真有未保存改动时 `saved_revision` 会落后，`is_dirty` 说了算）
+            seen_rev: core_rev,
+            snapshotted_rev: core_rev,
             autosave: opm_app::autosave::Autosave::spawn(),
             ws: args_ws,
             idle_start: None,
@@ -2380,10 +2393,12 @@ impl App {
     fn pump_broadcasts(&mut self) {
         // 先把广播全部取出（释放对 self 的可变借用），再统一重建
         let mut batch: Vec<(u64, String, Vec<String>, Dirty)> = Vec::new();
+        let mut batch_rev: Option<u64> = None;
         if let Some(sub) = &self.sub {
             while let Ok(b) = sub.rx.try_recv() {
                 let d = dirty::dirty_of_topics(&b.topics);
                 let topics: Vec<String> = b.topics.iter().map(broadcast::Topic::label).collect();
+                batch_rev = Some(batch_rev.map_or(b.revision, |r: u64| r.max(b.revision)));
                 batch.push((b.revision, b.summary(), topics, d));
             }
         }
@@ -2415,6 +2430,10 @@ impl App {
             self.last_topics = topics;
         }
         self.applied_broadcasts += n;
+        // **文档变了**的权威口径：每条成功改动都会带新修订号广播（查询命令不动它）
+        if let Some(last) = batch_rev {
+            self.seen_rev = self.seen_rev.max(last);
+        }
         // 实际重建按**批**计（一帧内多条广播合并成一次重建，K 条广播 1 次重建即合并收益）
         self.skipped_structure += ns;
         self.skipped_props += np;
@@ -2746,11 +2765,11 @@ impl App {
         s.skipped_tracks = self.skipped_tracks;
         s.skipped_inspector = self.skipped_inspector;
         s.pending = self.pending_dispatch.is_some();
-        s.seen_revision = self
-            .core
-            .lock()
-            .map(|c| c.revision())
-            .unwrap_or_default();
+        let rev = self.core.lock().map(|c| c.revision()).unwrap_or_default();
+        s.seen_revision = rev;
+        // 兜底对齐：广播万一丢了（订阅缓冲溢出之类），修订号在这里也能被看到 ——
+        // 它本来就已经读了这一行，不额外抢锁
+        self.seen_rev = self.seen_rev.max(rev);
         s.last_broadcast = self.last_broadcast.clone();
         s.last_topics = self.last_topics.clone();
         s.latency_p50_ms = p50;
@@ -2886,30 +2905,48 @@ impl App {
     /// 曾经它是同步的，于是**每 2 秒卡一下 ~250 ms**（`OPM_FRAME_LOG` 量到 30 次/60 秒，
     /// `ui_ms` 250~275 ms；播放头是墙钟驱动的 ⇒ 画面还会跳掉 0.28 秒）。
     /// 实测修前/修后：`ui_ms` max 274.5 → 13.5 ms，>60 ms 的帧 30 → 0（同一场景、同一段播放）。
-    /// 上一份还没写完就**跳过这一拍**（不推进节流时刻，下一帧再试）。
-    fn maybe_snapshot(&mut self, now: Instant) {
-        // 顺序要紧：先看后台忙不忙（一个原子量，不抢锁），忙就整拍跳过 ——
-        // 否则我们会每帧都去克隆一份 50 000 音符的文档，比原来还糟
-        if !self.autosave.idle() {
-            return;
-        }
-        if now.duration_since(self.snapshot_at) < SNAPSHOT_MIN_INTERVAL {
-            return;
-        }
-        let job = {
-            let c = self.core.lock().unwrap();
-            if !c.is_dirty() {
-                return;
+    ///
+    /// **什么时候写：由"文档改了"决定，不由表决定**（[`opm_app::autosave::snapshot_due`]）。
+    /// 判据是**修订号**：`seen_rev != snapshotted_rev` 才有事。曾经只有"距上次 ≥ 2 秒 **且** 脏"，
+    /// 而"脏"粘住 ⇒ 一份没再改过的文档每 2 秒被完整重写一遍（空闲 24 秒实测重写 9 次、
+    /// 每次 15.9 MB）。连续编辑（拖拽/连打）仍被 2 秒节流合并成"最多每 2 秒一份"，
+    /// 到点由 `ctx.request_repaint_after` 唤醒 —— 不再是每帧轮询。
+    fn maybe_snapshot(&mut self, now: Instant, ctx: &egui::Context) {
+        use opm_app::autosave::SnapshotDue;
+        let due = opm_app::autosave::snapshot_due(
+            self.seen_rev,
+            self.snapshotted_rev,
+            self.autosave.failed(),
+            !self.autosave.idle(),
+            now.duration_since(self.snapshot_at),
+            SNAPSHOT_MIN_INTERVAL,
+        );
+        match due {
+            // 没有新改动（或上一份还在写）：**一个字都不写**。曾经这里靠"脏"当判据，
+            // 而"脏"是粘住的 ⇒ 一份没再改过的文档被每 2 秒重写一遍（实测空闲 24 秒重写 9 次）
+            SnapshotDue::Nothing => {}
+            // 还没到节流点：**让 egui 到点唤醒一帧**，而不是每帧问一次"到了吗"
+            // （`--idle-fps 0` 的纯事件驱动模式下，不安排这一下就真的没人来问）
+            SnapshotDue::Wait(d) => ctx.request_repaint_after(d),
+            SnapshotDue::Now => {
+                let job = {
+                    let c = self.core.lock().unwrap();
+                    if !c.is_dirty() {
+                        // 干净（刚存过盘 / 载入的就是干净文档）：这个修订号不必写，
+                        // 记下来免得每帧再来问一遍
+                        None
+                    } else {
+                        c.snapshot_job().ok() // 没有缓存目录（裸 `.opm.json`）⇒ 同样不必写
+                    }
+                };
+                self.snapshotted_rev = self.seen_rev;
+                if let Some(job) = job {
+                    self.snapshot_at = now;
+                    if self.autosave.try_send(job) {
+                        self.snapshots += 1;
+                    }
+                }
             }
-            match c.snapshot_job() {
-                Ok(j) => j,
-                // 没有解压缓存目录（不是从容器载入的）：这不是失败，只是没什么可写
-                Err(_) => return,
-            }
-        };
-        self.snapshot_at = now;
-        if self.autosave.try_send(job) {
-            self.snapshots += 1;
         }
     }
 
@@ -3469,8 +3506,8 @@ impl eframe::App for App {
         // 所以补得快慢都不影响画面 —— 它只决定每帧要花多少代价，进度显示在底栏。
         // 放在 `build_instances` **之前**：这一帧补好的位置这一帧就用上。
         self.state.pump_floors(EditorState::FLOOR_NOTES_PER_FRAME);
-        // 编辑期把文档快照写回解压缓存（节流；被强杀时"继续此谱面"才有东西可继续）
-        self.maybe_snapshot(Instant::now());
+        // 编辑期把文档快照写回解压缓存（**改动驱动 + 2 秒节流**；被强杀时"继续此谱面"才有东西可继续）
+        self.maybe_snapshot(Instant::now(), &ctx);
         self.pump_snapshot_errors();
 
         // 播放头：有音频时由音频游标驱动（见 state::advance），否则墙钟

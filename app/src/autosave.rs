@@ -28,6 +28,11 @@
 //!   快照是"隔两秒的最新副本"，不是必须每拍都写。
 //! · **本线程**：序列化 + 落盘（仍走"先写 `.tmp` 再 `rename`"的原子替换，见 `write_snapshot`）。
 //!
+//! 什么时候写由 [`snapshot_due`] 决定（纯逻辑、可单测）：**修订号变了才写**，
+//! 2 秒节流，到点由 `ctx.request_repaint_after` 唤醒一帧（不是每帧轮询），
+//! 上一份还在写就 [`BUSY_RETRY`] 后再来看。改前/改后：空闲脏文档 24 秒内重写 9 次 → 1 次，
+//! 播放 60 秒（1 笔改动）投出 26~30 份 → 1 份。
+//!
 //! 顺序上只有一处需要小心：**保存前**要先 [`Autosave::flush`] —— 否则一份"保存之前"的旧任务
 //! 可能在保存之后落盘，把缓存里的文档退回旧内容（见 `App::save_doc` 的注释）。
 //! 退出前同样要 flush（`Drop` 会做）：缓存目录是 `main` 在 `run_native` 返回后删的，
@@ -75,6 +80,58 @@ enum Msg {
     Stop,
 }
 
+/// 上一份还在写时，隔多久回来看一眼（它通常 140 ms 上下就写完）。见 [`SnapshotDue`]。
+///
+/// 为什么不是"干脆什么都不做、等下一帧"：那会让行为**依赖 idle 心跳**
+/// （`--idle-fps 0` 的纯事件驱动模式下，编辑撞上正在写的快照时，那一笔要等到下一次输入才落盘）。
+/// 让"等它"自己安排下一次唤醒，行为就与帧率设置无关了。
+pub const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 该不该现在投一份快照？——**纯逻辑**（无 IO、无时钟），所以它可以在单测里穷举。
+///
+/// 这一小段就是把"每 2 秒轮询一次"变成"文档变了才有事"的地方：
+/// 早先的判据只有"距上次快照 ≥ 2 秒 **且** 文档脏"，而"脏"是**粘住**的
+/// （`revision != saved_revision`，改过一笔就一直为真）⇒ 一份**没再改过**的文档
+/// 会被每 2 秒重写一遍。实测（空闲脏文档：不播放、不再编辑，24 秒）：**重写 9 次**，
+/// 每次都是 15.9 MB 的完整序列化 —— 白写的量比有用的大两个数量级。
+///
+/// 现在的判据是"**修订号**变了"（`seen_rev != done_rev`）：改完写过一份之后，
+/// 编辑器静静待着时这里返回 [`SnapshotDue::Nothing`]，一次锁都不抢、一个字都不写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotDue {
+    /// 现在投一份（有新改动，且距上一份已过 `min_interval`）
+    Now,
+    /// 还没到点：`d` 之后再唤醒一帧（**由事件安排下一次检查**，不靠每帧轮询）
+    Wait(std::time::Duration),
+    /// 什么都不做：没有新改动（也没有欠着的失败）
+    Nothing,
+}
+
+/// 见 [`SnapshotDue`]。`failed` = 上一份**写失败了**（那就得重试，哪怕修订号没再变）。
+pub fn snapshot_due(
+    seen_rev: u64,
+    done_rev: u64,
+    failed: bool,
+    busy: bool,
+    since_last: std::time::Duration,
+    min_interval: std::time::Duration,
+) -> SnapshotDue {
+    // ① 没有新改动：这就是"事件驱动"的核心 —— 一份没变过的文档不再被反复重写
+    //    （失败的那份是例外：它还没落盘，必须重试）
+    if seen_rev == done_rev && !failed {
+        return SnapshotDue::Nothing;
+    }
+    // ② 上一份还在写：**等它**（自己安排下一次唤醒，占用与帧率设置无关）
+    if busy {
+        return SnapshotDue::Wait(BUSY_RETRY);
+    }
+    // ③ 节流：连续编辑（拖拽、连打）时最多每 `min_interval` 写一份 —— 快照是"隔几秒的最新副本"
+    if since_last < min_interval {
+        return SnapshotDue::Wait(min_interval - since_last);
+    }
+    SnapshotDue::Now
+}
+
 /// 后台快照线程的把手。
 pub struct Autosave {
     tx: Option<Sender<Msg>>,
@@ -85,6 +142,9 @@ pub struct Autosave {
     written: Arc<AtomicU64>,
     /// 最近一次失败的原因（GUI 每帧 `try_recv` 式的回捞，只报一次变化的理由）
     err: Arc<Mutex<Option<String>>>,
+    /// **上一份是不是写失败了**：失败就得重试，哪怕文档的修订号没再变过
+    /// （见 [`snapshot_due`]；成功一次就清掉）
+    failed: Arc<AtomicBool>,
 }
 
 impl Autosave {
@@ -94,12 +154,13 @@ impl Autosave {
         let busy = Arc::new(AtomicBool::new(false));
         let written = Arc::new(AtomicU64::new(0));
         let err = Arc::new(Mutex::new(None));
-        let (b, w, e) = (busy.clone(), written.clone(), err.clone());
+        let failed = Arc::new(AtomicBool::new(false));
+        let (b, w, e, f) = (busy.clone(), written.clone(), err.clone(), failed.clone());
         let handle = std::thread::Builder::new()
             .name("opm-snapshot".to_owned())
-            .spawn(move || worker(rx, b, w, e))
+            .spawn(move || worker(rx, b, w, e, f))
             .ok();
-        Self { tx: Some(tx), handle, busy, written, err }
+        Self { tx: Some(tx), handle, busy, written, err, failed }
     }
 
     /// 手上那份写完没有。
@@ -110,6 +171,11 @@ impl Autosave {
     /// 已经落地的快照份数。
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// 上一份写失败了没有（失败 ⇒ 即使文档没再变也要重试，见 [`snapshot_due`]）。
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// 投一份任务。**上一份还没写完 ⇒ 返回 `false`**（这一拍跳过，调用方别把节流时刻推进）。
@@ -141,10 +207,11 @@ impl Autosave {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        let (b, w, e) = (self.busy.clone(), self.written.clone(), self.err.clone());
+        let (b, w, e, f) =
+            (self.busy.clone(), self.written.clone(), self.err.clone(), self.failed.clone());
         self.handle = std::thread::Builder::new()
             .name("opm-snapshot".to_owned())
-            .spawn(move || worker(nrx, b, w, e))
+            .spawn(move || worker(nrx, b, w, e, f))
             .ok();
         self.tx = Some(ntx);
     }
@@ -166,7 +233,13 @@ impl Drop for Autosave {
     }
 }
 
-fn worker(rx: Receiver<Msg>, busy: Arc<AtomicBool>, written: Arc<AtomicU64>, err: Arc<Mutex<Option<String>>>) {
+fn worker(
+    rx: Receiver<Msg>,
+    busy: Arc<AtomicBool>,
+    written: Arc<AtomicU64>,
+    err: Arc<Mutex<Option<String>>>,
+    failed: Arc<AtomicBool>,
+) {
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Stop => break,
@@ -179,11 +252,13 @@ fn worker(rx: Receiver<Msg>, busy: Arc<AtomicBool>, written: Arc<AtomicU64>, err
                 match r {
                     Ok(()) => {
                         written.fetch_add(1, Ordering::Relaxed);
+                        failed.store(false, Ordering::Relaxed);
                         if let Ok(mut g) = err.lock() {
                             *g = None; // 好了就别再提旧账
                         }
                     }
                     Err(e) => {
+                        failed.store(true, Ordering::Relaxed);
                         if let Ok(mut g) = err.lock() {
                             *g = Some(e);
                         }
@@ -238,6 +313,38 @@ mod tests {
         assert_eq!((s.snapshot, s.dirty), (42, true));
         assert!(!dir.join(format!("{}.tmp", codec::container::CHART_NAME)).exists(), "临时文件不该留下");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **"轮询 → 事件驱动"那一小段**：一条一条穷举（这是本轮改动的判据本身）
+    #[test]
+    fn the_snapshot_decision_is_change_driven_not_timer_driven() {
+        let min = std::time::Duration::from_secs(2);
+        let far = std::time::Duration::from_secs(60); // 早就过了节流点
+        use SnapshotDue::*;
+
+        // ① 没有新改动 ⇒ 什么都不做 —— **哪怕文档脏着很久、节流点早就过了**
+        assert_eq!(snapshot_due(7, 7, false, false, far, min), Nothing);
+        // ② 有新改动、过了节流点 ⇒ 写
+        assert_eq!(snapshot_due(8, 7, false, false, far, min), Now);
+        // ③ 有新改动、还没到点 ⇒ 安排"还差多少"再来看（不靠每帧轮询）
+        assert_eq!(
+            snapshot_due(8, 7, false, false, std::time::Duration::from_millis(500), min),
+            Wait(std::time::Duration::from_millis(1500))
+        );
+        // ④ 上一份还在写 ⇒ 不投，但**要安排下一次唤醒**（否则纯事件驱动模式下这笔改动没人管）
+        assert_eq!(snapshot_due(8, 7, false, true, far, min), Wait(BUSY_RETRY));
+        // ④′ 上一份还在写、而且没有欠着的活 ⇒ 连唤醒都不安排（写完就安静了）
+        assert_eq!(snapshot_due(7, 7, false, true, far, min), Nothing);
+        // ⑤ 上一份**写失败** ⇒ 修订号没变也要重试（否则一次失败就永远不再落盘）
+        assert_eq!(snapshot_due(7, 7, true, false, far, min), Now);
+        assert_eq!(
+            snapshot_due(7, 7, true, false, std::time::Duration::from_millis(1900), min),
+            Wait(std::time::Duration::from_millis(100))
+        );
+        // ⑥ 失败且忙 ⇒ 等它写完再重试
+        assert_eq!(snapshot_due(7, 7, true, true, far, min), Wait(BUSY_RETRY));
+        // 边界：正好到点 ⇒ 写（不是"再多等一帧"）
+        assert_eq!(snapshot_due(8, 7, false, false, min, min), Now);
     }
 
     /// `flush` 之后盘上一定有那份文件；`try_send` 在写的时候拒绝第二份
