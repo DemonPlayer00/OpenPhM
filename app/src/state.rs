@@ -234,8 +234,12 @@ pub const RPE_LINE_HALF_W: f32 = RPE_WINDOW_HALF_W;
 #[derive(Clone, Debug)]
 pub struct Chart {
     pub name: String,
-    /// 谱面时长（秒，含 2 秒尾巴）
+    /// 谱面时长（秒，含 2 秒尾巴）。**它只描述谱面自己**（事件与音符的末端 + 尾巴），
+    /// 时间轴的总长请用 [`EditorState::timeline_duration`]。
     pub duration: f64,
+    /// **音符**末端（秒）——不含事件。时间轴在"有音乐"时按音乐长度，但音符写在曲末之后也**不许切掉**：
+    /// 谱面最后一个音符比音频尾巴长是常事（音频末尾被裁过），切掉就等于"看不见自己的音符"。
+    pub notes_end: f64,
     /// 拍 ↔ 秒映射（多 BPM 分段线性）
     pub tmap: TimeMap,
     /// 一拍多少秒（当前 BPM，时间轴刻度用）
@@ -339,9 +343,16 @@ pub fn chart_from_doc(doc: &Document) -> Chart {
     // zOrder 小的先画（在后），大的后画（在前）；同 zOrder 保持文档顺序
     lines.sort_by(|a, b| a.z_order.cmp(&b.z_order).then(a.index.cmp(&b.index)));
     let bpm = tmap.bpm_at(0.0);
+    // 音符末端顺手算掉（构建时本来就走了一遍 notes；别把它留到每帧去算）
+    let notes_end = lines
+        .iter()
+        .flat_map(|l| l.notes.iter())
+        .map(|n| n.end.max(n.time))
+        .fold(0.0f64, f64::max);
     Chart {
         name: doc.meta.name.clone(),
         duration: tmap.duration,
+        notes_end,
         beat_interval: 60.0 / bpm.max(1.0),
         bpm,
         tmap,
@@ -658,6 +669,12 @@ pub struct EditorState {
     /// 播放头由单调时钟推进（后续换音频时钟）
     started: Option<std::time::Instant>,
     start_playhead: f64,
+    /// **乐曲时长（秒）**：时间轴的**总长**按它来（`None` = 没有音乐/还没解码出来）。
+    ///
+    /// 为什么要单独存一个：`chart.duration` 是**谱面自身**的跨度（末尾还留 2 秒尾巴），
+    /// 一份刚建的谱面几乎是 0 ⇒ 时间轴只有 2 秒（用户报的"默认总长度只有2秒"）。
+    /// 音乐一装上，时间轴就该和歌一样长：你才滚得到副歌去写谱。
+    music_len: Option<f64>,
 }
 
 impl EditorState {
@@ -686,6 +703,29 @@ impl EditorState {
             boundary_dim: crate::render::DIM_ALPHA_DEFAULT,
             started: None,
             start_playhead: 0.0,
+            music_len: None,
+        }
+    }
+
+    /// 设定**乐曲时长**（秒）。`None` = 没有音乐（或还没解码出来）；非正数/非有限值一律当"没有"。
+    ///
+    /// 调用点：音频解析完成时、运行中替换音频时（GUI 在拿到 `Audio` 之后调一次）。
+    pub fn set_music_len(&mut self, sec: Option<f64>) {
+        self.music_len = sec.filter(|s| s.is_finite() && *s > 0.0);
+    }
+
+    /// **时间轴总长（秒）**：时间轴绘制、播放头上限、可见范围**一律以它为准**。
+    ///
+    /// 规则（用户："时间轴总长按乐曲时长，避免默认总长度只有2秒"）：
+    /// - **有音乐** ⇒ 总长就是**乐曲时长**（再兜住"音符写在曲末之后"那种情况：取 `notes_end`）。
+    ///   为什么不是 `max(乐曲, 谱面跨度)`：谱面跨度会被**"铺满全谱"那类占位事件**撑到 5120 拍
+    ///   （≈28 分钟）—— 一首 1 分钟的歌配一条 28 分钟的时间轴，比 2 秒还难用。占位事件是"整首歌都这样"，
+    ///   它本来就该跟着歌，不该由它决定时间轴有多长。
+    /// - **没有音乐** ⇒ 退回谱面自身的跨度（末尾留 2 秒尾巴，见 `TimeMap::from_doc`）。
+    pub fn timeline_duration(&self) -> f64 {
+        match self.music_len {
+            Some(music) => music.max(self.chart.notes_end),
+            None => self.chart.duration,
         }
     }
 
@@ -780,7 +820,7 @@ impl EditorState {
     pub fn visible_range(&self) -> (f64, f64) {
         (
             self.playhead,
-            (self.playhead + self.lookahead).min(self.chart.duration),
+            (self.playhead + self.lookahead).min(self.timeline_duration()),
         )
     }
 
@@ -863,7 +903,7 @@ impl EditorState {
     }
 
     pub fn seek(&mut self, t: f64) {
-        self.playhead = t.clamp(0.0, self.chart.duration);
+        self.playhead = t.clamp(0.0, self.timeline_duration());
         if self.playing {
             self.started = Some(std::time::Instant::now());
             self.start_playhead = self.playhead;
@@ -878,14 +918,15 @@ impl EditorState {
     pub fn advance(&mut self, audio: Option<&crate::audio::Audio>) {
         if let (Some(a), true) = (audio, self.playing) {
             if a.is_playing() {
-                self.playhead = a.position_sec().clamp(0.0, self.chart.duration);
+                // 音乐比谱面长时，播放头要跟着音乐走到曲末（否则歌还在放、游标却停在谱面末尾）
+                self.playhead = a.position_sec().clamp(0.0, self.timeline_duration());
                 return;
             }
         }
         if let Some(t0) = self.started {
             let dt = t0.elapsed().as_secs_f64() * self.speed;
-            self.playhead = (self.start_playhead + dt).min(self.chart.duration);
-            if self.playhead >= self.chart.duration {
+            self.playhead = (self.start_playhead + dt).min(self.timeline_duration());
+            if self.playhead >= self.timeline_duration() {
                 self.playing = false;
                 self.started = None;
             }
@@ -1037,6 +1078,68 @@ mod tests {
         assert_eq!(st.visible_range(), (9.5, 10.0), "末尾要夹住，别越过谱面长度");
         st.playhead = 10.0;
         assert_eq!(st.visible_range(), (10.0, 10.0), "已经到末尾时区间退化为一个点");
+    }
+
+    /// **时间轴总长按乐曲时长**（用户报的"默认总长度只有2秒"）。
+    ///
+    /// 空谱面（`Document::fresh`：1 条空判定线、0 事件）自身只有 `0 + 2 秒尾巴` —— 时间轴被锁成
+    /// 2 秒，滚不到副歌。装上音乐之后，总长就该是**歌的长度**。
+    #[test]
+    fn timeline_length_follows_the_music() {
+        let mut st = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        assert!(
+            (st.chart.duration - 2.0).abs() < 1e-9,
+            "空谱面自身跨度就是 2 秒（这正是那个 bug 的样子）：{}",
+            st.chart.duration
+        );
+        assert_eq!(st.timeline_duration(), st.chart.duration, "没有音乐 ⇒ 用谱面自身跨度");
+
+        // 装上 60 秒的歌 ⇒ 总长按乐曲时长
+        st.set_music_len(Some(60.0));
+        assert_eq!(st.timeline_duration(), 60.0);
+        // 播放头能走到曲末（以前会被 2 秒的谱面跨度夹住）
+        st.seek(59.5);
+        assert!((st.playhead - 59.5).abs() < 1e-9, "{}", st.playhead);
+        st.seek(999.0);
+        assert_eq!(st.playhead, 60.0, "超过曲末仍要夹到曲末");
+
+        // 可见区间**不**被总长撑开：它只关心"播放头往后看前瞻"
+        st.seek(59.0);
+        assert_eq!(st.visible_range(), (59.0, 60.0), "末尾夹到曲末");
+
+        // 歌比"谱面跨度"短：总长**按歌**（谱面跨度常被占位事件撑大，不该由它决定时间轴）
+        let mut st2 = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        st2.chart.duration = 1708.0; // 5120 拍 @180BPM：就是"铺满全谱"那种占位跨度
+        st2.set_music_len(Some(30.0));
+        assert_eq!(st2.timeline_duration(), 30.0, "有音乐就按乐曲时长");
+
+        // 但**音符**写在曲末之后不许切掉（音频尾巴被裁过是常事）
+        let mut st4 = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        st4.chart.notes_end = 42.0;
+        st4.set_music_len(Some(30.0));
+        assert_eq!(st4.timeline_duration(), 42.0, "最后那个音符一定要看得见");
+        st4.chart.notes_end = 0.0;
+        assert_eq!(st4.timeline_duration(), 30.0);
+
+        // 退化输入一律当"没有音乐"
+        for bad in [None, Some(0.0), Some(-5.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            let mut st3 = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+            st3.set_music_len(bad);
+            assert_eq!(st3.timeline_duration(), st3.chart.duration, "{bad:?}");
+        }
+    }
+
+    /// 无音频时靠墙钟推进：到**总长**为止（有音乐就走到曲末，而不是谱面末尾）
+    #[test]
+    fn playback_advances_to_the_timeline_end_not_the_chart_end() {
+        let mut st = EditorState::new(chart_from_doc(&crate::doc::Document::default()));
+        st.set_music_len(Some(10.0));
+        st.set_playing(true);
+        st.start_playhead = 0.0;
+        st.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+        st.advance(None);
+        assert_eq!(st.playhead, 10.0, "推到曲末（不是谱面末尾的 2 秒）");
+        assert!(!st.playing, "到曲末就停");
     }
 
     #[test]

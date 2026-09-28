@@ -435,6 +435,16 @@ fn main() -> eframe::Result<()> {
     if args.verbose_updates {
         shared.lock().unwrap().set_verbose(true);
     }
+    // **时间轴总长按乐曲时长**：音乐一装上就把时长交给视图状态（见 `EditorState::timeline_duration`）。
+    // 放在这里（音频解析之后、`App::new` 之前）是因为顺序就是依赖：没有音频就没有"乐曲时长"这个概念。
+    state.set_music_len(audio.as_ref().map(|a| a.duration()));
+    if audio.is_some() {
+        println!(
+            "  时间轴总长        : {:.1}s（按乐曲时长；谱面自身 {:.1}s）",
+            state.timeline_duration(),
+            state.chart.duration
+        );
+    }
     let mut ctrl_path: Option<std::path::PathBuf> = None;
     if let Some(spec) = &args.control {
         let path = if spec == "auto" {
@@ -1717,6 +1727,31 @@ impl App {
             }
             self.sync_file_fields(); // 打开之后：文件夹/名字/格式提示都跟着新文件走
             self.remember_recent();
+            // **音乐跟着谱面走**：打开一份新谱面，它的 `meta.audio`（或 `--audio`）要重新解析 ——
+            // 否则时间轴总长还停在上一次那首歌上（"时间轴按乐曲时长"这条会当场失效）。
+            // 同一条 `resolve_audio`：命令行 `--audio` 优先、`--audio off` 明确不要。
+            match resolve_audio(&self.args, &self.core) {
+                Ok(a) => {
+                    let sec = a.as_ref().map(|a| a.duration());
+                    self.state.set_music_len(sec);
+                    match (&a, sec) {
+                        (Some(a), Some(sec)) => self.console_log.push((
+                            true,
+                            format!("音乐 → {}（{:.1}s；时间轴总长按它）", a.path, sec),
+                        )),
+                        _ => self
+                            .console_log
+                            .push((true, "这份谱面没有音乐：时间轴按谱面自身跨度".to_owned())),
+                    }
+                    self.audio = a;
+                }
+                // 载入失败不该把"打开成功"变成失败：说一句，音乐留空
+                Err(e) => {
+                    self.state.set_music_len(None);
+                    self.audio = None;
+                    self.console_log.push((false, format!("音乐没能载入：{e}")));
+                }
+            }
         } else {
             self.console_log.push((
                 false,
@@ -1955,6 +1990,8 @@ impl App {
                     Ok(a) => {
                         a.set_offset_ms(self.args.audio_offset_ms);
                         println!("  音频已替换        : {}（{}）", a.path, a.device());
+                        // 时间轴总长跟着新音乐走（换了歌，长度当然也换）
+                        self.state.set_music_len(Some(a.duration()));
                         self.audio = Some(a);
                     }
                     Err(e) => eprintln!("  替换音频失败      : {e}"),
@@ -3638,7 +3675,8 @@ impl eframe::App for App {
             let resp = ui.allocate_rect(tl_rect, egui::Sense::click_and_drag());
             let p = ui.painter_at(tl_rect);
             p.rect_filled(tl_rect, 2.0, egui::Color32::from_rgb(16, 16, 24));
-            let dur = self.state.chart.duration.max(0.001);
+            // 总长 = max(谱面跨度, 乐曲时长)：音乐比谱面长时时间轴铺到曲末，比谱面短也不会切掉谱面
+            let dur = self.state.timeline_duration().max(0.001);
             let x_of = |t: f64| tl_rect.min.x + (t / dur) as f32 * tl_rect.width();
 
             // 拍线（自适应抽稀）：整谱可见时拍线密度会远超像素密度 ——
