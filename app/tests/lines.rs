@@ -862,7 +862,10 @@ fn every_note_becomes_visible_inside_the_window_before_its_hit() {
                     }
                     // 构建窗口留了 `NOTE_SPAN_MARGIN` 的余量：贴边滑入的那几帧允许中心越界，
                     // 但**不许**超出余量（那才是"建了实例又看不见"的浪费/漏画）
-                    if q.center()[1].abs() > 450.0 + opm_app::state::EditorState::NOTE_SPAN_MARGIN + 1.0
+                    // 判据是"屏幕包围盒与窗口相交"，方块旋转后外接半径最多 ~48，
+                    // 所以允许中心超出窗口 `NOTE_SPAN_MARGIN + 60`（再多就是在白建实例了）
+                    if q.center()[1].abs()
+                        > 450.0 + opm_app::state::EditorState::NOTE_SPAN_MARGIN + 60.0 + 1.0
                     {
                         far_outside += 1;
                     }
@@ -882,11 +885,12 @@ fn every_note_becomes_visible_inside_the_window_before_its_hit() {
     }
 }
 
-/// **负流速支持**：流速为负时音符从判定线**下方**飞上来 —— 用户明确说"在判定线之下时不用显示"，
-/// 所以到线之前不画；到线那一刻**击中效果照旧**（否则负流速段就完全没有反馈了）。
+/// **负流速支持**：流速为负时音符从判定线**下方**飞上来 —— 它照旧要显示
+/// （"音符只要在可见区域就要显示"），只是位置在线的下面；到线那一刻播一次击中效果，
+/// 之后本体停在线上收缩消失。
 #[test]
-fn a_negative_flow_speed_draws_no_note_but_still_flashes_on_hit() {
-    use opm_app::render::HIT_FX_SEC;
+fn a_negative_flow_speed_brings_notes_up_from_below() {
+    use opm_app::render::{HIT_FADE_SEC, HIT_FX_SEC};
     let doc = one_line_doc_speed(-10.0, &[(DocKind::Tap, 2.0, None, 0.0)]); // 2 拍 = 1 秒
     let mut st = EditorState::new(chart_from_doc(&doc));
     st.selected_line = usize::MAX;
@@ -897,34 +901,90 @@ fn a_negative_flow_speed_draws_no_note_but_still_flashes_on_hit() {
         build_instances(st, &mut inst);
         inst
     };
-    // 到线之前：一颗音符都不画（它们在判定线下面）
-    for t in [0.0, 0.5, 0.9] {
-        let inst = at(&mut st, t);
-        assert_eq!(inst.len(), 1, "t={t}：只剩判定线本体，不该有音符：{:?}", inst.len());
+    let note_y = |inst: &[NoteInstance]| -> Option<f32> {
+        inst.iter()
+            .find(|q| {
+                let c = q.color();
+                (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
+            })
+            .map(|q| q.center()[1])
+    };
+    // 到线之前：音符画在**判定线下方**、且在窗口里（越接近打击时刻越靠近判定线）
+    // 流速 10 ⇒ 1200 单位/秒：0.3 秒前偏移 -360、0.1 秒前 -120（都在 ±450 里）
+    let far = note_y(&at(&mut st, 0.7)).expect("0.7s：音符该在判定线下方可见");
+    let near = note_y(&at(&mut st, 0.9)).expect("0.9s：音符该更靠近判定线");
+    assert!(far < 0.0 && near < 0.0, "负流速下音符在线下面：{far} / {near}");
+    assert!(far < near, "越接近打击时刻越靠近判定线：{far} → {near}");
+    assert!(far >= -450.0, "还在窗口里：{far}");
+    // 再早一点就出窗口了 ⇒ 不建实例（不是"因为离判定线远"被丢的，是真的看不见）
+    assert_eq!(note_y(&at(&mut st, 0.5)), None, "0.5 秒前偏移 -600，已在窗口之外");
+    // 到线那一刻：闪光出现
+    assert!(flash_count(&at(&mut st, 1.0)) > 0, "负流速下击中效果要播");
+    // 效果结束 + 本体淡出之后：只剩判定线
+    let after = at(&mut st, 1.0 + HIT_FADE_SEC + HIT_FX_SEC + 0.01);
+    assert_eq!(after.len(), 1, "结束之后只剩线本体，实际 {}", after.len());
+    // 到线之后本体停在线上（不是继续往线上方跑）
+    let at_line = at(&mut st, 1.0 + 0.01);
+    if let Some(y) = note_y(&at_line) {
+        assert!(y.abs() < 1.0, "到线后应停在线上：{y}");
     }
-    // 到线那一刻：闪光出现（音符本体也在线上收缩）
-    let hit = at(&mut st, 1.0);
-    assert!(flash_count(&hit) > 0, "负流速下击中效果仍要播");
-    // 效果结束：又只剩判定线
-    let after = at(&mut st, 1.0 + HIT_FX_SEC + 0.01);
-    assert_eq!(after.len(), 1, "效果结束后只剩线本体");
-    // 任何时刻都**不画音符本体**（负流速下它整段都在判定线之下）；
-    // 击中效果的环会朝两侧扩散，那几条边允许在线下，所以按颜色认音符本体。
-    for t in [0.0, 0.7, 0.99, 1.0 + HIT_FX_SEC + 0.01] {
-        let inst = at(&mut st, t);
-        assert_eq!(
-            tap_quad_count(&inst),
-            0,
-            "t={t}：负流速下不该画音符本体（它在判定线下面）"
-        );
-    }
-    // 击中当帧：音符本体**停在判定线上**（不是线下面），一闪即逝
-    let hit_mid = at(&mut st, 1.0 + 0.02);
-    if tap_quad_count(&hit_mid) > 0 {
-        let q = hit_mid
-            .iter()
-            .find(|q| q.color()[0] < 0.5 && q.half()[0] > 30.0)
-            .expect("音符本体");
-        assert!(q.center()[1].abs() < 1.0, "到线后应停在线上：{:?}", q.center());
+}
+
+/// **"音符只要在可见区域就要显示"**：判据必须是**屏幕上的位置**，不是"离判定线多远"。
+///
+/// 这条盯的是一个真 bug：判定线被事件移开（`moveY = -300`）时，偏移 660 的音符在屏幕上
+/// 的 y 是 +360（明明在窗口里），却被旧的"线本地偏移 > 510 就跳过"整颗丢掉；
+/// 线旋转 90° 时，同样的音符落在屏幕 x = -660（±675 之内）也被丢掉。
+#[test]
+fn notes_inside_the_window_are_drawn_however_far_they_are_from_the_line() {
+    // (moveY, rotate)：音符 0.55 秒后打击（偏移 660）
+    for (my, rot, want_screen) in [
+        (0.0_f64, 0.0_f64, None),          // 屏幕上是 660 —— 真的在窗口外，不画才对
+        (-300.0, 0.0, Some([0.0, 360.0])), // 线被移到下面 ⇒ 音符出现在屏幕上方 360（可见）
+        (0.0, 90.0, Some([-660.0, 0.0])),  // 线转了 90° ⇒ 音符出现在屏幕左方 660（可见）
+    ] {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        doc.judge_lines.clear();
+        let mut l = JudgeLine::default();
+        let end = Beat::new(4096, 1);
+        for (track, v) in [("speed", 10.0), ("moveY", my), ("rotate", rot)] {
+            l.layers[0].track_mut(track).unwrap().push(Event::new(
+                Beat::zero(),
+                end,
+                json!(v),
+                json!(v),
+                "linear",
+            ));
+        }
+        l.notes
+            .push(DocNote::new(DocKind::Tap, Beat::new(11, 10), 0.0)); // 0.55 s ⇒ 偏移 660
+        doc.judge_lines.push(l);
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.selected_line = usize::MAX;
+        st.playhead = 0.0;
+        let mut inst = Vec::new();
+        build_instances(&st, &mut inst);
+        let note = inst.iter().find(|q| {
+            let c = q.color();
+            (c[0] - 0.35).abs() < 0.02 && (c[1] - 0.65).abs() < 0.02 && (c[2] - 1.0).abs() < 0.02
+        });
+        match want_screen {
+            Some(p) => {
+                let q = note.unwrap_or_else(|| {
+                    panic!("moveY={my} rotate={rot}：窗口里的音符被丢掉了（屏幕位置 {p:?}）")
+                });
+                assert!(
+                    (q.center()[0] - p[0]).abs() < 1.0 && (q.center()[1] - p[1]).abs() < 1.0,
+                    "屏幕位置应约等于 {p:?}，实际 {:?}",
+                    q.center()
+                );
+            }
+            None => assert!(note.is_none(), "屏幕上是 660（窗口外）⇒ 不该建实例"),
+        }
     }
 }

@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::doc::Event;
 use crate::perf;
-use crate::state::{Chart, EditorState, Note, NoteKind, RPE_WINDOW_HALF_H};
+use crate::state::{Chart, EditorState, Note, NoteKind, RPE_WINDOW_HALF_H, RPE_WINDOW_HALF_W};
 
 pub const RPE_W: f32 = 1350.0;
 pub const RPE_H: f32 = 900.0;
@@ -591,12 +591,10 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             let lead = (walk.to(note.time) * spd) as f32;
             // **到线之后就不再往下走**：音符停在判定线上收缩消失（游戏里就是这样，
             // 而不是从判定线下面继续往下掉）。`age > 0` = 已经到达判定线。
+            //
+            // 到线**之前**不夹：负流速的音符从判定线下面飞上来，它就该画在线的下面
+            // （用户要求："音符只要在可见区域就要显示"——可见与否由下面的屏幕空间判据说了算）。
             let age = state.playhead - note.time;
-            // **判定线之下不显示**（用户要求）：流速为负时音符从下面飞上来，到线之前整条都在
-            // 线下面 —— 那一段不画（到线那一刻由击中效果接住）。也顺手省掉"建了实例再被 GPU 裁掉"。
-            if age <= 0.0 && lead < 0.0 {
-                continue;
-            }
             let y_local = if age > 0.0 { 0.0 } else { lead };
             // 到达之后 0→1 的消失进度；`>= 1` 就彻底没了（只剩击中效果在场）。
             // **必须夹到 0**：`age < 0` 是"还没到"（绝大多数音符），不夹就成了负进度 ⇒
@@ -611,13 +609,30 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             } else {
                 0.0
             };
-            // 整条都在窗口**之外**（上或下）⇒ 不必建实例（GPU 那边本来也会裁掉）。
-            // 判据取两端：长 hold 的尾巴可能远在窗口之上、身子正从判定线穿过去
-            // （只看最高的一端会把它整条裁掉 —— 那是"长条一到线就消失"的另一个成因）。
+            // ---- 可见性判据：**按屏幕上的位置**，不是"离判定线多远" ----
+            //
+            // 这里修的是一个真 bug：判据曾经只看**线本地**的偏移（`|offset| > 510 就跳过`），
+            // 而判定线是会被事件移开/旋转的 —— 线被移到 y=-300 时，偏移 660 的音符在屏幕上
+            // 的 y 是 **+360**（明明在窗口里），却被当成"离判定线太远"整颗丢掉；
+            // 线旋转 90° 时，偏移 660 的音符落在屏幕上 x=-660（±675 之内）同样被丢掉。
+            // 现在判据是"这颗音符（连它自己的半宽半高）在屏幕上的包围盒是否与窗口相交"。
             let tail_y = lead + hold_dy;
-            let edge = RPE_WINDOW_HALF_H + EditorState::NOTE_SPAN_MARGIN;
-            let (body_lo, body_hi) = (y_local.min(tail_y), y_local.max(tail_y));
-            if body_lo > edge || body_hi < -edge {
+            let (nw, nh) = match note.kind {
+                NoteKind::Hold => (HOLD_W, NOTE_H),
+                _ => (NOTE_W, NOTE_H),
+            };
+            let head_pt = perf.apply([note.lane_x, y_local]);
+            let tail_pt = perf.apply([note.lane_x, tail_y]);
+            // 旋转过的方块在屏幕上的外接半径（保守：宁可多建几个实例，也不能漏画看得见的）
+            let radius = ((nw * 0.5) * (nw * 0.5) + (nh * 0.5) * (nh * 0.5)).sqrt()
+                + EditorState::NOTE_SPAN_MARGIN;
+            let (lo_x, hi_x) = (head_pt[0].min(tail_pt[0]), head_pt[0].max(tail_pt[0]));
+            let (lo_y, hi_y) = (head_pt[1].min(tail_pt[1]), head_pt[1].max(tail_pt[1]));
+            if hi_x < -RPE_WINDOW_HALF_W - radius
+                || lo_x > RPE_WINDOW_HALF_W + radius
+                || hi_y < -RPE_WINDOW_HALF_H - radius
+                || lo_y > RPE_WINDOW_HALF_H + radius
+            {
                 continue;
             }
 
@@ -661,15 +676,11 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             // ---- 音符本体：到线之后收缩淡出，`HIT_FADE_SEC` 之后不再画 ----
             if gone < 1.0 {
                 let k = (1.0 - gone).max(0.0);
-                let (w, h) = match note.kind {
-                    NoteKind::Hold => (HOLD_W, NOTE_H),
-                    _ => (NOTE_W, NOTE_H),
-                };
                 let mut c = color;
                 c[3] *= k;
                 out.push(NoteInstance::new(
-                    perf.apply([note.lane_x, y_local]),
-                    [w * 0.5 * k.max(0.15), h * 0.5 * k.max(0.15)],
+                    head_pt,
+                    [nw * 0.5 * k.max(0.15), nh * 0.5 * k.max(0.15)],
                     c,
                     angle,
                 ));
