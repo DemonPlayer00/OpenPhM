@@ -2066,6 +2066,17 @@ impl App {
 
     /// 只重建脏掉的东西，而且**按线**重建：改 3 号线的音符不动 0/1/2 号线的缓存。
     fn apply_dirty(&mut self, d: Dirty) {
+        // **内容末端（拍）随任何内容变化刷新** —— 时间轴总长要用它。
+        // 这条是用户报的 bug 的修复点：总长以前读 `state.chart.tmap.end_beat`，而那份视图模型只在
+        // `structure` 变化时重建（加音符走"逐线局部重建"）⇒ 音符放到 68.9s 了，时间轴还停在 20.0s。
+        // 只算末端（`chart_end()` 是 note/事件的 max），不重建视图模型，所以可以每条广播都做。
+        // （不含 `d.meta`：改曲名/曲师不影响内容长度，别为它白扫一遍所有音符）
+        if d.structure || !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_empty() {
+            let c = self.core.lock().unwrap();
+            let end = c.doc().chart_end().to_f64();
+            drop(c);
+            self.state.set_content_end_beat(end);
+        }
         // 文档变了 ⇒ 状态栏的"有未保存改动"标记可能翻转（改一笔就脏、撤销回去就干净）。
         // 这是**事件**，不是每帧：只在收到广播时重算。
         self.refresh_file_badge();
@@ -2090,7 +2101,7 @@ impl App {
             let c = self.core.lock().unwrap();
             let doc = c.doc().clone();
             drop(c);
-            self.state.chart = state::chart_from_doc(&doc);
+            self.state.set_chart(state::chart_from_doc(&doc)); // 连内容末端一起同步
             self.last_structure_ms = t.elapsed().as_secs_f64() * 1000.0;
             self.builds_structure += 1;
             self.line_rows = view::line_rows_of(&self.state.chart);

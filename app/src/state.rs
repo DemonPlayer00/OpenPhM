@@ -659,6 +659,12 @@ pub struct EditorState {
     /// 播放头由单调时钟推进（后续换音频时钟）
     started: Option<std::time::Instant>,
     start_playhead: f64,
+    /// **文档内容的末端（拍）**：`max(note 末端, 事件末端)`，由**文档**算出来（`doc.chart_end()`）。
+    ///
+    /// 为什么不直接用 `chart.tmap.end_beat`：那是**视图模型**里的副本，而视图模型只在 `structure`
+    /// 话题变化时才整表重建（加/删音符走的是"逐线局部重建"那条路）⇒ 它会**过期**。
+    /// 用户报的正是这个："放了音符的谱面上，时间轴还是短的" —— 音符在 68.9s，时间轴却停在 20.0s。
+    pub content_end_beat: f64,
     /// **乐曲时长（秒）**：时间轴的**总长**按它来（`None` = 没有音乐/还没解码出来）。
     ///
     /// 为什么要单独存一个：`chart.duration` 是**谱面自身**的跨度（末尾还留 2 秒尾巴），
@@ -669,6 +675,8 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn new(chart: Chart) -> Self {
+        // 先把长度取出来：`chart` 会被移动进结构体（借用顺序而已，不是逻辑问题）
+        let content_end_beat = chart.tmap.end_beat;
         Self {
             chart,
             playhead: 0.0,
@@ -693,7 +701,21 @@ impl EditorState {
             boundary_dim: crate::render::DIM_ALPHA_DEFAULT,
             started: None,
             start_playhead: 0.0,
+            content_end_beat,
             music_len: None,
+        }
+    }
+
+    /// 整表重建之后同步内容末端（视图模型与它必须一起更新，见 [`Self::content_end_beat`]）。
+    pub fn set_chart(&mut self, chart: Chart) {
+        self.content_end_beat = chart.tmap.end_beat;
+        self.chart = chart;
+    }
+
+    /// 内容变了（加/删/移动 note 或事件）之后由调用方刷新 —— 只更新**长度**，不重建整个视图模型。
+    pub fn set_content_end_beat(&mut self, beat: f64) {
+        if beat.is_finite() && beat >= 0.0 {
+            self.content_end_beat = beat;
         }
     }
 
@@ -715,9 +737,10 @@ impl EditorState {
     /// 拖时间轴或缩放时总长不会跳。
     pub fn timeline_end_beat(&self) -> f64 {
         let tmap = &self.chart.tmap;
-        let content = tmap.end_beat; // note 与事件末端（`TimeMap::from_doc` 里算的）
+        // **内容是缓存值**（`content_end_beat`，随每次内容变化刷新），不是 `tmap.end_beat` ——
+        // 后者那份视图模型在"只加了个音符"时不会重建，会一直报旧的长度（用户报的 bug）
         let music = self.music_len.map(|sec| tmap.beat(sec)).unwrap_or(0.0);
-        content.max(music) + Self::TIMELINE_TAIL_BEATS
+        self.content_end_beat.max(music) + Self::TIMELINE_TAIL_BEATS
     }
 
     /// 时间轴总长（秒）。时间轴绘制、播放头上限、可见范围都以它为准。
@@ -1150,6 +1173,47 @@ mod tests {
         for k in ["chartEnd", "duration", "length", "timeline"] {
             assert!(json.get(k).is_none(), "文档里不该有 {k}：{json}");
         }
+    }
+
+    /// **回归**：内容末端是**缓存值**，过期的那份视图模型不许再影响总长。
+    ///
+    /// 用户报的现象："在放了音符的谱面上，底部时间轴还是保持短的状态" —— 音符放到 68.9s，
+    /// 时间轴仍停在 20.0s。根因是总长读的是 `chart.tmap.end_beat`，而那份视图模型只在 `structure`
+    /// 话题变化时整表重建（加音符走"逐线局部重建"）⇒ 一直是旧值。现在读 `content_end_beat`。
+    #[test]
+    fn timeline_length_follows_new_notes_even_when_the_view_model_is_stale() {
+        let mut doc = crate::doc::Document::default();
+        doc.bpm_list = vec![crate::doc::BpmEntry {
+            start: crate::doc::Beat::zero(),
+            bpm: 120.0, // 1 拍 = 0.5s
+            foreign: Default::default(),
+        }];
+        let line = &mut doc.judge_lines[0];
+        line.notes.push(crate::doc::Note::new(
+            crate::doc::NoteKind::Tap,
+            crate::doc::Beat::new(4, 1),
+            0.0,
+        ));
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        assert_eq!(st.timeline_end_beat(), 14.0, "4 拍 + 10 拍留白");
+
+        // 文档里又加了两个音符（末端 200 拍）——但**视图模型故意不重建**（这正是加音符时的真实情况）
+        st.set_content_end_beat(200.0);
+        assert_eq!(st.timeline_end_beat(), 210.0, "总长要跟着新内容走");
+        assert!(
+            (st.timeline_duration() - 105.0).abs() < 1e-9,
+            "210 拍 @120BPM = 105s（实际 {}）",
+            st.timeline_duration()
+        );
+        // 视图模型里那份旧值仍然是 4 拍 —— 证明我们读的不是它
+        assert_eq!(st.chart.tmap.end_beat, 4.0);
+        // 播放头也能走到新末端（以前被短的总长夹住）
+        st.seek(100.0);
+        assert!((st.playhead - 100.0).abs() < 1e-9);
+
+        // 整表重建（`set_chart`）时缓存跟着一起更新
+        st.set_chart(chart_from_doc(&doc));
+        assert_eq!(st.content_end_beat, 4.0, "重建后与视图模型一致（文档里确实只有那个音符）");
     }
 
     /// 编辑区窗口（黄线取底部、浅色带取整段）：底部 = 播放头退回 `lead_beats`，顶部 = +可见拍数

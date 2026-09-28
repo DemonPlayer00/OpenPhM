@@ -3314,3 +3314,68 @@ let text_w = |s: &str| ctx.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clo
 （`grep -n "线 #{} · 轨道"` 一眼看到两处），别假设只有一处。
 
 测试 214 通过 / 0 失败 / 0 警告；Windows 目标 0 警告。
+
+## 7.58 "放了音符时间轴还是短的"：总长读了一份会过期的视图模型（2026-09-28）
+
+用户："**在放了音符的谱面上，底部时间轴还是保持短的状态。改为 max(音乐时长,最后事件或音符)+10拍**"
+（公式与 §7.56 一致 —— 所以这不是"再改一次公式"，而是**公式没错、喂给它的输入是旧的**。）
+
+### 复现（先看见，再动手）
+
+跑起来用控制通道加一个**远端**音符，然后自己截图：
+
+| | 左栏（子音符） | 时间轴读数 |
+|---|---|---|
+| 加音符（beat 200 = 68.966s）后 | `2  68.966s  0.0  Tap` | **`总长 20.0s`** ← 音符在轴外 |
+
+`20.0s` = 旧的 48 拍 + 10 拍留白（@174BPM）。也就是说：**谱面内容变了，时间轴的长度没跟上**。
+
+### 根因：总长读的是"视图模型里的副本"，而那份副本不是每次内容变化都重建
+
+```rust
+// 旧
+pub fn timeline_end_beat(&self) -> f64 {
+    let content = self.chart.tmap.end_beat;   // ← 视图模型里的 end_beat
+    ...
+}
+```
+
+`state.chart` 只在广播话题里带 **`structure`** 时才整表重建（`apply_dirty` 里那一支）；
+加/删/移动音符走的是"**逐线局部重建**"那条路（只改该线的一部分），于是 `tmap.end_beat` 一直是旧值。
+`Documet::chart_end()` 本身是对的（它每次现算），错的是**我们读了一份缓存**。
+
+### 改法：内容末端单独缓存，并且**每条内容广播都刷新**
+
+```rust
+// state.rs
+pub content_end_beat: f64,               // 由文档算出来（doc.chart_end()），不是视图模型的副本
+pub fn set_content_end_beat(&mut self, beat: f64)
+pub fn set_chart(&mut self, chart: Chart) // 整表重建时连它一起同步（避免"谁忘了同步"）
+
+// main.rs::apply_dirty —— 任何**内容**变化都刷新（structure/props/notes/tracks）
+if d.structure || !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_empty() {
+    let end = self.core.lock().unwrap().doc().chart_end().to_f64();
+    self.state.set_content_end_beat(end);
+}
+```
+
+- 只算末端（`chart_end()` 是 note/事件的 max），**不重建视图模型** ⇒ 每条广播都能做；
+- 刻意**不含 `d.meta`**：改曲名/曲师不影响长度，别为它白扫一遍所有音符；
+- 播放头/可见范围/`seek` 也走同一个总长 ⇒ 它们跟着一起能到达新末端（以前被短的总长夹住）。
+
+### 实测（同一次实验，改前 / 改后）
+
+| | 时间轴读数 |
+|---|---|
+| 改前 | `总长 20.0s`（音符在 68.966s，落在轴外） |
+| 改后 | **`总长 72.4s`**（= 200 拍 + 10 拍 @174BPM）✔ |
+
+截图：`artifacts/timeline-stale-length-bug.png`（改前）与 `artifacts/timeline-grows-with-notes.png`（改后）。
+
+### 单测钉住的那条不变量
+
+`timeline_length_follows_new_notes_even_when_the_view_model_is_stale`：
+**故意让视图模型过期**（`st.chart.tmap.end_beat` 停在 4 拍），只调 `set_content_end_beat(200.0)`,
+断言总长 = 210 拍、且 `st.chart.tmap.end_beat == 4.0`（证明读的不是它）；再断言播放头能 seek 到 100s。
+
+测试 **215 通过 / 0 失败 / 0 警告**；Windows 目标 0 警告。
