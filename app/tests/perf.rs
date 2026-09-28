@@ -635,7 +635,7 @@ fn a_curved_speed_ramp_integrates_exactly() {
                     * dt;
             }
             let want = acc * 120.0;
-            let got = table.h_at(&events, &tm, sec);
+            let got = table.h_at(&tm, sec);
             assert!(
                 (got - want).abs() < 1e-6,
                 "{name} 在 {sec} 秒：查表 {got} ≠ 极细求积 {want}"

@@ -354,6 +354,18 @@ impl FlowCache {
     fn rebuild_table(&mut self, events: &[Event], tmap: &TimeMap) {
         self.table = crate::perf::SpeedTable::build(events, tmap, tmap.end_beat);
     }
+    /// 流速只是**值**变了（起止拍与缓动没动）：表的切点与分段一模一样 ⇒ 不重建，
+    /// 只从改动点起重算前缀积分（`H` 是前缀积分 —— 前半张表一个字都不用动）。
+    ///
+    /// 这是"拖动一条流速事件的值"每帧走的路：拖第 k 条时，前面那些事件的值、斜率、
+    /// 检查点全都没变。**表还没建过**时退回全量建表（否则会留下一张空的表）。
+    fn retune_table(&mut self, events: &[Event], tmap: &TimeMap, from_beat: f64) {
+        if self.table.is_empty() {
+            self.rebuild_table(events, tmap);
+        } else {
+            self.table.reaccumulate_from(events, tmap, from_beat);
+        }
+    }
     /// 一颗音符的 **`(头 H, 尾 H, 新的提示下标)`** —— 算这个**只有这一处**。
     ///
     /// 头与尾各要一次 `h_at_hinted`（hold 的尾巴是另一个时刻，而且可能落在改动点之后，
@@ -361,28 +373,29 @@ impl FlowCache {
     /// 而不是每颗各做一次二分。整表重建与异步补算必须给出一模一样的数 —— 所以共用它。
     fn note_floors(
         table: &crate::perf::SpeedTable,
-        events: &[Event],
         tmap: &TimeMap,
         n: &Note,
         hint: usize,
     ) -> (f64, f64, usize) {
-        let (h, hi) = table.h_at_hinted(events, tmap, n.time, hint);
+        let (h, hi) = table.h_at_hinted(tmap, n.time, hint);
         if n.kind == NoteKind::Hold {
-            let (t, hi) = table.h_at_hinted(events, tmap, n.end, hi);
+            let (t, hi) = table.h_at_hinted(tmap, n.end, hi);
             (h, t, hi)
         } else {
             (h, h, hi)
         }
     }
-    /// 整条线一次算好（**加载时**、以及音符表变了之后走这里）
-    fn rebuild(&mut self, notes: &[Note], events: &[Event], tmap: &TimeMap) {
+    /// 整条线一次算好（**加载时**、以及音符表变了之后走这里）。
+    ///
+    /// **不需要事件表** —— 检查点表已经把它折算成了每个切点上的"值 + 每秒斜率"。
+    fn rebuild(&mut self, notes: &[Note], tmap: &TimeMap) {
         self.head.clear();
         self.tail.clear();
         self.head.reserve(notes.len());
         self.tail.reserve(notes.len());
         let mut hint = 0usize;
         for n in notes {
-            let (h, t, hi) = Self::note_floors(&self.table, events, tmap, n, hint);
+            let (h, t, hi) = Self::note_floors(&self.table, tmap, n, hint);
             hint = hi;
             self.head.push(h);
             self.tail.push(t);
@@ -392,26 +405,20 @@ impl FlowCache {
     /// 建表 + 全部算好（**唯一**"从零建立缓存"的入口）
     fn activate(&mut self, notes: &[Note], events: &[Event], tmap: &TimeMap) {
         self.rebuild_table(events, tmap);
-        self.rebuild(notes, events, tmap);
+        self.rebuild(notes, tmap);
     }
     /// 摘出本帧要算的那一段（`region` = 播放头之后 / 之前那一半）
     fn take_stale(&mut self, region: std::ops::Range<usize>, budget: usize) -> std::ops::Range<usize> {
         self.stale.take(region, budget)
     }
     /// 把 `span` 这一段算出来（升序），返回实际算了几条
-    fn build_span(
-        &mut self,
-        notes: &[Note],
-        events: &[Event],
-        tmap: &TimeMap,
-        span: std::ops::Range<usize>,
-    ) -> usize {
+    fn build_span(&mut self, notes: &[Note], tmap: &TimeMap, span: std::ops::Range<usize>) -> usize {
         if span.start >= span.end || span.end > notes.len() || span.end > self.head.len() {
             return 0;
         }
         let mut hint = 0usize;
         for i in span.clone() {
-            let (h, t, hi) = Self::note_floors(&self.table, events, tmap, &notes[i], hint);
+            let (h, t, hi) = Self::note_floors(&self.table, tmap, &notes[i], hint);
             hint = hi;
             self.head[i] = h;
             self.tail[i] = t;
@@ -504,7 +511,7 @@ impl Line {
     /// `H(sec)`（绝对位置，RPE y 单位）：查这条线的流速检查点表。
     /// **任何时刻都能问**（过去/现在/将来一视同仁，不是"只会往前走"的累加器）。
     pub fn h_at(&self, sec: f64, tmap: &TimeMap) -> f64 {
-        self.floors.table.h_at(&self.tracks[4].events, tmap, sec)
+        self.floors.table.h_at(tmap, sec)
     }
 
     /// 该音符此刻离判定线多远（**预算好的值**；`None` = 还没算准 ⇒ 调用方现算）
@@ -547,7 +554,7 @@ impl Line {
             .iter()
             .map(|n| (n.end - n.time).max(0.0))
             .fold(0.0_f64, f64::max);
-        self.floors.rebuild(&self.notes, &self.tracks[4].events, tmap);
+        self.floors.rebuild(&self.notes, tmap);
     }
 
     /// 换上新的**事件轨道**（按线局部重建的唯一入口）。
@@ -560,6 +567,8 @@ impl Line {
     ///    没跟着变宽，本该看得见的音符整颗没有实例（与那个真 bug 同源）。
     pub fn set_tracks(&mut self, tracks: [TrackView; 5], tmap: &TimeMap) {
         let changed = first_speed_change(&self.tracks[4].events, &tracks[4].events);
+        let value_only =
+            crate::perf::speed_shape_unchanged(&self.tracks[4].events, &tracks[4].events);
         self.min_speed_abs =
             crate::perf::min_speed_magnitude(&tracks[4].events, tmap)
                 .unwrap_or(crate::perf::SPEED_DEFAULT);
@@ -569,12 +578,17 @@ impl Line {
             // （"之后"按**头或尾**算：长 hold 的尾巴可能落在改动之后而头在之前，见
             // `FlowCache::mark_from_sec`）
             Some(beat) => {
-                self.floors.rebuild_table(&self.tracks[4].events, tmap);
+                // 只是滑值 ⇒ 表只重算改动点之后的前缀积分；动了起止拍/缓动才全量重建
+                if value_only {
+                    self.floors.retune_table(&self.tracks[4].events, tmap, beat);
+                } else {
+                    self.floors.rebuild_table(&self.tracks[4].events, tmap);
+                }
                 if self.floors.len() == self.notes.len() {
                     self.floors.mark_from_sec(tmap.sec(beat), &self.notes);
                 } else {
                     // 缓存还没建过（或与音符表长度对不上，比如这条线刚从 `line_shell` 造出来）
-                    self.floors.rebuild(&self.notes, &self.tracks[4].events, tmap);
+                    self.floors.rebuild(&self.notes, tmap);
                 }
             }
             // **流速没变**（改的是透明度/移动/旋转…）：位置照旧有效，连检查点表都不用重建 ——
@@ -585,6 +599,13 @@ impl Line {
             }
             None => {}
         }
+    }
+
+    /// **测试用**：绕过"值没变就不重建"的快路，强制整表重建 + 整条重算 ——
+    /// 给"后缀重算"当基准（生产代码里没有这条路：`set_tracks` 自己会挑）。
+    #[cfg(test)]
+    fn floors_test_force_full_rebuild(&mut self, events: &[Event], tmap: &TimeMap) {
+        self.floors.activate(&self.notes, events, tmap);
     }
 
     /// 本帧把这条线待重算的位置补一段：`after = true` 先补**播放头之后**那一半，
@@ -603,7 +624,7 @@ impl Line {
             if span.is_empty() {
                 break;
             }
-            let got = self.floors.build_span(&self.notes, &self.tracks[4].events, tmap, span);
+            let got = self.floors.build_span(&self.notes, tmap, span);
             if got == 0 {
                 break;
             }
@@ -1948,6 +1969,48 @@ mod tests {
             let got = line.floor_offset(i, h_now).expect("改动点之前的音符仍然算准");
             let direct = line.floor_offset_now(line.notes[i].time, h_now, &tmap);
             assert!((got - direct).abs() < 1e-9, "第 {i} 颗：{got} ≠ {direct}");
+        }
+    }
+
+    /// **拖动流速的值走的是"后缀重算"，结果必须与全量重建逐位相同**。
+    ///
+    /// 这条钉的是"值变了就不重建整张表"那个优化：它靠的是 `H` 是**前缀**积分
+    /// （改动点之前一个字都不用动）。只要有一条音符的位置对不上，画面就会在拖动时抖。
+    #[test]
+    fn a_value_only_speed_edit_lands_on_the_same_positions_as_a_full_rebuild() {
+        // 三块流速 + 一批音符，第二块的值会被"拖"
+        let doc = speed_doc(
+            vec![ev(0.0, 4.0, 10.0, 20.0), ev(4.0, 8.0, 20.0, 6.0), ev(8.0, 12.0, 6.0, 14.0)],
+            &(0..24).map(|k| ("tap", 0.5 + k as f64 * 0.5, None)).collect::<Vec<_>>(),
+        );
+        let chart = chart_from_doc(&doc);
+        let tmap = chart.tmap.clone();
+        let mut line = chart.lines[0].clone();
+        // 拖第 1 块：只改值（起止拍不动）
+        let mut tracks = line.tracks.clone();
+        tracks[4].events[1].end_value = serde_json::json!(31.5);
+        tracks[4].events[1].start_value = serde_json::json!(12.25);
+        line.set_tracks(tracks, &tmap);
+        // 全部补齐（异步那条路），再与"从零建一遍"逐位比
+        let playhead = 5.0;
+        while line.floors.stale_count() > 0 {
+            // 两半都补（`after = true` 是"播放头之后"那一半，顺序与 GUI 一致）
+            let done = line.pump_floors(playhead, true, 4096, &tmap)
+                + line.pump_floors(playhead, false, 4096, &tmap);
+            assert!(done > 0, "还有 {} 颗没算准，却一颗都补不动", line.floors.stale_count());
+        }
+        let h_now = line.h_at(playhead, &tmap);
+        // 基准：把同一份事件交给一条**全新**的线（走 `activate` = 建表 + 全部算好）
+        let mut fresh = chart.lines[0].clone();
+        let mut tracks2 = fresh.tracks.clone();
+        tracks2[4].events[1].end_value = serde_json::json!(31.5);
+        tracks2[4].events[1].start_value = serde_json::json!(12.25);
+        fresh.set_tracks(tracks2.clone(), &tmap);
+        fresh.floors_test_force_full_rebuild(&tracks2[4].events, &tmap);
+        for i in 0..line.notes.len() {
+            let a = line.floor_offset(i, h_now).expect("补齐之后都算准了");
+            let b = fresh.floor_offset(i, h_now).expect("全量重建那边也都有");
+            assert_eq!(a.to_bits(), b.to_bits(), "第 {i} 颗：后缀重算 {a} ≠ 全量重建 {b}");
         }
     }
 
