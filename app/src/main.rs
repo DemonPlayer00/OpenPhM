@@ -2454,14 +2454,18 @@ impl App {
                 for i in &d.notes {
                     let notes = state::notes_of(c.doc(), *i, &tmap);
                     if let Some(slot) = self.state.chart.lines.iter_mut().find(|x| x.index == *i) {
-                        slot.notes = notes;
+                        // 走 `set_notes` 而不是直接赋值：音符位置缓存（加载时算好的那份）
+                        // 必须跟着重算 —— 下标全变了，"只补一段"补不对
+                        slot.set_notes(notes, &tmap);
                         self.builds_notes += 1;
                     }
                 }
                 for i in &d.tracks {
                     let tracks = state::tracks_of(c.doc(), *i, &tmap);
                     if let Some(slot) = self.state.chart.lines.iter_mut().find(|x| x.index == *i) {
-                        slot.tracks = tracks;
+                        // 走 `set_tracks`：流速真的变了就把**它之后**的音符位置标成待重算
+                        // （异步补齐，见下面的 `pump_floors`），并刷新构建窗口用的 min_speed_abs
+                        slot.set_tracks(tracks, &tmap);
                         self.builds_tracks += 1;
                     }
                 }
@@ -3334,6 +3338,14 @@ impl eframe::App for App {
         // ---- 唯一的更新入口：抽广播 → 置脏 → 只重建脏掉的那块 ----
         // GUI 不轮询 `revision`、不直接读文档判断"要不要更新"：文档什么时候变了，由 EditCore 说。
         self.pump_broadcasts();
+        // ---- 音符位置重算：**异步补一小段**（在帧里做，不开线程）----
+        //
+        // 流速事件一改，它之后的音符位置就过期了（`Line::set_tracks` 把那段标脏）。
+        // 这里每帧补 `FLOOR_NOTES_PER_FRAME` 条，顺序是"从当前时间轴 → 结尾"再
+        // "从头 → 当前时间轴"（屏幕上马上要用的先算）；没补好的那些音符在渲染侧**现算**，
+        // 所以补得快慢都不影响画面 —— 它只决定每帧要花多少代价，进度显示在底栏。
+        // 放在 `build_instances` **之前**：这一帧补好的位置这一帧就用上。
+        self.state.pump_floors(EditorState::FLOOR_NOTES_PER_FRAME);
         // 编辑期把文档快照写回解压缓存（节流；被强杀时"继续此谱面"才有东西可继续）
         self.maybe_snapshot(Instant::now());
 
@@ -3597,6 +3609,8 @@ impl eframe::App for App {
                 show_conflicts: self.show_conflicts,
                 // 编辑器里常驻的只有状态栏 ⇒ 消息也显示在这里（文件对话框里那份照旧）
                 notice: self.file_message.clone(),
+                // 音符位置重算的进度（流速事件改了之后要异步补的那批活）
+                floor_rebuild: self.state.floor_rebuild(),
                 diagnostics,
             };
             let act = egui::Panel::bottom("status").show(ui, |ui| {
@@ -4050,6 +4064,16 @@ impl eframe::App for App {
                 "跳过 整表{}/属性{}/音符{}/轨道{}",
                 self.skipped_structure, self.skipped_props, self.skipped_notes, self.skipped_tracks
             ));
+            // 音符位置缓存：待重算条数（0 = 全部算准）。这行是"异步补完了没有"的读数 ——
+            // 底栏那行字只在真的在补时出现，**补完就没了**，所以核对时要看这里。
+            match self.state.floor_rebuild() {
+                Some((done, total)) => {
+                    ui.monospace(format!("位置缓存 重算中 {done}/{total}"));
+                }
+                None => {
+                    ui.monospace(format!("位置缓存 已算准（{} 条）", self.state.floor_cached()));
+                }
+            }
             } // Debug 工作区结束
         });
         }
@@ -4319,7 +4343,9 @@ impl eframe::App for App {
         // 只认「正在按住/拖拽」。
         let interacting = ctx.egui_is_using_pointer();
         // 「等广播」也是工作态：命令已交给 EditCore，界面要保持出帧才能及时应用更新
-        let awaiting = self.pending_dispatch.is_some() || self.dirty.any();
+        // 「还在补音符位置」也是工作态：不主动出帧的话它会在别人看的时候停在那儿不动
+        let awaiting =
+            self.pending_dispatch.is_some() || self.dirty.any() || self.state.floor_pending() > 0;
         // bench 的活跃阶段本身就是「持续出帧」的测量场景，需强制视为工作态，
         // 否则事件驱动下帧数永远到不了目标值（实测踩过：进程直接被 timeout 杀掉）。
         let bench_active = self.args.bench > 0 && self.frames < self.args.bench;

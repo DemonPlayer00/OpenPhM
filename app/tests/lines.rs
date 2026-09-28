@@ -7,7 +7,7 @@
 
 use opm_app::doc::{Beat, BpmEntry, Document, Event, JudgeLine, Note as DocNote, NoteKind as DocKind};
 use opm_app::render::{build_instances, NoteInstance};
-use opm_app::state::{chart_from_doc, EditorState, TrackId};
+use opm_app::state::{chart_from_doc, tracks_of, EditorState, TrackId};
 use serde_json::json;
 
 /// 造一份 2 条线的小谱面：L0 在原点，L1 平移 moveY 并**常量**旋转 `rotate_to`。
@@ -980,7 +980,7 @@ fn notes_inside_the_window_are_drawn_however_far_they_are_from_the_line() {
 
 /// **hold 的尾巴位置必须按当前时刻推算**（用户发现："没有给 hold 尾部推算位置"）。
 ///
-/// 曾经算成"头的偏移 + 整段时长"，而头的偏移来自**单调累加器**（`SpeedAccum` 只往前走，
+/// 曾经算成"头的偏移 + 整段时长"，而头的偏移当时来自一个**单调累加器**（它只往前走，
 /// 查询过去的时刻一律返回当前累计值 0）⇒ 被按住时尾巴被钉死在"头 + 全长"上：
 /// 身子不随按住而缩短，尾巴过去之后也永远不消失。
 #[test]
@@ -1187,5 +1187,264 @@ fn visible_notes_are_always_drawn_and_below_line_ones_never_are() {
             "事件 [{a},{b}] {from}→{to}：窗口里的音符漏画了 {above_missing} 次"
         );
         assert!(below > 0 && above > 0, "用例本身要覆盖到线的两侧");
+    }
+}
+
+// ------------------------------------------------ 音符位置：加载时算好 + 异步重算
+
+/// 一份"一条线 + 多段流速 + 若干音符（含 hold）"的谱面（BPM 120 ⇒ 一拍 0.5 秒）。
+///
+/// 刻意混进四件难事：**缓动段**（段内梯形法与线性不同）、**空隙**（保持前一条的终值）、
+/// **负流速段**（音符在判定线之下）、**长 hold**（尾巴要单独推算位置）。
+fn floor_doc() -> Document {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    // 秒 → 拍（BPM 120 ⇒ 一拍 0.5 秒；写 `sec × 8 / 4` 保证落在精确的 1/4 拍上）
+    let beat = |sec: f64| Beat::new((sec * 8.0).round() as i64, 4);
+    let mut ev = |a: f64, b: f64, from: f64, to: f64, easing: &str| {
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            beat(a),
+            beat(b),
+            json!(from),
+            json!(to),
+            easing,
+        ));
+    };
+    ev(0.0, 1.0, 10.0, 20.0, "linear"); // 起步加速
+    ev(4.0, 6.0, 20.0, -10.0, "inOutQuad"); // 1~4 秒是空隙（保持 20），之后掉到负流速
+    ev(6.0, 12.0, -10.0, 10.0, "outCubic"); // 负→正
+    // 音符：铺满整条时间轴，含两条 hold（一条长的、一条在负流速段里且音符 speed = 2）
+    for (k, sec) in [0.5_f64, 1.0, 2.5, 3.5, 5.5, 7.0, 9.0].iter().enumerate() {
+        l.notes.push(DocNote::new(DocKind::Tap, beat(*sec), -600.0 + 200.0 * k as f32));
+    }
+    let mut h1 = DocNote::new(DocKind::Hold, beat(1.5), -500.0);
+    h1.end = Some(beat(8.0));
+    l.notes.push(h1);
+    let mut h2 = DocNote::new(DocKind::Hold, beat(5.0), 0.0);
+    h2.end = Some(beat(9.0));
+    h2.speed = 2.0;
+    l.notes.push(h2);
+    doc.judge_lines.push(l);
+    doc
+}
+
+/// 两个 `EditorState` 在给定播放头下**逐实例比对**（位置 / 半宽 / 颜色 / 角度）
+fn assert_same_instances(a: &mut EditorState, b: &mut EditorState, at: f64, why: &str) {
+    a.playhead = at;
+    b.playhead = at;
+    let mut ia = Vec::new();
+    let mut ib = Vec::new();
+    build_instances(a, &mut ia);
+    build_instances(b, &mut ib);
+    assert_eq!(ia.len(), ib.len(), "{why}：t={at} 实例条数不同");
+    for (k, (x, y)) in ia.iter().zip(&ib).enumerate() {
+        assert_eq!(x.center(), y.center(), "{why}：t={at} 第 {k} 个实例位置不同");
+        assert_eq!(x.half(), y.half(), "{why}：t={at} 第 {k} 个实例大小不同");
+        assert_eq!(x.color(), y.color(), "{why}：t={at} 第 {k} 个实例颜色不同");
+        assert_eq!(x.angle(), y.angle(), "{why}：t={at} 第 {k} 个实例角度不同");
+    }
+}
+
+/// **"预算好的位置"与"现算的位置"给出的是同一帧**（逐位相同）。
+///
+/// 这是这整套缓存最要紧的性质：异步重算补没补完、补到哪儿、中途又改没改，**画面都一样** ——
+/// 于是"异步"退化成纯粹的代价问题，不必为它再写一份渲染语义。
+/// 做法：同一条线，缓存干净时建一次实例；把缓存整条标脏（等价于"一颗都还没重算"）再建一次，
+/// 两次的实例逐字段比对（含 hold 尾巴与击中效果 —— 它们都吃位置）。
+#[test]
+fn cached_and_on_the_fly_positions_agree() {
+    let doc = floor_doc();
+    for t in [0.0, 0.4, 1.2, 1.9, 2.8, 3.3, 4.5, 5.2, 6.4, 7.8, 9.5] {
+        let mut a = EditorState::new(chart_from_doc(&doc));
+        a.selected_line = usize::MAX;
+        let mut b = EditorState::new(chart_from_doc(&doc));
+        b.selected_line = usize::MAX;
+        b.chart.lines[0].mark_floors_stale_from(0); // 整条标脏 ⇒ 每个音符都走"现算"
+        assert_eq!(
+            b.floor_pending(),
+            b.chart.lines[0].notes.len(),
+            "整条该是脏的（否则这条用例没测到现算路径）"
+        );
+        assert_same_instances(&mut a, &mut b, t, "缓存 vs 现算");
+    }
+}
+
+/// **流速事件改了之后：改完的下一帧就已经是对的**，异步补完还是对的。
+///
+/// 走的是 GUI 那条路（`tracks_of` → `Line::set_tracks`，即"按线局部重建"）：
+/// ① 改完立刻与"从头加载这份改过的谱面"逐实例相同；
+/// ② 待重算的那些确实被标脏了（否则这条测试等于没测异步）；
+/// ③ 一帧一小段补完之后，仍然与从头加载完全相同。
+#[test]
+fn a_speed_edit_is_correct_before_and_after_the_async_rebuild() {
+    let doc = floor_doc();
+    // 改第 2 条流速事件（4~6 秒那段）的起始值：20 → 3
+    let mut edited = doc.clone();
+    {
+        let t = edited.judge_lines[0].layers[0].track_mut("speed").unwrap();
+        t[1].start_value = json!(3.0);
+    }
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    let tmap = st.chart.tmap.clone();
+    let tracks = tracks_of(&edited, 0, &tmap);
+    st.chart.lines[0].set_tracks(tracks, &tmap);
+
+    let mut fresh = EditorState::new(chart_from_doc(&edited));
+    fresh.selected_line = usize::MAX;
+    let dirty = st.floor_pending();
+    assert!(dirty > 0, "这次改动该弄脏一部分音符（否则下面测的不是异步）");
+    assert!(dirty < st.chart.lines[0].notes.len(), "前缀积分：不该整条都脏");
+
+    let spots = [0.0, 1.0, 3.0, 4.2, 5.0, 6.5, 8.5, 10.0];
+    for t in spots {
+        assert_same_instances(&mut st, &mut fresh, t, "改完但还没重算");
+    }
+    // 异步补齐：一帧只补 3 条（远小于 `FLOOR_NOTES_PER_FRAME`，好确认它真的一步步来）
+    let mut frames = 0;
+    while st.floor_pending() > 0 {
+        assert!(st.pump_floors(3) <= 3, "一帧不许超过预算");
+        frames += 1;
+        assert!(frames <= dirty, "补不完：{dirty} 条脏、{frames} 帧");
+    }
+    assert_eq!(st.floor_rebuild(), None, "补完之后不该还挂着进度");
+    for t in spots {
+        assert_same_instances(&mut st, &mut fresh, t, "重算之后");
+    }
+}
+
+/// 判定线**之下**的音符在"现算"路径上也一律不画（现算路径 = 缓存被标脏之后那条路）。
+///
+/// 基准是**直接积分**（`perf::speed_travel(此刻 → 打击时刻)`）：它 < 0 的那些帧，
+/// 一个实例都不许有。这条用例顺带抓出过一个真 bug —— 走法在**空隙之后把下一条事件整条跳过**，
+/// 于是前缀积分（渲染用的那条）与直接积分在空隙之后分家；见 `perf::walk_speed`。
+#[test]
+fn the_below_the_line_rule_holds_on_the_on_the_fly_path_too() {
+    let doc = floor_doc();
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    st.chart.lines[0].mark_floors_stale_from(0); // 全部走现算
+    let tmap = st.chart.tmap.clone();
+    let events = st.chart.lines[0].tracks[4].events.clone();
+    let notes: Vec<(f64, f32)> = st.chart.lines[0]
+        .notes
+        .iter()
+        .map(|n| (n.time, n.lane_x))
+        .collect();
+    for (t_hit, lane) in &notes {
+        let mut t = 0.0;
+        while t < *t_hit {
+            let want = opm_app::perf::speed_travel(&events, &tmap, t, *t_hit);
+            if want < -1.0 {
+                st.playhead = t;
+                let mut inst = Vec::new();
+                build_instances(&st, &mut inst);
+                let drawn = inst.iter().any(|q| {
+                    let c = q.color();
+                    (q.center()[0] - lane).abs() < 1.0
+                        && (c[0] - 0.35).abs() < 0.02
+                        && (c[1] - 0.65).abs() < 0.02
+                        && (c[2] - 1.0).abs() < 0.02
+                });
+                assert!(!drawn, "t={t}（打击时刻 {t_hit}）：位置 {want:.0} 在判定线之下，却画了音符");
+            }
+            t += 0.1;
+        }
+    }
+}
+
+/// **空隙之后的事件必须被算进去**（渲染侧验收：位置必须是**手算**出来的那个数）。
+///
+/// 谱面：流速 0~1 秒 = 0.5、**1~2 秒是空隙**（保持 0.5）、2~5 秒 = 10、5~8 秒 = 20。
+/// 播放头 0.875 秒（**在空隙之前**），两颗音符在 2.125 / 2.25 秒。手算（不依赖任何一行积分代码）：
+///
+/// ```text
+///   [0.875, 1.00]  0.5  → 0.125 × 0.5 × 120 =  7.5
+///   [1.00,  2.00]  0.5  → 1.000 × 0.5 × 120 = 60      （空隙里保持前一条的终值）
+///   [2.00,  2.125] 10   → 0.125 × 10  × 120 = 150     ⇒ 第一颗 217.5
+///   [2.00,  2.25]  10   → 0.250 × 10  × 120 = 300     ⇒ 第二颗 367.5
+/// ```
+///
+/// 走法出错时（把空隙之后那条事件整条跳过）会一直拿 0.5 算 ⇒ 90 / 105 ——
+/// 音符**还在画面上**，只是位置差了几百单位。这比"丢了"更难发现，
+/// 而且**不能拿 `speed_travel(播放头 → 音符)` 当基准**（它和渲染侧的旧实现共用同一个走法，
+/// 会一起错、于是对得上）—— 必须手算。
+#[test]
+fn a_note_after_a_gap_sits_where_the_direct_integral_says() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    let beat = |b: f64| Beat::new((b * 4.0).round() as i64, 4);
+    let mut push = |a: f64, b: f64, v: f64| {
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            beat(a),
+            beat(b),
+            json!(v),
+            json!(v),
+            "linear",
+        ));
+    };
+    push(0.0, 2.0, 0.5); // 0~1 秒
+    // 2~4 拍（1~2 秒）故意留空
+    push(4.0, 10.0, 10.0); // 2~5 秒
+    push(10.0, 16.0, 20.0); // 5~8 秒
+    for (k, b) in [4.25_f64, 4.5].iter().enumerate() {
+        l.notes.push(DocNote::new(DocKind::Tap, beat(*b), -300.0 + 600.0 * k as f32));
+    }
+    doc.judge_lines.push(l);
+
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    st.playhead = 0.875;
+    let mut inst = Vec::new();
+    build_instances(&st, &mut inst);
+    for (k, sec, want) in [(0usize, 2.125_f64, 217.5_f32), (1, 2.25, 367.5)] {
+        let lane = -300.0 + 600.0 * k as f32;
+        let got = inst.iter().find(|q| {
+            let c = q.color();
+            (q.center()[0] - lane).abs() < 1.0
+                && (c[0] - 0.35).abs() < 0.02
+                && (c[1] - 0.65).abs() < 0.02
+                && (c[2] - 1.0).abs() < 0.02
+        });
+        let q = got.unwrap_or_else(|| panic!("{sec} 秒那颗（手算偏移 {want}）没被画出来"));
+        assert!(
+            (q.center()[1] - want).abs() < 0.5,
+            "{sec} 秒那颗应在 {want}（手算），实际 {} —— 空隙之后的事件被跳过了？",
+            q.center()[1]
+        );
+    }
+}
+
+/// **空隙之后的事件必须被算进去**（前缀积分 vs 直接积分的一条回归）。
+///
+/// 走法曾经在"空隙段走完"时也把 `idx` 前进一格，于是那条**正好从空隙终点开始**的事件
+/// 被整条跳过：积分在空隙之后永远保持空隙前的值 —— 谱面里只要有一个空隙，它后面全错。
+/// 这里把两种口径逐点对账（`H` 是前缀积分，两者的差必须等于"两点之间的直接积分"）。
+#[test]
+fn the_integral_keeps_going_after_a_gap() {
+    let doc = floor_doc();
+    let chart = chart_from_doc(&doc);
+    let tmap = chart.tmap.clone();
+    let line = &chart.lines[0];
+    let events = line.tracks[4].events.clone();
+    for sec in [0.5_f64, 1.5, 2.5, 3.9, 4.1, 5.0, 5.4, 6.2, 7.5, 9.0, 11.0] {
+        let prefix = line.h_at(sec, &tmap);
+        let direct = opm_app::perf::speed_travel(&events, &tmap, 0.0, sec);
+        assert!(
+            (prefix - direct).abs() < 1e-6,
+            "t={sec}：前缀积分 {prefix} ≠ 从 0 直接积分 {direct}（空隙之后的事件被跳过了？）"
+        );
     }
 }

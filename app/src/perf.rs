@@ -317,6 +317,8 @@ pub const SPEED_DEFAULT: f64 = 10.0;
 /// 为什么是积分而不是"两端平均值 × 时长"：音符的纵向位置本来就是 `H(t_音符) − H(t_此刻)`
 /// （RPE/prpr 的 floor position），而缓动段里 v 一直在变 —— 用端点近似会在长缓动段上跑偏。
 ///
+/// 这是**直接查询**那一份（从 `from_sec` 起现积）：用途是"任意两时刻之间走了多远"，
+/// 以及**测试里的独立基准**（编辑器自己走的是 [`SpeedTable`] 的检查点查表，两者互为对账）。
 /// 实现：**事件边界**当必须的抽点，段内再等分抽 [`SPEED_SAMPLES_PER_SEGMENT`] 点走梯形法。
 /// 线性段因此是精确的（梯形法对线性就是精确积分），非线性缓动是高精度近似
 /// （prpr 对带缓动的事件同样是数值积分）。
@@ -331,7 +333,8 @@ pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64
     let b_from = tmap.beat(from_sec);
     let idx = events.partition_point(|e| e.end.to_f64() <= b_from);
     let (_, _, acc) = integrate_until(events, tmap, idx, b_from, 0.0, tmap.beat(to_sec));
-    // 积分出来的 `acc` 是 `∫v dτ`（流速单位 × 秒）；换算成 RPE y 单位只在这两处乘法里发生
+    // 积分出来的 `acc` 是 `∫v dτ`（流速单位 × 秒）；换算成 RPE y 单位只在这里与
+    // `SpeedTable::h_at_hinted` 两处乘法里发生
     acc * SPEED_UNITS_PER_SEC
 }
 
@@ -365,100 +368,87 @@ pub fn min_speed_magnitude(events: &[Event], samples_per_event: usize) -> Option
 /// 每一段里抽几个点走梯形法。线性段与常值段不需要抽（见 [`integrate_until`]）。
 pub const SPEED_SAMPLES_PER_SEGMENT: usize = 8;
 
-/// **单调流速累加器**：从 `origin_sec` 起一路往后积，摊还 O(1)。
-///
-/// 演奏区每帧要给窗口内每个音符算纵向位置，而音符是**按时间排好序**的 ——
-/// 从播放头逐个音符重新积分是 O(音符 × 事件)，大谱面上这笔钱每帧都要付；
-/// 单调走一遍的总代价只与**这段时间里的流速事件条数**有关，与音符数量无关。
-pub struct SpeedAccum<'a> {
-    events: &'a [Event],
-    tmap: &'a TimeMap,
-    idx: usize,
-    at_beat: f64,
-    acc: f64,
-}
-
-impl<'a> SpeedAccum<'a> {
-    /// 从 `origin_sec` 起算（通常是播放头）
-    pub fn new(events: &'a [Event], tmap: &'a TimeMap, origin_sec: f64) -> Self {
-        let at_beat = tmap.beat(origin_sec);
-        let idx = events.partition_point(|e| e.end.to_f64() <= at_beat);
-        Self { events, tmap, idx, at_beat, acc: 0.0 }
-    }
-
-    /// 积到 `sec`，返回 `H(sec) − H(origin)`（RPE y 单位）。
-    /// **必须不早于上一次**（调用方保证升序：音符本来就是升序的）。
-    pub fn to(&mut self, sec: f64) -> f64 {
-        let b = self.tmap.beat(sec);
-        if b <= self.at_beat {
-            return self.acc * SPEED_UNITS_PER_SEC;
-        }
-        let (idx, at, acc) =
-            integrate_until(self.events, self.tmap, self.idx, self.at_beat, self.acc, b);
-        self.idx = idx;
-        self.at_beat = at;
-        self.acc = acc;
-        acc * SPEED_UNITS_PER_SEC
-    }
-}
-
-/// 一段流速的求值方式：走在某条事件的缓动上，或"保持"某个定值（空隙里 / 首尾之外）
-#[derive(Clone, Copy)]
-enum SpeedSeg<'a> {
-    Eased(&'a Event),
+/// 一段流速的求值方式：走在某条事件的缓动上（**记下标**：检查点表要把"哪一段"存下来，
+/// 跨帧、跨查询用），或"保持"某个定值（空隙里 / 首尾之外）。
+#[derive(Clone, Copy, Debug)]
+enum SpeedSeg {
+    Eased(usize),
     Hold(f64),
 }
 
-impl SpeedSeg<'_> {
-    fn at(&self, beat: f64) -> f64 {
+impl SpeedSeg {
+    fn at(self, events: &[Event], beat: f64) -> f64 {
         match self {
-            SpeedSeg::Hold(v) => *v,
-            SpeedSeg::Eased(e) => event_value(e, beat),
+            SpeedSeg::Hold(v) => v,
+            SpeedSeg::Eased(i) => events.get(i).map(|e| event_value(e, beat)).unwrap_or(0.0),
         }
     }
 }
 
-/// 从 `(idx, at_beat, acc)` 一直积到 `b_to`，返回新的 `(idx, at_beat, acc)`。
+/// 位置 `at_beat`、下一条还没走完的事件是 `events[idx]` 时，**这一段**怎么求值。
 ///
-/// 这是流速积分的**唯一**实现：直接查询（[`speed_travel`]）与单调累加（[`SpeedAccum`]）
-/// 共用它，于是"段怎么切、空隙怎么算"只有一处定义。
-fn integrate_until(
+/// 判断只此一份：整条走一遍（[`walk_speed`]）与"从检查点往前外推"（[`SpeedTable`]）都从它拿值，
+/// 段怎么切才不会在两处慢慢分家。
+fn seg_at(events: &[Event], idx: usize, at_beat: f64) -> SpeedSeg {
+    match events.get(idx) {
+        // 事件覆盖着当前位置：值走它的缓动，段尾就是它的终点
+        Some(e) if e.start.to_f64() <= at_beat => SpeedSeg::Eased(idx),
+        // 空隙（或在首条事件之前）：保持"上一条的终值"（首条之前取它的起始值）
+        ev => SpeedSeg::Hold(
+            held_value(&events[..idx], at_beat)
+                .or_else(|| ev.and_then(|e| as_f64(&e.start_value)))
+                .unwrap_or(SPEED_DEFAULT),
+        ),
+    }
+}
+
+/// 流速积分的**唯一走法**：从 `(idx, at_beat, acc)` 一路积到 `b_to`。
+///
+/// `acc` 的单位是"流速单位 × 秒"（换算成 RPE y 单位只在 [`speed_travel`] 与 [`SpeedTable::build`]
+/// 两处乘 120）。每走到一段就回调一次 `on_seg(段起点拍, 段起点处的 acc, 这一段怎么求值)` ——
+/// [`SpeedTable`] 靠它记检查点，其余调用方传一个空闭包。
+///
+/// 抽点方式：**事件边界**当必须的抽点，段内再等分抽 [`SPEED_SAMPLES_PER_SEGMENT`] 点走梯形法。
+/// 线性段因此是精确的（梯形法对线性就是精确积分），非线性缓动是高精度近似
+/// （prpr 对带缓动的事件同样是数值积分）。
+fn walk_speed(
     events: &[Event],
     tmap: &TimeMap,
     mut idx: usize,
     mut at_beat: f64,
     mut acc: f64,
     b_to: f64,
+    mut on_seg: impl FnMut(f64, f64, SpeedSeg),
 ) -> (usize, f64, f64) {
     while at_beat < b_to {
         let ev = events.get(idx);
-        let seg = match ev {
-            // 事件覆盖着当前位置：值走它的缓动，段尾就是它的终点
-            Some(e) if e.start.to_f64() <= at_beat => SpeedSeg::Eased(e),
-            // 空隙（或在首条事件之前）：保持"上一条的终值"（首条之前取它的起始值）
-            _ => {
-                let held = held_value(&events[..idx], at_beat)
-                    .or_else(|| ev.and_then(|e| as_f64(&e.start_value)))
-                    .unwrap_or(SPEED_DEFAULT);
-                SpeedSeg::Hold(held)
-            }
+        let seg = seg_at(events, idx, at_beat);
+        on_seg(at_beat, acc, seg);
+        // 这一段到哪里为止：事件段到事件终点，空隙段到下一条事件的**起点**（没有下一条就到底）。
+        // `consumed` 区分两种"走到 seg_end"：事件段走完才换下一条事件；
+        // 空隙段走完时 `events[idx]` **还没被用过**（它正好从 `seg_end` 开始）⇒ idx 不许前进。
+        //
+        // 踩过的坑：早先两种情况一起 `idx += 1`，于是**空隙之后的那条事件被整条跳过** ——
+        // 积分在空隙之后永远保持空隙前的值（谱面里只要有一个空隙，后面全错）。
+        // 是 `tests/lines.rs` 里那条"独立基准对账"（直接积分 vs 前缀积分）把它抓出来的。
+        let (seg_end, consumed) = match (ev, &seg) {
+            (Some(e), SpeedSeg::Eased(_)) => (e.end.to_f64(), true),
+            (Some(e), _) => (e.start.to_f64(), false),
+            (None, _) => (b_to, false),
         };
-        // 这一段到哪里为止：事件段到事件终点，空隙段到下一条事件的起点（没有下一条就到底）
-        let seg_end = match (ev, &seg) {
-            (Some(e), SpeedSeg::Eased(_)) => e.end.to_f64(),
-            (Some(e), _) => e.start.to_f64(),
-            (None, _) => b_to,
-        };
-        let stop = seg_end.min(b_to);
-        acc += integrate_seg(tmap, &seg, at_beat, stop);
+        // `max(at_beat)`：病态输入（后一条事件整条包在前一条里）下 `seg_end` 会落在身后，
+        // 夹一下保证这一步**永远向前**（走法单调 ⇒ 不会原地打转，也不会重复积分）
+        let stop = seg_end.min(b_to).max(at_beat);
+        acc += integrate_seg(tmap, events, &seg, at_beat, stop);
         at_beat = stop;
         if stop >= seg_end - 1e-12 {
-            // 这一段走完了：换下一条事件
-            if ev.is_some() {
+            if consumed {
                 idx += 1;
-            } else {
+            } else if ev.is_none() {
                 break; // 末尾之后：`held` 会一直保持，没有下一段了
             }
+            // 空隙走完（`stop == ev.start`）：idx 不动 —— 下一轮 `seg_at` 看到 `start <= at_beat`，
+            // 这条事件就成了当前段
         } else {
             break; // 到 b_to 了
         }
@@ -466,13 +456,25 @@ fn integrate_until(
     (idx, at_beat, acc)
 }
 
+/// 同 [`walk_speed`]，但不记检查点（返回新的 `(idx, at_beat, acc)`）
+fn integrate_until(
+    events: &[Event],
+    tmap: &TimeMap,
+    idx: usize,
+    at_beat: f64,
+    acc: f64,
+    b_to: f64,
+) -> (usize, f64, f64) {
+    walk_speed(events, tmap, idx, at_beat, acc, b_to, |_, _, _| {})
+}
+
 /// 一段（值函数恒定或走单条事件的缓动）的积分：梯形法。
 ///
 /// **返回 `∫v dτ`（流速单位 × 秒），不乘 120** —— 换算成 RPE y 单位只在
-/// [`speed_travel`] / [`SpeedAccum::to`] 那两处发生，免得两条路径各乘一次或漏乘。
+/// [`speed_travel`] 与 [`SpeedTable::h_at_hinted`] 那两处发生，免得两条路径各乘一次或漏乘。
 ///
 /// 秒域长度一律用 `tmap` 换算 —— BPM 变过的时间段里 `(b1−b0)/bpm` 是错的。
-fn integrate_seg(tmap: &TimeMap, seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
+fn integrate_seg(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 {
     if !(b_to > b_from) {
         return 0.0;
     }
@@ -482,11 +484,11 @@ fn integrate_seg(tmap: &TimeMap, seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 
     }
     let n = SPEED_SAMPLES_PER_SEGMENT.max(1);
     let mut prev_b = b_from;
-    let mut prev_v = seg.at(prev_b);
+    let mut prev_v = seg.at(events, prev_b);
     let mut acc = 0.0;
     for k in 1..=n {
         let b = b_from + (b_to - b_from) * k as f64 / n as f64;
-        let v = seg.at(b);
+        let v = seg.at(events, b);
         acc += 0.5 * (prev_v + v) * (tmap.sec(b) - tmap.sec(prev_b));
         prev_b = b;
         prev_v = v;
@@ -494,6 +496,81 @@ fn integrate_seg(tmap: &TimeMap, seg: &SpeedSeg, b_from: f64, b_to: f64) -> f64 
     acc
 }
 
+/// 流速积分的**分段检查点**：每个段起点上的 `H`（`H = 120 ∫ v dτ`，从谱面 0 秒起）。
+///
+/// 存在的理由：`H(t)` 是**前缀**积分 ——
+/// ① 每帧从 0 重积是 O(流速事件数)；
+/// ② 更要紧的是"**随机取一段音符来算**"（流速事件改了之后要重算它之后的音符、以及还没重算完
+///    那几颗的兜底现算）：若从 0 起到每个时刻各积一遍，就是 O(音符 × 流速事件)。
+/// 有了检查点，`H(t)` = 查一次表（二分）+ 在段内积一小段，代价与 t 在哪儿、问的是哪一段无关。
+///
+/// **切法与 [`walk_speed`] 共用同一份实现、段内积分共用 [`integrate_seg`]**，所以
+/// "查表得到的 `H`"与"从 0 整条走一遍"是同一个数 —— 于是"预算好的位置"与"现算的位置"
+/// 可以互为基准对账（`tests/lines.rs` 里那条对账就是这么钉的）。
+///
+/// 被它换掉的那个**单调累加器**只能往前问：查询过去的时刻会静默返回当前累计值（0），
+/// hold 尾巴"被钉死在头 + 全长"那个 bug 就是从这儿来的。检查点表没有这个毛病 ——
+/// 过去、现在、将来都能问。
+#[derive(Clone, Debug, Default)]
+pub struct SpeedTable {
+    /// 段起点：`(拍, 该点的 H（RPE y 单位）, 这一段怎么求值)`
+    cuts: Vec<(f64, f64, SpeedSeg)>,
+}
+
+impl SpeedTable {
+    /// 建表：切到 `b_end`（拍）为止。**O(流速事件数)**
+    ///
+    /// 最后一段之后不再有点：查表时用最后一段的求值方式外推（末尾之后是"保持"，
+    /// 而事件段之后 `event_value` 自己就夹在终点值上 —— 与走一遍的语义一致）。
+    pub fn build(events: &[Event], tmap: &TimeMap, b_end: f64) -> Self {
+        let at0 = tmap.beat(0.0);
+        let mut cuts: Vec<(f64, f64, SpeedSeg)> = Vec::new();
+        walk_speed(events, tmap, 0, at0, 0.0, b_end, |beat, acc, seg| {
+            cuts.push((beat, acc * SPEED_UNITS_PER_SEC, seg));
+        });
+        if cuts.is_empty() {
+            // 谱面长度为 0 的退化情形（走不进循环）：补第一段，照样能外推 —— 别 panic
+            cuts.push((at0, 0.0, seg_at(events, 0, at0)));
+        }
+        Self { cuts }
+    }
+
+    /// `H(sec)`（RPE y 单位）。**任何时刻都能问**（过去 / 现在 / 将来一视同仁）。
+    pub fn h_at(&self, events: &[Event], tmap: &TimeMap, sec: f64) -> f64 {
+        self.h_at_hinted(events, tmap, sec, 0).0
+    }
+
+    /// 同上，但允许带一个"上次落在哪一段"的提示（升序查询时摊还 O(1)）。
+    /// 返回 `(H, 新的提示)`；提示只当**起点**用：不命中就二分，所以倒退查询不会算错。
+    pub fn h_at_hinted(
+        &self,
+        events: &[Event],
+        tmap: &TimeMap,
+        sec: f64,
+        hint: usize,
+    ) -> (f64, usize) {
+        let b = tmap.beat(sec);
+        let i = self.seg_index(b, hint);
+        let Some(&(beat, h, seg)) = self.cuts.get(i) else {
+            // 表还没建（这条线是从 `line_shell` 造出来的、事件轨道还是空的）：
+            // 退回直接积分。两条路径的值相同（共用走法与段内积分），只是慢。
+            return (speed_travel(events, tmap, 0.0, sec), 0);
+        };
+        (h + integrate_seg(tmap, events, &seg, beat, b) * SPEED_UNITS_PER_SEC, i)
+    }
+
+    /// `beat` 落在第几段：`hint` 命中就 O(1)（升序查询的顺序），否则二分
+    fn seg_index(&self, beat: f64, hint: usize) -> usize {
+        let hit = self
+            .cuts
+            .get(hint)
+            .is_some_and(|c| c.0 <= beat && self.cuts.get(hint + 1).is_none_or(|n| n.0 > beat));
+        if hit {
+            return hint;
+        }
+        self.cuts.partition_point(|c| c.0 <= beat).saturating_sub(1)
+    }
+}
 
 /// 判定线的表演状态（由五条轨道在某一时刻求值得到）
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -622,12 +699,17 @@ mod speed_tests {
     }
 
     fn ev(from_beat: f64, to_beat: f64, from: f64, to: f64) -> Event {
+        ev_ease(from_beat, to_beat, from, to, "linear")
+    }
+
+    /// 同上，但指定缓动（非线性缓动是段内梯形法唯一会被看出来的地方）
+    fn ev_ease(from_beat: f64, to_beat: f64, from: f64, to: f64, easing: &str) -> Event {
         Event::new(
             Beat::new((from_beat * 4.0) as i64, 4),
             Beat::new((to_beat * 4.0) as i64, 4),
             json!(from),
             json!(to),
-            "linear",
+            easing,
         )
     }
 
@@ -690,23 +772,95 @@ mod speed_tests {
         assert!((t - 4.0 * 120.0).abs() < 1e-6, "空隙里应保持 4，实际 {}", t / 120.0);
     }
 
-    /// 单调累加器 = 逐段直接积分（两条路径共用同一份积分实现，结果必须一致）
+    /// **空隙之后的那条事件必须被算进去** —— 这是从真 bug 里钉下来的一条。
+    ///
+    /// 走法曾经在"空隙段走完"时也把 `idx` 前进一格，而空隙段是**走到下一条事件的起点**为止的：
+    /// 于是那条正好从空隙终点开始的事件被整条跳过，积分在空隙之后永远保持空隙前的值。
+    /// 表现：谱面里只要有一个空隙，**它后面所有音符的位置都是错的**（而且错得"自洽"，
+    /// 只有拿直接积分当基准对账才会露出来 —— 见 `tests/lines.rs` 里那条）。
     #[test]
-    fn the_monotone_accumulator_agrees_with_direct_integration() {
+    fn the_walk_does_not_skip_the_event_after_a_gap() {
         let tmap = tmap120();
-        let events = vec![
-            ev(0.0, 2.0, 10.0, 20.0),
-            ev(2.0, 6.0, 20.0, 20.0),
-            ev(6.0, 10.0, 20.0, 0.0),
+        // 拍域：0~1 拍流速 4、2~3 拍流速 0（BPM 120 ⇒ 一拍 0.5 秒）
+        let events = vec![ev(0.0, 1.0, 4.0, 4.0), ev(2.0, 3.0, 0.0, 0.0)];
+        // 0.5~1.0 秒是空隙（保持 4），1.0~1.5 秒必须走第二条事件（流速 0）
+        // ⇒ ∫ = 4×0.5 + 4×0.5 + 0×0.5 = 4（流速单位 × 秒）
+        let t = speed_travel(&events, &tmap, 0.0, 1.5);
+        assert!((t - 4.0 * 120.0).abs() < 1e-6, "实际 {}", t / 120.0);
+        // 前缀与"两点之间"两种问法必须一致
+        let prefix = speed_travel(&events, &tmap, 0.0, 1.4) + speed_travel(&events, &tmap, 1.4, 1.5);
+        assert!((prefix - t).abs() < 1e-6, "前缀拼起来应等于整段：{prefix} ≠ {t}");
+        // 后半段（1.0~1.5 秒）流速是 0 ⇒ 一点都不动
+        assert!(speed_travel(&events, &tmap, 1.0, 1.5).abs() < 1e-6);
+    }
+
+    /// **检查点表 = 逐段直接积分**：几百个时刻（事件中间、空隙里、末尾之后）逐一对账。
+    ///
+    /// 这条是"预算好的位置"与"现算的位置"能互为基准的前提 —— 两条路径共用同一份段划分与段内积分。
+    /// 四种形状都过一遍：缓动斜坡、负流速、带空隙、没有事件（默认流速 10）。
+    #[test]
+    fn the_checkpoint_table_agrees_with_direct_integration() {
+        let tmap = tmap120();
+        let shapes: Vec<Vec<Event>> = vec![
+            vec![ev(0.0, 2.0, 10.0, 20.0), ev(2.0, 6.0, 20.0, 20.0), ev(6.0, 10.0, 20.0, 0.0)],
+            vec![ev(0.0, 2.0, -10.0, 10.0), ev(2.0, 4.0, 10.0, -5.0)],
+            vec![ev(0.0, 2.0, 4.0, 4.0), ev(4.0, 6.0, 0.0, 0.0)], // 中间有空隙
+            vec![ev_ease(0.0, 8.0, 0.0, 20.0, "inOutElastic")],  // 非线性缓动
+            vec![],
         ];
-        let mut acc = SpeedAccum::new(&events, &tmap, 0.25);
-        for sec in [0.3, 0.9, 1.4, 2.5, 3.0, 3.7, 5.2] {
-            let got = acc.to(sec);
-            let want = speed_travel(&events, &tmap, 0.25, sec);
-            assert!((got - want).abs() < 1e-9, "t={sec}: 累加 {got} ≠ 直积 {want}");
+        for events in shapes {
+            let table = SpeedTable::build(&events, &tmap, 20.0);
+            for k in 0..=400 {
+                let sec = k as f64 * 0.05; // 0 … 20 秒
+                let want = speed_travel(&events, &tmap, 0.0, sec);
+                let got = table.h_at(&events, &tmap, sec);
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "事件 {} 条：t={sec} 查表 {got} ≠ 直积 {want}",
+                    events.len()
+                );
+            }
         }
-        // 倒退调用（不该发生）返回上次的值，而不是负数
-        assert_eq!(acc.to(1.0), acc.to(5.2));
+    }
+
+    /// **过去也能问**（这是被换掉那个累加器的病根：它只会往前走，问过去一律返回当前累计值 0，
+    /// hold 的尾巴因此被钉死在"头 + 全长"上，身子不随按住而缩短）。
+    #[test]
+    fn the_table_answers_about_the_past_too() {
+        let tmap = tmap120();
+        let events = vec![ev(0.0, 8.0, 10.0, 10.0)];
+        let table = SpeedTable::build(&events, &tmap, 20.0);
+        let early = table.h_at(&events, &tmap, 2.0);
+        let late = table.h_at(&events, &tmap, 5.0);
+        assert!((early - 2.0 * 1200.0).abs() < 1e-6, "2 秒处应是 2400，实际 {early}");
+        assert!(early < late, "5 秒处应更远：{late} ≤ {early}");
+        // 问的顺序不影响答案（累加器时代这里会返回"当前累计值"）
+        assert_eq!(table.h_at(&events, &tmap, 2.0), early);
+    }
+
+    /// 提示（hint）只是"从哪一段开始找"：升序查询时摊还 O(1)，但**降序查询也必须给对值**
+    #[test]
+    fn the_segment_hint_only_speeds_things_up() {
+        let tmap = tmap120();
+        let events = vec![ev(0.0, 2.0, 0.0, 20.0), ev(2.0, 8.0, 20.0, -10.0)];
+        let table = SpeedTable::build(&events, &tmap, 20.0);
+        let mut hint = 0usize;
+        let mut seen = 0usize;
+        for k in 0..=200 {
+            let sec = k as f64 * 0.1;
+            let (a, h) = table.h_at_hinted(&events, &tmap, sec, hint);
+            hint = h;
+            seen = seen.max(h);
+            assert_eq!(a, table.h_at(&events, &tmap, sec), "t={sec} 带提示的值必须一样");
+        }
+        assert!(seen > 0, "这条用例本身要走过多个段（否则提示根本没被用到）");
+        // 倒着走：提示失效 ⇒ 二分回去，值照样对
+        for k in (0..=200).rev() {
+            let sec = k as f64 * 0.1;
+            let (a, h) = table.h_at_hinted(&events, &tmap, sec, hint);
+            hint = h;
+            assert_eq!(a, table.h_at(&events, &tmap, sec), "倒序 t={sec} 值必须一样");
+        }
     }
 
     /// 反向区间与零长度：一律 0（不返回负数，免得音符被画到判定线下面去）
@@ -716,5 +870,8 @@ mod speed_tests {
         let events = vec![ev(0.0, 16.0, 10.0, 10.0)];
         assert_eq!(speed_travel(&events, &tmap, 2.0, 2.0), 0.0);
         assert_eq!(speed_travel(&events, &tmap, 2.0, 1.0), 0.0);
+        // 表也一样：问"0 秒之前"给 0，而不是某个负值
+        let table = SpeedTable::build(&events, &tmap, 20.0);
+        assert_eq!(table.h_at(&events, &tmap, 0.0), 0.0);
     }
 }

@@ -11,7 +11,6 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::doc::Event;
 use crate::perf;
 use crate::state::{Chart, EditorState, Note, NoteKind, RPE_WINDOW_HALF_H, RPE_WINDOW_HALF_W};
 
@@ -570,13 +569,14 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
         // `perf::SPEED_UNITS_PER_SEC`）。于是**流速 10（RPE 默认值 = 1×）的音符 0.75 秒划过
         // 整个 900 高的窗口** —— 与 RPE 一致。
         //
-        // 从前这里是 `(dt / 2s) × 450 × (speed/10)`：既把 1× 定成了 225 单位/秒（RPE 是 1200，
-        // 慢 5.33 倍），又把流速当"此刻的瞬时值"（缓动段里跑偏）。
+        // **每个音符自己的那一半（`H(t_音符)`）是加载时算好的**（`state::FlowCache`）：
+        // 它与播放头无关、与判定线被搬到哪里也无关，所以没有理由每帧重算一遍。
+        // 这里每帧只需要这条线的一个标量 —— `H(此刻)`（查流速检查点表，O(log 事件数)）。
         //
-        // 累加器是**单调**的（音符按时间升序）⇒ 总代价只与这段时间里的流速事件条数有关，
-        // 与音符数量无关；逐个音符从播放头重新积分才是 O(音符 × 事件) 那种每帧都要付的钱。
-        let speed_events: &[Event] = &line.tracks[4].events;
-        let mut walk = perf::SpeedAccum::new(speed_events, &state.chart.tmap, state.playhead);
+        // 流速事件改了之后，"它之后"的音符位置会过期；那些还没被异步补上的音符在这里**现算**
+        // （`floor_offset_now`）。两条路径共用同一份积分实现 ⇒ 现算的值与预算好的值一致，
+        // 异步补得快慢**不影响画面**，只影响每帧的代价。
+        let h_now = line.h_at(state.playhead, tmap);
         for idx in state.visible_range_of(li) {
             let note = &line.notes[idx];
             // 音符自身的 speed（文档字段，默认 1.0）乘在**离判定线的距离**上：
@@ -588,23 +588,25 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             if spd.abs() < 1e-3 {
                 continue;
             }
-            let lead = (walk.to(note.time) * spd) as f32;
-            // ---- **判定线之下不显示**（用户口径，2026-09-28 明确）----
+            // 这颗音符此刻离判定线多远（判据与画法都只用这一个数）
+            let lead_h = line
+                .floor_offset(idx, h_now)
+                .unwrap_or_else(|| line.floor_offset_now(note.time, h_now, tmap));
+            let lead = (lead_h * spd) as f32;
+            let age = state.playhead - note.time;
+            // ---- 画不画：**位置 < 0 ⇒ 在判定线之下 ⇒ 不显示**（用户口径）----
             //
-            // 两类情形都落在这里：
-            // ① **流速为负**：音符从判定线下面飞上来，到线之前整条都在线下面；
-            // ② **流速从负变正的过零段**：过零点之前音符也还在线下面
-            //    （用户报的正是这一种："负→正期间的音符即使在判定线之下也会显示"）。
-            // 到线那一刻（`age ≥ 0`）就不再算"之下"了 ⇒ **击中效果照旧会播**，
-            // 音符本体随后停在判定线上收缩消失。
+            // 只有这一条规则，**没有"哪种流速"的分支**：流速为负（音符从判定线下面飞上来）、
+            // 以及"负→正"的过零段（过零点之前也在下面），都只是"位置此刻是负的"的不同来路。
+            // 到线那一刻（`age ≥ 0`）就不再算"之下"：音符停在判定线上收缩消失，
+            // **击中效果照旧会播** —— 否则负流速段完全没有反馈。
             //
             // 这条与"音符只要在可见区域就要显示"不冲突：后者管的是**别拿"离判定线多远"
             // 当可见性判据**（判定线被移开/旋转时会漏画），本条管的是**在线下面那一半不画**。
-            let age = state.playhead - note.time;
-            if age <= 0.0 && lead < 0.0 {
+            let y_local = if age > 0.0 { 0.0 } else { lead };
+            if y_local < 0.0 {
                 continue;
             }
-            let y_local = if age > 0.0 { 0.0 } else { lead };
             // 到达之后 0→1 的消失进度；`>= 1` 就彻底没了（只剩击中效果在场）。
             // **必须夹到 0**：`age < 0` 是"还没到"（绝大多数音符），不夹就成了负进度 ⇒
             // 音符被放大到 2.8 倍、alpha 乘到 5.5（实测：一个 510×144 的亮蓝块挂在窗口顶上）。
@@ -613,21 +615,19 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             } else {
                 0.0
             };
-            // ---- hold 的**尾巴**：位置按**当前时刻**推算，不是"头的位置 + 全长" ----
+            // ---- hold 的**尾巴**：`H(t_尾) − H(t_此刻)`（与头部同源）----
             //
-            // 这里修的是一个真 bug：尾巴曾经算成 `头的偏移 + 整段时长`，而"头的偏移"来自
-            // **单调累加器**（`SpeedAccum`）——它只会往前走，查询过去的时刻一律返回当前累计值
-            // （0）。于是被按住时尾巴停在"头 + 全长"上：身子不会随按住而缩短，
-            // 尾巴过去之后也永远不消失。
-            //
-            // 正确写法与头部同源：尾巴此刻的偏移 = `H(t_尾) − H(t_此刻)`
-            // （`speed_travel(此刻 → 尾)`，尾巴已经过去时它给 0）。
-            let tail_y = if note.kind == NoteKind::Hold {
-                (perf::speed_travel(speed_events, &state.chart.tmap, state.playhead, note.end) * spd)
-                    as f32
+            // 尾巴曾经算成"头的偏移 + 整段时长"，而"头的偏移"当时来自一个**只会往前走**的
+            // 单调累加器 —— 查询过去的时刻一律返回当前累计值（0）⇒ 被按住时尾巴被钉死在
+            // "头 + 全长"上：身子不随按住而缩短，尾巴过去之后也永远不消失。
+            // 现在头尾都是查表（过去/现在/将来都能问），这个病根不存在了。
+            let tail_h = if note.kind == NoteKind::Hold {
+                line.floor_tail_offset(idx, h_now)
+                    .unwrap_or_else(|| line.floor_offset_now(note.end, h_now, tmap))
             } else {
-                lead
+                lead_h
             };
+            let tail_y = (tail_h * spd) as f32;
             // ---- 可见性判据：**按屏幕上的位置**，不是"离判定线多远" ----
             //
             // 这里修的是一个真 bug：判据曾经只看**线本地**的偏移（`|offset| > 510 就跳过`），
@@ -672,7 +672,13 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             }
 
             // ---- hold 的身子：被"按住"吃掉的那一段不再画（从判定线起算到尾巴）----
-            if note.kind == NoteKind::Hold {
+            //
+            // **寿命**：hold 到 `note.end` 就结束 —— 之后一段身子都不画。这条必须显式写出来，
+            // 不能靠符号判断（下面的"整段在线下"只挡住了正流速那一半）：**流速为负时
+            // "已经过去的尾巴"在判定线上面**（`H` 随时间是减小的，`now > end` ⇒
+            // `H(end) − H(now) > 0`），光看符号会把它当成"还在上升的长条"画出来。
+            // 是那条"尾巴之后两种符号都不该再有身子"的用例把它抓出来的。
+            if note.kind == NoteKind::Hold && state.playhead < note.end {
                 // 到线之前身子是 [头, 尾]；到线之后头那一段已经被吃掉 ⇒ 身子从**判定线**起算。
                 // 段是**带符号**的：负流速时尾巴在判定线下面，段就画在线的下面。
                 let body_a = y_local;

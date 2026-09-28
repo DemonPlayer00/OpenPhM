@@ -155,6 +155,270 @@ impl TrackView {
     }
 }
 
+// ---------------------------------------------------------------- 音符位置（加载时算好）
+
+/// 一条线上**位置还没算准**的音符下标集合。
+///
+/// 为什么是一串区间而不是一个：异步重算的优先级是"播放头 → 结尾"再"开头 → 播放头"，
+/// 预算用完时中间就会留下空洞 —— 待算集合因此天然是 1~3 块。区间**升序**且互不相邻，
+/// 于是"从 k 到末尾都要重算"这类操作只是截断/合并。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StaleSet {
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl StaleSet {
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+    /// 还有几颗要算
+    pub fn count(&self) -> usize {
+        self.ranges.iter().map(|r| r.end - r.start).sum()
+    }
+    pub fn contains(&self, i: usize) -> bool {
+        self.ranges.iter().any(|r| r.contains(&i))
+    }
+    pub fn clear(&mut self) {
+        self.ranges.clear();
+    }
+    /// 待算的那些下标（升序；诊断与测试用）
+    pub fn indices(&self) -> Vec<usize> {
+        self.ranges.iter().flat_map(|r| r.clone()).collect()
+    }
+    /// 把 `[from, len)` 整段标成待重算（与已有区间合并 —— 流速再改一次时走的就是这里）
+    pub fn mark_from(&mut self, from: usize, len: usize) {
+        let from = from.min(len);
+        if from >= len {
+            return;
+        }
+        // 完全落在新区间里的旧区间丢掉；起点在 `from` 之前的那个保留（下面把它扩到末尾）
+        self.ranges.retain(|r| r.start < from);
+        match self.ranges.last_mut() {
+            Some(last) if last.end >= from => last.end = len,
+            _ => self.ranges.push(from..len),
+        }
+    }
+    /// 把**单独一颗**标成待重算（与相邻区间合并）。
+    ///
+    /// 用途只有一个但很要紧：流速改动之前起头、改动之后才收尾的**长 hold** ——
+    /// 它的头没变、尾巴变了，落在"后缀"之外。
+    pub fn mark_one(&mut self, i: usize) {
+        let pos = self.ranges.partition_point(|r| r.end <= i);
+        // `pos` 之后的第一个区间可能正好紧邻（`r.start == i + 1`）⇒ 合并
+        if let Some(r) = self.ranges.get_mut(pos) {
+            if r.start <= i + 1 {
+                r.start = r.start.min(i);
+                return;
+            }
+        }
+        // 前一个区间可能与它相邻（`r.end == i`）
+        if let Some(r) = pos.checked_sub(1).and_then(|k| self.ranges.get_mut(k)) {
+            if r.end == i {
+                r.end = i + 1;
+                // 合并之后可能与后一个接上
+                if let Some(next) = self.ranges.get(pos) {
+                    if next.start == i + 1 {
+                        let end = next.end;
+                        self.ranges[pos - 1].end = end;
+                        self.ranges.remove(pos);
+                    }
+                }
+                return;
+            }
+        }
+        self.ranges.insert(pos, i..i + 1);
+    }
+
+    /// 从 `region` 里**摘出最靠左的至多 `budget` 条**（从待算集合里移除并返回它们的下标区间）
+    pub fn take(&mut self, region: std::ops::Range<usize>, budget: usize) -> std::ops::Range<usize> {
+        if budget == 0 || region.start >= region.end {
+            return 0..0;
+        }
+        for k in 0..self.ranges.len() {
+            let r = self.ranges[k].clone();
+            let lo = r.start.max(region.start);
+            let hi = r.end.min(region.end);
+            if lo >= hi {
+                continue;
+            }
+            let n = (hi - lo).min(budget);
+            let mut rest: Vec<std::ops::Range<usize>> = Vec::new();
+            if r.start < lo {
+                rest.push(r.start..lo);
+            }
+            if lo + n < r.end {
+                rest.push(lo + n..r.end);
+            }
+            self.ranges.remove(k);
+            for (j, x) in rest.into_iter().enumerate() {
+                self.ranges.insert(k + j, x);
+            }
+            return lo..lo + n;
+        }
+        0..0
+    }
+}
+
+/// 一条线的**音符纵向位置**（加载时算好；流速事件改了就把它之后的重算）。
+///
+/// 位置的口径与渲染完全同源：
+/// ```text
+///   离判定线的距离 = (H(t_音符) − H(t_此刻)) × 音符自身 speed
+///   H(t) = 120 ∫₀ᵗ v dτ            ← 从**谱面 0 秒**起积的绝对量（RPE y 单位）
+/// ```
+/// `H(t_音符)` 是音符自己的常量：与播放头、与判定线被搬到哪里都无关 ⇒ 在**加载时**一次算好。
+/// 渲染每帧只要这条线的一个标量 `H(t_此刻)`（[`crate::perf::SpeedTable`] 查一次表）。
+///
+/// **流速事件一改**，它之后（时间上）的音符位置就全变了：那时把这段后缀标成待重算
+/// （[`Self::mark_from`]，由 [`Line::set_tracks`] 做），GUI 每帧补一小段
+/// （[`EditorState::pump_floors`]）。没补好之前渲染侧**现算**那一颗
+/// （[`Line::floor_offset_now`]）—— 同一个公式、同一份实现，所以补得快慢都不影响画面，
+/// 异步只影响"每帧要花多少代价"。
+///
+/// 检查点表与 `head`/`tail` **一起建**（表里的段下标指向的就是这条线现在那份
+/// `tracks[4].events`），所以不存在"表与事件对不上"的中间态。
+#[derive(Clone, Debug, Default)]
+pub struct FlowCache {
+    /// 流速积分的检查点（`H` 怎么查）
+    table: crate::perf::SpeedTable,
+    /// `H(note.time)`，与 `Line::notes` 一一对应
+    head: Vec<f64>,
+    /// `H(note.end)`（hold 的尾巴；非 hold 与 `head` 相同）
+    tail: Vec<f64>,
+    /// 还没算准的那些
+    stale: StaleSet,
+}
+
+impl FlowCache {
+    /// 音符位置离判定线多远（`H(t_音符) − H(此刻)`，RPE y 单位，带符号）；
+    /// `None` = 还没算准 ⇒ 调用方现算（[`Line::floor_offset_now`]）
+    pub fn offset(&self, i: usize, h_now: f64) -> Option<f64> {
+        if self.stale.contains(i) {
+            return None;
+        }
+        self.head.get(i).map(|h| h - h_now)
+    }
+    /// 同上，尾巴（hold 用）
+    pub fn tail_offset(&self, i: usize, h_now: f64) -> Option<f64> {
+        if self.stale.contains(i) {
+            return None;
+        }
+        self.tail.get(i).map(|h| h - h_now)
+    }
+    pub fn is_stale(&self, i: usize) -> bool {
+        i >= self.head.len() || self.stale.contains(i)
+    }
+    pub fn stale_count(&self) -> usize {
+        self.stale.count()
+    }
+    pub fn len(&self) -> usize {
+        self.head.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty()
+    }
+    /// 把 `from` 之后（含）的音符全标成待重算
+    pub fn mark_from(&mut self, from: usize) {
+        let n = self.head.len();
+        self.stale.mark_from(from, n);
+    }
+
+    /// **流速在 `sec`（秒）处变了**：头或尾落在那之后的音符，位置都要重算。
+    ///
+    /// 判据为什么是"头或尾"而不是"头"：一条长 hold 的头可能在改动**之前**、尾巴却在**之后**
+    /// —— 尾巴离判定线多远是 `H(t_尾) − H(此刻)`，同样吃这次改动。
+    /// 时间升序的列表里这**不是**一段后缀（改动点之前那些长 hold 会零散地落进来），
+    /// 所以后缀部分一次标完，前面那些长 hold 逐个标（数量通常是个位数）。
+    /// 标记是 O(音符) 的线性扫；**真正要省的那笔钱是重算**，那部分照旧异步。
+    pub fn mark_from_sec(&mut self, sec: f64, notes: &[Note]) {
+        let from = notes.partition_point(|n| n.time < sec);
+        self.stale.mark_from(from, notes.len());
+        for (i, n) in notes.iter().take(from).enumerate() {
+            if n.end >= sec {
+                self.stale.mark_one(i);
+            }
+        }
+    }
+    /// 建/换流速检查点表（流速事件变了 ⇒ 表必须跟着换；**不动**已有的音符位置）
+    fn rebuild_table(&mut self, events: &[Event], tmap: &TimeMap) {
+        self.table = crate::perf::SpeedTable::build(events, tmap, tmap.end_beat);
+    }
+    /// 整条线一次算好（**加载时**、以及音符表变了之后走这里）
+    fn rebuild(&mut self, notes: &[Note], events: &[Event], tmap: &TimeMap) {
+        self.head.clear();
+        self.tail.clear();
+        self.head.reserve(notes.len());
+        self.tail.reserve(notes.len());
+        let mut hint = 0usize;
+        for n in notes {
+            let (h, hi) = self.table.h_at_hinted(events, tmap, n.time, hint);
+            hint = hi;
+            let (t, hi) = if n.kind == NoteKind::Hold {
+                self.table.h_at_hinted(events, tmap, n.end, hint)
+            } else {
+                (h, hint)
+            };
+            hint = hi;
+            self.head.push(h);
+            self.tail.push(t);
+        }
+        self.stale.clear();
+    }
+    /// 建表 + 全部算好（**唯一**"从零建立缓存"的入口）
+    fn activate(&mut self, notes: &[Note], events: &[Event], tmap: &TimeMap) {
+        self.rebuild_table(events, tmap);
+        self.rebuild(notes, events, tmap);
+    }
+    /// 摘出本帧要算的那一段（`region` = 播放头之后 / 之前那一半）
+    fn take_stale(&mut self, region: std::ops::Range<usize>, budget: usize) -> std::ops::Range<usize> {
+        self.stale.take(region, budget)
+    }
+    /// 把 `span` 这一段算出来（升序），返回实际算了几条
+    fn build_span(
+        &mut self,
+        notes: &[Note],
+        events: &[Event],
+        tmap: &TimeMap,
+        span: std::ops::Range<usize>,
+    ) -> usize {
+        if span.start >= span.end || span.end > notes.len() || span.end > self.head.len() {
+            return 0;
+        }
+        let mut hint = 0usize;
+        for i in span.clone() {
+            let (h, hi) = self.table.h_at_hinted(events, tmap, notes[i].time, hint);
+            hint = hi;
+            let (t, hi) = if notes[i].kind == NoteKind::Hold {
+                self.table.h_at_hinted(events, tmap, notes[i].end, hint)
+            } else {
+                (h, hint)
+            };
+            hint = hi;
+            self.head[i] = h;
+            self.tail[i] = t;
+        }
+        span.end - span.start
+    }
+}
+
+/// 两条流速事件表**第一处不同**发生在哪一拍（`None` = 完全一样）。
+///
+/// 用途：流速事件一改，只有它**之后**（时间上）的音符位置会变 —— 这个拍号就是"之后"的边界。
+/// 逐下标比对、取两者起点的较小值：那是最早可能被这次改动影响到的时刻
+/// （`H` 是前缀积分，`t` 之前的值只由 `t` 之前的事件决定）。
+pub fn first_speed_change(old: &[Event], new: &[Event]) -> Option<f64> {
+    for i in 0..old.len().max(new.len()) {
+        match (old.get(i), new.get(i)) {
+            (Some(a), Some(b)) if a == b => continue,
+            (Some(a), Some(b)) => return Some(a.start.to_f64().min(b.start.to_f64())),
+            (Some(a), None) => return Some(a.start.to_f64()),
+            (None, Some(b)) => return Some(b.start.to_f64()),
+            (None, None) => break,
+        }
+    }
+    None
+}
+
 /// 一条判定线（父对象）及其子音符
 #[derive(Clone, Debug)]
 pub struct Line {
@@ -180,7 +444,10 @@ pub struct Line {
     ///
     /// 决定"往后看多久"：流速越慢，音符越早进入窗口 —— 固定的 2 秒前瞻在慢流速下会**漏画**
     /// 本该看得见的音符（实测：流速 1 时 3 秒外的音符在窗口里，却整颗没有实例）。
+    /// 由 [`Line::set_tracks`] 随事件轨道一起刷新（**不是**只有整表重建才刷新）。
     pub min_speed_abs: f64,
+    /// **音符纵向位置**（加载时算好；流速事件改了就把它之后的重算）—— 见 [`FlowCache`]
+    pub floors: FlowCache,
 }
 
 impl Line {
@@ -232,6 +499,118 @@ impl Line {
         let lx = dx * c - dy * s;
         let ly = dx * s + dy * c;
         ly.abs() <= tol && lx.abs() <= line_half_w
+    }
+
+    // ---------------------------------------------------------------- 音符位置
+
+    /// `H(sec)`（绝对位置，RPE y 单位）：查这条线的流速检查点表。
+    /// **任何时刻都能问**（过去/现在/将来一视同仁，不是"只会往前走"的累加器）。
+    pub fn h_at(&self, sec: f64, tmap: &TimeMap) -> f64 {
+        self.floors.table.h_at(&self.tracks[4].events, tmap, sec)
+    }
+
+    /// 该音符此刻离判定线多远（**预算好的值**；`None` = 还没算准 ⇒ 调用方现算）
+    pub fn floor_offset(&self, i: usize, h_now: f64) -> Option<f64> {
+        self.floors.offset(i, h_now)
+    }
+
+    /// 同上，尾巴（hold 用；非 hold 与头相同）
+    pub fn floor_tail_offset(&self, i: usize, h_now: f64) -> Option<f64> {
+        self.floors.tail_offset(i, h_now)
+    }
+
+    /// **现算**同一件事（还没算准的音符的兜底）：与预算好的值是同一个公式、同一份实现，
+    /// 所以两条路径可以互为基准对账（`tests/lines.rs::cached_and_on_the_fly_positions_agree`）。
+    pub fn floor_offset_now(&self, sec: f64, h_now: f64, tmap: &TimeMap) -> f64 {
+        self.h_at(sec, tmap) - h_now
+    }
+
+    /// 把 `from` 之后（含）的音符位置标成"待重算"
+    pub fn mark_floors_stale_from(&mut self, from: usize) {
+        self.floors.mark_from(from);
+    }
+
+    /// **加载路径**：建流速检查点表、把这条线**全部**音符的位置算好
+    /// （"加载时算好所有音符实例的实际位置"就发生在这里）
+    pub fn activate_floors(&mut self, tmap: &TimeMap) {
+        self.floors.activate(&self.notes, &self.tracks[4].events, tmap);
+    }
+
+    /// 换上新的**音符表**（按线局部重建的唯一入口）：位置当场整条重算 ——
+    /// 插入/删除会移动后面所有音符的下标，"只补一段"是补不对的。
+    ///
+    /// 顺带重算 `max_note_sec`：它是"可见区间该从多早开始"的回退量，早先只有整表重建才刷新
+    /// ⇒ 编辑期**新加一条长 hold** 之后它仍是 0，那条长条的身子会在头被击中时整条消失
+    /// （与用户报过的"长条一到线就消失"是同一个病，只是入口不同）。
+    pub fn set_notes(&mut self, notes: Vec<Note>, tmap: &TimeMap) {
+        self.notes = notes;
+        self.max_note_sec = self
+            .notes
+            .iter()
+            .map(|n| (n.end - n.time).max(0.0))
+            .fold(0.0_f64, f64::max);
+        self.floors.rebuild(&self.notes, &self.tracks[4].events, tmap);
+    }
+
+    /// 换上新的**事件轨道**（按线局部重建的唯一入口）。
+    ///
+    /// 三件事必须跟着走：
+    /// ① 流速真的变了 ⇒ **把它之后的音符位置标成待重算**（异步补齐，见
+    ///    [`EditorState::pump_floors`]）；没补好之前渲染侧现算，画面照样是准的；
+    /// ② 换流速检查点表（`H` 的查询靠它）；
+    /// ③ 重算 `min_speed_abs` —— 早先只有整表重建才刷新，于是"把流速改慢"之后构建窗口
+    ///    没跟着变宽，本该看得见的音符整颗没有实例（与那个真 bug 同源）。
+    pub fn set_tracks(&mut self, tracks: [TrackView; 5], tmap: &TimeMap) {
+        let changed = first_speed_change(&self.tracks[4].events, &tracks[4].events);
+        self.min_speed_abs = crate::perf::min_speed_magnitude(&tracks[4].events, 16)
+            .unwrap_or(crate::perf::SPEED_DEFAULT);
+        self.tracks = tracks;
+        match changed {
+            // 前缀积分：`beat` 之前的时刻只由它之前的事件决定 ⇒ 本线只有**它之后**的音符要重算
+            // （"之后"按**头或尾**算：长 hold 的尾巴可能落在改动之后而头在之前，见
+            // `FlowCache::mark_from_sec`）
+            Some(beat) => {
+                self.floors.rebuild_table(&self.tracks[4].events, tmap);
+                if self.floors.len() == self.notes.len() {
+                    self.floors.mark_from_sec(tmap.sec(beat), &self.notes);
+                } else {
+                    // 缓存还没建过（或与音符表长度对不上，比如这条线刚从 `line_shell` 造出来）
+                    self.floors.rebuild(&self.notes, &self.tracks[4].events, tmap);
+                }
+            }
+            // **流速没变**（改的是透明度/移动/旋转…）：位置照旧有效，连检查点表都不用重建 ——
+            // 拖动透明度事件时每帧都会走到这里，白重建一次表就等于每帧白积一遍全谱的流速。
+            // 只有"缓存还没建过 / 长度对不上"时才整条重算。
+            None if self.floors.len() != self.notes.len() => {
+                self.floors.activate(&self.notes, &self.tracks[4].events, tmap);
+            }
+            None => {}
+        }
+    }
+
+    /// 本帧把这条线待重算的位置补一段：`after = true` 先补**播放头之后**那一半，
+    /// `false` 再补**播放头之前**那一半（用户口径：从当前时间轴 → 结尾，再从头 → 当前时间轴）。
+    /// 返回实际算了几条。
+    pub fn pump_floors(&mut self, playhead: f64, after: bool, budget: usize, tmap: &TimeMap) -> usize {
+        if budget == 0 || self.floors.stale_count() == 0 {
+            return 0;
+        }
+        let n = self.notes.len();
+        let p = self.notes.partition_point(|x| x.time < playhead);
+        let region = if after { p..n } else { 0..p };
+        let mut done = 0;
+        while done < budget {
+            let span = self.floors.take_stale(region.clone(), budget - done);
+            if span.is_empty() {
+                break;
+            }
+            let got = self.floors.build_span(&self.notes, &self.tracks[4].events, tmap, span);
+            if got == 0 {
+                break;
+            }
+            done += got;
+        }
+        done
     }
 }
 
@@ -292,6 +671,10 @@ impl Chart {
 }
 
 /// 由 opm 文档构建**一条判定线**的视图（只含属性 + 音符，不含轨道）—— 结构重建用
+///
+/// ⚠️ 轨道是空的 ⇒ **音符位置的缓存不在这里建**（`H` 要靠流速事件才算得出来）：
+/// 轨道就位（`tracks_of` 之后）必须调 [`Line::activate_floors`]，
+/// 否则这条线会退化成"没有流速事件"（默认 10）那条路径。
 pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> {
     let src = doc.judge_lines.get(index)?;
     let notes = notes_of(doc, index, tmap);
@@ -313,6 +696,7 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
         tracks: Default::default(),
         max_note_sec,
         min_speed_abs,
+        floors: FlowCache::default(),
     })
 }
 
@@ -374,12 +758,16 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
 }
 
 /// 把文档整体转成视图（引导期 / BPM 或判定线集合变化时用）
+///
+/// **音符位置在这里一次算好**（`activate_floors`）：它是"加载时算好所有音符实例的实际位置"
+/// 那条要求的落点 —— 之后每帧只查表，不再逐个音符积分。
 pub fn chart_from_doc(doc: &Document) -> Chart {
     let tmap = TimeMap::from_doc(doc);
     let mut lines: Vec<Line> = (0..doc.judge_lines.len())
         .filter_map(|i| {
             let mut l = line_shell(doc, i, &tmap)?;
             l.tracks = tracks_of(doc, i, &tmap);
+            l.activate_floors(&tmap);
             Some(l)
         })
         .collect();
@@ -870,6 +1258,9 @@ pub struct EditorState {
     /// 一份刚建的谱面几乎是 0 ⇒ 时间轴只有 2 秒（用户报的"默认总长度只有2秒"）。
     /// 音乐一装上，时间轴就该和歌一样长：你才滚得到副歌去写谱。
     music_len: Option<f64>,
+    /// 这一批音符位置重算**已经算了多少条**（底栏进度用；`pump_floors` 累加、
+    /// 待算清零时归零）
+    floor_done: usize,
 }
 
 impl EditorState {
@@ -901,6 +1292,7 @@ impl EditorState {
             start_playhead: 0.0,
             content_end_beat,
             music_len: None,
+            floor_done: 0,
         }
     }
 
@@ -1288,6 +1680,76 @@ impl EditorState {
     /// 事件挪动，留一点免得贴边的音符被裁掉。
     pub const NOTE_SPAN_MARGIN: f32 = 60.0;
 
+    // ---------------------------------------------------------------- 音符位置重算（异步）
+
+    /// 每帧给音符位置重算多少条。**实测**（`cargo test --release --test floor_bench -- --ignored
+    /// --nocapture`）：4096 条约 **0.2 ~ 0.8 ms**，是一帧预算的 1% 量级；10 万音符的谱面因此
+    /// 大约 **25 帧（0.4 秒）**补完，而**画面从第一帧就是准的**（没补好的那几颗由渲染侧现算，
+    /// 见 [`crate::render::build_instances`]；实测查表 **4 ns/颗** vs 现算 **160 ns/颗**）。
+    pub const FLOOR_NOTES_PER_FRAME: usize = 4096;
+
+    /// 还有多少颗音符的位置**没算准**（0 = 没有异步的活）
+    pub fn floor_pending(&self) -> usize {
+        self.chart.lines.iter().map(|l| l.floors.stale_count()).sum()
+    }
+
+    /// 已经算准的音符总数（诊断面板用：与 [`Self::floor_pending`] 一起看就是"缓存完不完整"）
+    pub fn floor_cached(&self) -> usize {
+        self.chart
+            .lines
+            .iter()
+            .map(|l| l.notes.len().saturating_sub(l.floors.stale_count()))
+            .sum()
+    }
+
+    /// 底栏提示用：`(这一批已算好, 这一批总数)`；`None` = 没有在跑的活。
+    ///
+    /// "本批"= 从"上一次全部算准"到"下一次全部算准"之间累计的条数（含中途又改流速新增的）：
+    /// 正在拖动流速事件时它会一直涨，那正是它该有的样子（那批活确实一直在变大）。
+    pub fn floor_rebuild(&self) -> Option<(usize, usize)> {
+        let pending = self.floor_pending();
+        if pending == 0 {
+            return None;
+        }
+        Some((self.floor_done, self.floor_done + pending))
+    }
+
+    /// **异步重算一步**：本帧最多算 `budget` 条，返回实际算了几条。
+    ///
+    /// 在 GUI 的帧里做（**不开线程**：这份缓存只被渲染与它自己用，没必要为它引入并发）。
+    /// 顺序是用户口径的两段：**从当前时间轴 → 结尾**，再**从头 → 当前时间轴** ——
+    /// 屏幕上马上要用的先算，屏幕外（将来/过去）的后算。
+    ///
+    /// 期间如果又改了流速事件（`Line::set_tracks` 会把新的后缀标脏），
+    /// 待算集合自然就并进来了：下帧从新的进度继续，不需要任何"取消/重来"的仪式。
+    pub fn pump_floors(&mut self, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let playhead = self.playhead;
+        // 借用拆分：`tmap` 只读、`lines` 可变，两者是 `chart` 的不同字段
+        let tmap = &self.chart.tmap;
+        let lines = &mut self.chart.lines;
+        let mut left = budget;
+        for after in [true, false] {
+            for l in lines.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                left -= l.pump_floors(playhead, after, left, tmap);
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        let done = budget - left;
+        self.floor_done += done;
+        if self.floor_pending() == 0 {
+            self.floor_done = 0;
+        }
+        done
+    }
+
     /// 实例构建窗口的**上限**（秒）。流速趋近 0 时"穿过窗口要多久"会发散 ——
     /// 封顶之后极端谱面（流速 0.01）里 30 秒之外的音符不会建实例（它们也都贴在判定线附近）。
     pub const MAX_BUILD_LOOKAHEAD: f64 = 30.0;
@@ -1340,6 +1802,272 @@ pub fn prefer_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------ 音符位置缓存（加载时算好 + 异步重算）
+
+    /// 一份"一条线 + 若干音符 + 给定流速事件"的谱面（BPM 120 ⇒ 一拍 0.5 秒）
+    fn speed_doc(events: Vec<Event>, notes: &[(&str, f64, Option<f64>)]) -> Document {
+        use crate::doc::{Beat, BpmEntry, JudgeLine, Note as DocNote, NoteKind as DocKind};
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry { start: Beat::zero(), bpm: 120.0, foreign: Default::default() }];
+        doc.judge_lines.clear();
+        let mut l = JudgeLine::default();
+        *l.layers[0].track_mut("speed").unwrap() = events;
+        for (kind, start, end) in notes {
+            let k = match *kind {
+                "hold" => DocKind::Hold,
+                "drag" => DocKind::Drag,
+                "flick" => DocKind::Flick,
+                _ => DocKind::Tap,
+            };
+            let mut n = DocNote::new(k, Beat::new((start * 4.0).round() as i64, 4), 0.0);
+            n.end = end.map(|e| Beat::new((e * 4.0).round() as i64, 4));
+            l.notes.push(n);
+        }
+        doc.judge_lines.push(l);
+        doc
+    }
+
+    fn ev(a: f64, b: f64, from: f64, to: f64) -> Event {
+        Event::new(
+            crate::doc::Beat::new((a * 4.0).round() as i64, 4),
+            crate::doc::Beat::new((b * 4.0).round() as i64, 4),
+            serde_json::json!(from),
+            serde_json::json!(to),
+            "linear",
+        )
+    }
+
+    /// **加载时算好的位置 = 直接积分**（独立基准：`perf::speed_travel`，不经过检查点表）。
+    ///
+    /// 这条是"缓存"能不能被信的前提 —— 缓存错了，预览就会在没有流速改动时也是歪的。
+    #[test]
+    fn load_time_positions_match_direct_integration() {
+        // 三段：0→10 升到 20、保持、再降回 -5（含负流速），音符铺在整条时间轴上
+        let events = vec![ev(0.0, 4.0, 10.0, 20.0), ev(4.0, 8.0, 20.0, 20.0), ev(8.0, 12.0, 20.0, -5.0)];
+        let notes: Vec<(&str, f64, Option<f64>)> = (0..12)
+            .map(|k| ("tap", 0.5 * k as f64, None))
+            .chain(std::iter::once(("hold", 1.0, Some(9.0))))
+            .collect();
+        let doc = speed_doc(events.clone(), &notes);
+        let chart = chart_from_doc(&doc);
+        let tmap = chart.tmap.clone();
+        let line = &chart.lines[0];
+        assert_eq!(line.floors.stale_count(), 0, "加载之后不该还有没算准的");
+        assert_eq!(line.floors.len(), line.notes.len());
+        for (i, n) in line.notes.iter().enumerate() {
+            let h = line.h_at(n.time, &tmap);
+            let want = crate::perf::speed_travel(&events, &tmap, 0.0, n.time);
+            assert!((h - want).abs() < 1e-6, "第 {i} 颗：缓存 {h} ≠ 直积 {want}");
+            // 尾巴也一样（hold 的尾巴过去也能问 —— 那个累加器版本在这里会返回 0）
+            if n.kind == NoteKind::Hold {
+                let t = line.h_at(n.end, &tmap);
+                let want = crate::perf::speed_travel(&events, &tmap, 0.0, n.end);
+                assert!((t - want).abs() < 1e-6, "尾巴：缓存 {t} ≠ 直积 {want}");
+            }
+        }
+    }
+
+    /// **流速事件一改：只有它之后的音符被标脏**（前缀积分的直接推论），其余仍是"已算准"。
+    /// 唯一的例外是**跨过改动点的长 hold** —— 它的头没变、尾巴变了（见下）。
+    #[test]
+    fn a_speed_edit_only_dirties_the_notes_after_it() {
+        // 音符在 1..10 拍（一拍一个），另外加一条 2 拍起、9 拍止的长 hold（跨过第 5 拍）
+        let mut notes: Vec<(&str, f64, Option<f64>)> =
+            (0..10).map(|k| ("tap", 1.0 + k as f64, None)).collect();
+        notes.push(("hold", 2.0, Some(9.0)));
+        let doc = speed_doc(vec![ev(0.0, 16.0, 10.0, 10.0)], &notes);
+        let chart = chart_from_doc(&doc);
+        let mut line = chart.lines[0].clone();
+        let tmap = chart.tmap.clone();
+        // 在第 5 拍（2.5 秒）处插一条改流速的事件
+        let mut events = line.tracks[4].events.clone();
+        events.push(ev(5.0, 16.0, 10.0, 30.0));
+        events.sort_by(|a, b| a.start.cmp(&b.start));
+        let mut tracks = line.tracks.clone();
+        tracks[4].events = events;
+        line.set_tracks(tracks, &tmap);
+        // 改动点：第 5 拍 = 2.5 秒。音符按时间升序，**头在 2.5 秒之前、尾在之后的**只有那条长 hold
+        // （2~9 拍 = 1.0~4.5 秒 ⇒ 下标 2）；其后（下标 5..11）整段都要重算。
+        let crossing: Vec<usize> = (0..line.notes.len())
+            .filter(|i| line.notes[*i].time < 2.5 && line.notes[*i].end >= 2.5)
+            .collect();
+        assert_eq!(crossing, vec![2], "这条用例要有一条跨过改动点的长 hold");
+        let stale: Vec<usize> = (0..line.notes.len()).filter(|i| line.floors.is_stale(*i)).collect();
+        let want: Vec<usize> = crossing.iter().copied().chain(5..11).collect();
+        assert_eq!(stale, want, "跨点的长 hold + 改动点之后的那些");
+        // 其余（改动点之前的短音符）位置**一个字都没变**，而且仍然算准
+        let h_now = line.h_at(0.0, &tmap);
+        for i in 0..11 {
+            if want.contains(&i) {
+                continue;
+            }
+            let got = line.floor_offset(i, h_now).expect("改动点之前的音符仍然算准");
+            let direct = line.floor_offset_now(line.notes[i].time, h_now, &tmap);
+            assert!((got - direct).abs() < 1e-9, "第 {i} 颗：{got} ≠ {direct}");
+        }
+    }
+
+    /// **异步重算：预算 + 优先级**（用户口径：先"当前时间轴 → 结尾"，再"开头 → 当前时间轴"）
+    #[test]
+    fn the_rebuild_goes_from_the_playhead_to_the_end_first() {
+        let doc = speed_doc(
+            vec![ev(0.0, 16.0, 10.0, 10.0)],
+            &(0..20).map(|k| ("tap", 1.0 + k as f64, None)).collect::<Vec<_>>(),
+        );
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        // 整条标脏（等于"流速事件改了整条"）
+        st.chart.lines[0].mark_floors_stale_from(0);
+        let total = st.floor_pending();
+        assert_eq!(total, 20);
+        assert_eq!(st.floor_rebuild(), Some((0, 20)), "刚开始：0/20");
+        // 播放头落在 3.5 秒（= 第 7 拍）：音符在 1..20 拍（0.5 … 10.0 秒）
+        st.seek(3.5);
+        let before: Vec<usize> = (0..20).filter(|i| st.chart.lines[0].floors.is_stale(*i)).collect();
+        assert_eq!(before.len(), 20);
+        // 一帧只算 3 条
+        assert_eq!(st.pump_floors(3), 3);
+        let left: Vec<usize> = (0..20).filter(|i| st.chart.lines[0].floors.is_stale(*i)).collect();
+        // 先算的必须是**播放头之后**那三颗：时间 < 3.5s 的有 6 颗（下标 0..6）⇒ 算掉 6、7、8
+        assert_eq!(left, (0..6).chain(9..20).collect::<Vec<_>>(), "实际剩下 {left:?}");
+        assert_eq!(st.floor_rebuild(), Some((3, 20)), "进度：3/20");
+        // 补完为止：每帧 ≤ 预算，总数正好是剩下的
+        let mut frames = 0;
+        while st.floor_pending() > 0 {
+            assert!(st.pump_floors(3) <= 3, "一帧不许超过预算");
+            frames += 1;
+            assert!(frames < 20, "补不完说明预算没被用上");
+        }
+        assert_eq!(frames, 6, "还剩 17 条、每帧 3 条 ⇒ 6 帧");
+        assert_eq!(st.floor_rebuild(), None, "补完之后底栏那行字要消失");
+        assert_eq!(st.floor_pending(), 0);
+    }
+
+    /// 中途又改一次流速（拖动事件就是这个节奏）：**新的脏区间并进来**，从当前的进度继续
+    #[test]
+    fn a_second_speed_edit_merges_into_the_running_rebuild() {
+        let doc = speed_doc(
+            vec![ev(0.0, 16.0, 10.0, 10.0)],
+            &(0..12).map(|k| ("tap", 1.0 + k as f64, None)).collect::<Vec<_>>(),
+        );
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.chart.lines[0].mark_floors_stale_from(0);
+        st.seek(0.0);
+        st.pump_floors(4); // 先补 4 条（播放头在 0 ⇒ 从开头往后）
+        assert_eq!(st.floor_pending(), 8);
+        // 第二笔：从第 4 颗起再改（下标 3）⇒ 并成一个待算集合，总数不变（本来就都待算）
+        st.chart.lines[0].mark_floors_stale_from(3);
+        assert_eq!(st.floor_pending(), 12 - 3.max(0) - 0, "实际 {}", st.floor_pending());
+        assert_eq!(st.floor_rebuild(), Some((4, 4 + st.floor_pending())));
+        while st.floor_pending() > 0 {
+            st.pump_floors(64);
+        }
+        assert_eq!(st.floor_rebuild(), None);
+        assert_eq!(st.floor_cached(), 12);
+    }
+
+    /// `set_notes` / `set_tracks` 顺手要修的两件事（都是"只有整表重建才刷新"留下的病）：
+    /// ① 新加一条长 hold ⇒ `max_note_sec` 跟着涨（否则长条一到线就消失）；
+    /// ② 把流速改慢 ⇒ `min_speed_abs` 跟着降（否则构建窗口没变宽、音符整颗没有实例）。
+    #[test]
+    fn note_and_track_rebuilds_refresh_the_derived_numbers() {
+        let doc = speed_doc(vec![ev(0.0, 16.0, 10.0, 10.0)], &[("tap", 1.0, None)]);
+        let chart = chart_from_doc(&doc);
+        let tmap = chart.tmap.clone();
+        let mut line = chart.lines[0].clone();
+        assert_eq!(line.min_speed_abs, 10.0);
+        assert_eq!(line.max_note_sec, 0.0);
+        // ① 加一条 8 拍的长 hold（0.5 秒/拍 ⇒ 4 秒；起点与 0 号音符相同 ⇒ 列表仍按时间升序）
+        //    再加一颗 3.0 秒（第 6 拍）的音符 —— 它只在窗口放宽之后才该进构建区间
+        let mut notes = line.notes.clone();
+        let mut hold = notes[0];
+        hold.kind = NoteKind::Hold;
+        hold.end = hold.time + 4.0;
+        let mut far = notes[0];
+        far.time = 3.0;
+        far.end = 3.0;
+        notes.push(hold);
+        notes.push(far);
+        line.set_notes(notes, &tmap);
+        assert!((line.max_note_sec - 4.0).abs() < 1e-9, "实际 {}", line.max_note_sec);
+
+        let mut st = EditorState::new(chart);
+        st.chart.lines[0] = line;
+        st.lookahead = 2.0;
+        st.playhead = 0.0;
+        // 流速 10（默认）时窗口是 `lookahead` 的 2 秒 ⇒ 3.0 秒那颗不在构建区间里
+        assert_eq!(st.visible_range_of(0).end, 2, "流速 10 时只该有前两颗");
+        // ② 流速从 10 改成 1 ⇒ `min_speed_abs` 跟着降，窗口放宽到 ~4.25 秒
+        let mut tracks = st.chart.lines[0].tracks.clone();
+        tracks[4].events = vec![ev(0.0, 16.0, 1.0, 1.0)];
+        st.chart.lines[0].set_tracks(tracks, &tmap);
+        assert_eq!(st.chart.lines[0].min_speed_abs, 1.0);
+        assert_eq!(st.visible_range_of(0).end, 3, "流速 1 ⇒ 窗口 4.25 秒，3.0 秒那颗要在区间里");
+    }
+
+    /// `StaleSet`：注入、合并、按区间摘取（异步重算的账本，只有一个地方算得对才算数）
+    #[test]
+    fn stale_set_bookkeeping() {
+        let mut s = StaleSet::default();
+        assert!(s.is_empty() && s.count() == 0 && !s.contains(0));
+        s.mark_from(5, 10);
+        assert_eq!(s.indices(), (5..10).collect::<Vec<_>>());
+        // 再往前标 ⇒ 合并成一整段
+        s.mark_from(2, 10);
+        assert_eq!(s.indices(), (2..10).collect::<Vec<_>>());
+        // 往后标（新的流速改动弄脏尾巴）⇒ 仍是连续的一段
+        s.mark_from(8, 10);
+        assert_eq!(s.indices(), (2..10).collect::<Vec<_>>());
+        // 摘取：只动 `region` 里的那些，最靠左优先
+        let got = s.take(0..4, 1);
+        assert_eq!(got, 2..3, "播放头之前那一半只摘得到 2");
+        assert_eq!(s.indices(), vec![3, 4, 5, 6, 7, 8, 9]);
+        let got = s.take(4..10, 3);
+        assert_eq!(got, 4..7);
+        assert_eq!(s.indices(), vec![3, 7, 8, 9]);
+        // 越界的 region / 预算为 0：什么都不摘
+        assert_eq!(s.take(0..0, 5), 0..0);
+        assert_eq!(s.take(0..10, 0), 0..0);
+        assert_eq!(s.count(), 4);
+        // 单独标一颗（跨过改动点的长 hold 就是这么标的）：与相邻区间合并，不制造碎片
+        s.mark_one(0);
+        assert_eq!(s.indices(), vec![0, 3, 7, 8, 9]);
+        s.mark_one(3);
+        assert_eq!(s.indices(), vec![0, 3, 7, 8, 9], "已经在里面了 ⇒ 不变");
+        s.mark_one(2);
+        assert_eq!(s.indices(), vec![0, 2, 3, 7, 8, 9], "2 与 3 相邻 ⇒ 合成一段");
+        s.mark_one(10);
+        assert_eq!(s.indices(), vec![0, 2, 3, 7, 8, 9, 10]);
+        s.mark_one(1);
+        assert_eq!(s.indices(), (0..4).chain(7..11).collect::<Vec<_>>(), "1 把 0 与 2..3 接起来");
+        assert_eq!(s.count(), 8);
+        // 反复摘到空
+        while !s.is_empty() {
+            s.take(0..16, 2);
+        }
+        assert_eq!(s.count(), 0);
+        // 长度 0 的线：标脏是空操作（别 panic）
+        s.mark_from(0, 0);
+        assert!(s.is_empty());
+    }
+
+    /// `first_speed_change`：找到第一处不同、并给出"最早可能被影响的拍"
+    #[test]
+    fn first_speed_change_finds_the_earliest_affected_beat() {
+        let a = vec![ev(0.0, 4.0, 10.0, 10.0), ev(4.0, 8.0, 10.0, 20.0)];
+        assert_eq!(first_speed_change(&a, &a), None, "一模一样 ⇒ 没有要重算的");
+        // 改第二条 ⇒ 边界是 4 拍
+        let b = vec![ev(0.0, 4.0, 10.0, 10.0), ev(4.0, 8.0, 10.0, 5.0)];
+        assert_eq!(first_speed_change(&a, &b), Some(4.0));
+        // 把第二条的起点往前提 ⇒ 最早受影响的仍是 4 拍（前面那条不动）
+        let c = vec![ev(0.0, 4.0, 10.0, 10.0), ev(3.0, 8.0, 10.0, 5.0)];
+        assert_eq!(first_speed_change(&a, &c), Some(3.0));
+        // 删掉第一条 ⇒ 边界 0
+        assert_eq!(first_speed_change(&a, &b[1..]), Some(0.0));
+        // 空表 → 非空：从新事件起点开始
+        assert_eq!(first_speed_change(&[], &a), Some(0.0));
+    }
+
 
     /// 待放置的 hold：默认一个格点、反向拖有保底、控制杆拖不交叉、Esc 取消不动文档
     #[test]
