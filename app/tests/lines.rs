@@ -113,8 +113,9 @@ fn notes_follow_line_rotation_and_translation() {
         let (s, co) = (-perf.rotate_deg).to_radians().sin_cos();
         let lx = dx * co - dy * s;
         let ly = dx * s + dy * co;
-        if (i.half()[0] - 675.0).abs() < 1e-3 {
+        if (i.half()[0] - st.line_half_w).abs() < 1e-3 {
             // 线本体：本地 y 必须是 0
+            // （按 `st.line_half_w` 认，不写死 675 —— 默认线长是 3000，写死了就会把线当成音符）
             assert!(ly.abs() < 1e-3, "线本体的本地 y 应为 0，实际 {ly}");
         } else {
             // 子音符：本地 x 就是它的 lane_x（±300），本地 y 是下落距离（正、有限）
@@ -767,4 +768,163 @@ fn window_offset_extends_the_lattice_beyond_the_window() {
     let wide = GridCfg { beat_div: 4, lane_div: 128 };
     let v = wide.snap_lane_windowed(0.0, 675.0);
     assert!(v.is_finite());
+}
+
+/// 一份"一条线 + 给定流速 + 给定音符"的谱面（BPM 120 ⇒ 一拍 0.5 秒）
+fn one_line_doc_speed(speed: f64, notes: &[(DocKind, f64, Option<f64>, f32)]) -> Document {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    l.layers[0].track_mut("speed").unwrap().push(Event::new(
+        Beat::zero(),
+        Beat::new(4096, 1),
+        json!(speed),
+        json!(speed),
+        "linear",
+    ));
+    for (kind, start, end, lane) in notes {
+        let mut n = DocNote::new(*kind, Beat::new((start * 4.0) as i64, 4), *lane);
+        n.end = end.map(|e| Beat::new((e * 4.0) as i64, 4));
+        l.notes.push(n);
+    }
+    doc.judge_lines.push(l);
+    doc
+}
+
+/// **判定线默认长度 = 3000**（用户要求；渲染按半长画，长度是编辑器设置而不是格式字段）
+#[test]
+fn the_default_judge_line_is_3000_long() {
+    let st = EditorState::new(chart_from_doc(&Document::default()));
+    assert_eq!(
+        st.line_half_w * 2.0,
+        opm_app::state::RPE_LINE_LEN_DEFAULT,
+        "默认线长应等于这个常量"
+    );
+    assert_eq!(opm_app::state::RPE_LINE_LEN_DEFAULT, 3000.0);
+    // 三个入口用的是**同一个常量**（默认值不许各写各的）
+    assert_eq!(opm_app::cli::Args::default().line_len, 3000.0, "CLI 默认");
+    // 无头出图默认也走它
+    assert_eq!(
+        opm_app::headless::RenderOpts::default().line_len,
+        3000.0,
+        "无头默认"
+    );
+}
+
+/// **每一颗音符都必须在它该看得见的时候被画出来、且完整落在窗口里**（不被裁掉）。
+///
+/// 这条盯的是一个真 bug：实例构建窗口曾经是**固定 2 秒前瞻**，而音符进入窗口的时刻由流速决定
+/// —— 流速 1（0.1×）时音符是 4.25 秒之前进画面，于是 2 秒之外那些**本该看得见**的音符
+/// 整颗没有实例（实测：流速 1、播放头在 0 时，3 秒处那颗在窗口内的音符没有被画）。
+#[test]
+fn every_note_becomes_visible_inside_the_window_before_its_hit() {
+    for speed in [10.0_f64, 3.0, 1.0, 0.5] {
+        // 五颗音符，横向铺满"完整落在窗口内"的范围（±675 减去一个音符的半宽）
+        let lanes = [-600.0_f32, -300.0, 0.0, 300.0, 600.0];
+        let notes: Vec<(DocKind, f64, Option<f64>, f32)> = lanes
+            .iter()
+            .enumerate()
+            .map(|(k, lane)| (DocKind::Tap, 2.0 + 4.0 * k as f64, None, *lane))
+            .collect();
+        let doc = one_line_doc_speed(speed, &notes);
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.selected_line = usize::MAX;
+        // 音符从窗口边缘走到判定线要多久（+ 一点余量）
+        let span = 450.0 / (opm_app::perf::SPEED_UNITS_PER_SEC * speed) + 0.2;
+
+        for (k, lane) in lanes.iter().enumerate() {
+            let t_hit = (2.0 + 4.0 * k as f64) * 0.5;
+            let mut well_inside = 0usize;
+            let mut far_outside = 0usize;
+            let mut quad_outside = 0usize;
+            for step in 0..=80 {
+                st.playhead = t_hit - span * 1.2 + span * 1.2 * step as f64 / 80.0;
+                let mut inst = Vec::new();
+                build_instances(&st, &mut inst);
+                // 只认**音符本体**：判定线本体（半长 1500，故意伸出窗口）与击中效果的方框
+                // 颜色/尺寸都不同，按 Tap 的颜色 + 中心横向位置挑出来
+                let is_this_note = |q: &NoteInstance| {
+                    let c = q.color();
+                    (q.center()[0] - lane).abs() < 1.0
+                        && (c[0] - 0.35).abs() < 0.02
+                        && (c[1] - 0.65).abs() < 0.02
+                        && (c[2] - 1.0).abs() < 0.02
+                };
+                for q in inst.iter().filter(|q| is_this_note(q)) {
+                    // 中心**稳稳地在窗口里**（离边缘还有 30 单位）⇒ 这一帧它是真的看得见
+                    if q.center()[1].abs() <= 450.0 - 30.0 {
+                        well_inside += 1;
+                    }
+                    // 构建窗口留了 `NOTE_SPAN_MARGIN` 的余量：贴边滑入的那几帧允许中心越界，
+                    // 但**不许**超出余量（那才是"建了实例又看不见"的浪费/漏画）
+                    if q.center()[1].abs() > 450.0 + opm_app::state::EditorState::NOTE_SPAN_MARGIN + 1.0
+                    {
+                        far_outside += 1;
+                    }
+                    // 横向也要完整落在窗口里（这几条 laneX 都在"放得下"的范围内）
+                    if q.center()[0].abs() + q.half()[0] > 675.0 + 1e-3 {
+                        quad_outside += 1;
+                    }
+                }
+            }
+            assert!(
+                well_inside > 0,
+                "流速 {speed}：laneX={lane} 的音符从没完整地出现在窗口里"
+            );
+            assert_eq!(far_outside, 0, "流速 {speed}：laneX={lane} 的音符被建到了余量之外");
+            assert_eq!(quad_outside, 0, "流速 {speed}：laneX={lane} 的音符横向被裁了");
+        }
+    }
+}
+
+/// **负流速支持**：流速为负时音符从判定线**下方**飞上来 —— 用户明确说"在判定线之下时不用显示"，
+/// 所以到线之前不画；到线那一刻**击中效果照旧**（否则负流速段就完全没有反馈了）。
+#[test]
+fn a_negative_flow_speed_draws_no_note_but_still_flashes_on_hit() {
+    use opm_app::render::HIT_FX_SEC;
+    let doc = one_line_doc_speed(-10.0, &[(DocKind::Tap, 2.0, None, 0.0)]); // 2 拍 = 1 秒
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+
+    let at = |st: &mut EditorState, t: f64| {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(st, &mut inst);
+        inst
+    };
+    // 到线之前：一颗音符都不画（它们在判定线下面）
+    for t in [0.0, 0.5, 0.9] {
+        let inst = at(&mut st, t);
+        assert_eq!(inst.len(), 1, "t={t}：只剩判定线本体，不该有音符：{:?}", inst.len());
+    }
+    // 到线那一刻：闪光出现（音符本体也在线上收缩）
+    let hit = at(&mut st, 1.0);
+    assert!(flash_count(&hit) > 0, "负流速下击中效果仍要播");
+    // 效果结束：又只剩判定线
+    let after = at(&mut st, 1.0 + HIT_FX_SEC + 0.01);
+    assert_eq!(after.len(), 1, "效果结束后只剩线本体");
+    // 任何时刻都**不画音符本体**（负流速下它整段都在判定线之下）；
+    // 击中效果的环会朝两侧扩散，那几条边允许在线下，所以按颜色认音符本体。
+    for t in [0.0, 0.7, 0.99, 1.0 + HIT_FX_SEC + 0.01] {
+        let inst = at(&mut st, t);
+        assert_eq!(
+            tap_quad_count(&inst),
+            0,
+            "t={t}：负流速下不该画音符本体（它在判定线下面）"
+        );
+    }
+    // 击中当帧：音符本体**停在判定线上**（不是线下面），一闪即逝
+    let hit_mid = at(&mut st, 1.0 + 0.02);
+    if tap_quad_count(&hit_mid) > 0 {
+        let q = hit_mid
+            .iter()
+            .find(|q| q.color()[0] < 0.5 && q.half()[0] > 30.0)
+            .expect("音符本体");
+        assert!(q.center()[1].abs() < 1.0, "到线后应停在线上：{:?}", q.center());
+    }
 }

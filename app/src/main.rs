@@ -4128,21 +4128,43 @@ impl eframe::App for App {
                 );
             }
             // 判定线端点：线长是编辑器设置，端点位置 = 线变换后的 (±line_half, 0)
+            //
+            // 默认线长是 **3000**（比窗口的 1350 宽得多）⇒ 两个端点本来会落在画面之外、
+            // 连"线 #N 长 L"这行字一起看不见。所以：端点圆圈只画**看得见的**那些，
+            // 而长度读数贴在**看得见的那一端**上，并写明"伸出窗口"。
             if let Some(line) = self.state.selected() {
                 let perf = line.perf(&self.state.chart.tmap, self.state.playhead);
                 let p = ui.painter();
                 let col = egui::Color32::from_rgb(250, 220, 120);
+                let outside = self.state.line_half_w > state::RPE_WINDOW_HALF_W + 0.5;
                 for sx in [-1.0_f32, 1.0] {
                     let q = perf.apply([sx * self.state.line_half_w, 0.0]);
                     let pos = rpe_of(q[0], q[1]);
+                    if !play_rect.expand(8.0).contains(pos) {
+                        continue; // 端点在线长超过窗口时本来就在画外
+                    }
                     p.circle_stroke(pos, 5.0, egui::Stroke::new(1.2, col));
-                    p.line_segment([pos - egui::vec2(9.0, 0.0), pos + egui::vec2(9.0, 0.0)], egui::Stroke::new(1.0, col));
+                    p.line_segment(
+                        [pos - egui::vec2(9.0, 0.0), pos + egui::vec2(9.0, 0.0)],
+                        egui::Stroke::new(1.0, col),
+                    );
                 }
-                let q = perf.apply([self.state.line_half_w, 0.0]);
+                // 读数贴在**窗口内**的那一端（长线时就是窗口边缘），且右对齐 ——
+                // 否则"线 #0 长 3000（伸出窗口）"这行字会从右边缘伸出去、同样被裁掉。
+                let at = self
+                    .state
+                    .line_half_w
+                    .min(state::RPE_WINDOW_HALF_W * 0.98);
+                let q = perf.apply([at, 0.0]);
                 p.text(
-                    rpe_of(q[0], q[1]) + egui::vec2(10.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    format!("线 #{} 长 {:.0}", line.index, self.state.line_half_w * 2.0),
+                    rpe_of(q[0], q[1]) + egui::vec2(-10.0, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    format!(
+                        "线 #{} 长 {:.0}{}",
+                        line.index,
+                        self.state.line_half_w * 2.0,
+                        if outside { "（伸出窗口）" } else { "" }
+                    ),
                     egui::FontId::monospace(10.0),
                     col,
                 );

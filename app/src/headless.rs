@@ -67,7 +67,7 @@ pub fn lines_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
 pub struct RenderOpts {
     /// 演奏区垂直可视范围（秒）
     pub lookahead: f64,
-    /// 判定线**全长**（编辑器设置，默认 1350 = 与窗口同宽）
+    /// 判定线**全长**（编辑器设置，默认 3000 —— 比窗口宽，见 `state::RPE_LINE_LEN_DEFAULT`）
     pub line_len: f32,
     /// 是否画窗口边界框（RPE ±675 × ±450）
     pub boundary: bool,
@@ -77,7 +77,7 @@ impl Default for RenderOpts {
     fn default() -> Self {
         Self {
             lookahead: 2.0,
-            line_len: crate::state::RPE_LINE_HALF_W * 2.0,
+            line_len: crate::state::RPE_LINE_LEN_DEFAULT,
             boundary: true,
         }
     }

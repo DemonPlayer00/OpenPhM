@@ -580,12 +580,23 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
         for idx in state.visible_range_of(li) {
             let note = &line.notes[idx];
             // 音符自身的 speed（文档字段，默认 1.0）乘在**离判定线的距离**上：
-            // RPE/prpr 就是这么用的（它不改到达时刻，只改"落多远"）。
-            let spd = (note.speed as f64).abs().max(1e-3);
+            // RPE/prpr 就是这么用的（它不改到达时刻，只改"落多远"）。**带符号** ——
+            // 负的音符 speed 把方向翻过来（音符从下方上来），与负流速是同一套几何。
+            let spd = note.speed as f64;
+            // `speed = 0` 的东西不渲染（RPE：Hold 的 `speed = 0` ⇒ 长度 0 ⇒ 不渲染；
+            // 这里对四种音符一视同仁，免得它永远贴在判定线上）
+            if spd.abs() < 1e-3 {
+                continue;
+            }
             let lead = (walk.to(note.time) * spd) as f32;
             // **到线之后就不再往下走**：音符停在判定线上收缩消失（游戏里就是这样，
             // 而不是从判定线下面继续往下掉）。`age > 0` = 已经到达判定线。
             let age = state.playhead - note.time;
+            // **判定线之下不显示**（用户要求）：流速为负时音符从下面飞上来，到线之前整条都在
+            // 线下面 —— 那一段不画（到线那一刻由击中效果接住）。也顺手省掉"建了实例再被 GPU 裁掉"。
+            if age <= 0.0 && lead < 0.0 {
+                continue;
+            }
             let y_local = if age > 0.0 { 0.0 } else { lead };
             // 到达之后 0→1 的消失进度；`>= 1` 就彻底没了（只剩击中效果在场）。
             // **必须夹到 0**：`age < 0` 是"还没到"（绝大多数音符），不夹就成了负进度 ⇒
@@ -600,11 +611,13 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             } else {
                 0.0
             };
-            // 整条都在窗口上方很远 ⇒ 不必建实例（GPU 那边本来也会裁掉，省下来的是带宽）。
-            // 判据取**最低的那一端**：长 hold 的尾巴可能远在窗口之上，而身子正从判定线穿过去
-            // （取"最高的一端"会把它整条裁掉 —— 那是"长条一到线就消失"的另一个成因）。
+            // 整条都在窗口**之外**（上或下）⇒ 不必建实例（GPU 那边本来也会裁掉）。
+            // 判据取两端：长 hold 的尾巴可能远在窗口之上、身子正从判定线穿过去
+            // （只看最高的一端会把它整条裁掉 —— 那是"长条一到线就消失"的另一个成因）。
             let tail_y = lead + hold_dy;
-            if y_local.min(tail_y) > RPE_WINDOW_HALF_H + 60.0 {
+            let edge = RPE_WINDOW_HALF_H + EditorState::NOTE_SPAN_MARGIN;
+            let (body_lo, body_hi) = (y_local.min(tail_y), y_local.max(tail_y));
+            if body_lo > edge || body_hi < -edge {
                 continue;
             }
 

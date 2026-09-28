@@ -263,7 +263,9 @@ pub fn inspector_ui(
                     set.insert("isFake".into(), serde_json::json!(fake));
                 }
                 let mut sp = n.speed;
-                if value_field(ui, &mut sp, "speed ", 0.01, Some(0.01..=20.0)).changed
+                // **负值也允许**：音符自身的 speed 带符号，负值把方向翻过来
+                // （与负流速是同一套几何：音符从判定线下面上来，到线之前不显示）
+                if value_field(ui, &mut sp, "speed ", 0.01, Some(-20.0..=20.0)).changed
                 {
                     set.insert("speed".into(), serde_json::json!(sp));
                 }

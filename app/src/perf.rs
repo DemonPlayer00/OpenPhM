@@ -335,6 +335,35 @@ pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64
     acc * SPEED_UNITS_PER_SEC
 }
 
+/// 流速轨道上**最接近 0 的那个非零量级**（`|v|` 的下界）—— 用来估算"音符穿过窗口要多久"。
+///
+/// **逐事件采样**（缓动可能在中途掉到很低，端点看不出来），不是解析求极值：这个数只用来
+/// 决定"往后看多久"，估小一点只是多算几个实例，估大了会**漏画本该看得见的音符**，
+/// 所以采样点取密一点（每事件 16 点）并且把 |v| < 0.05 的点当"几乎不动"排除掉。
+/// 返回 `None` = 没有流速事件（调用方按 `SPEED_DEFAULT` 处理）。
+pub fn min_speed_magnitude(events: &[Event], samples_per_event: usize) -> Option<f64> {
+    if events.is_empty() {
+        return None;
+    }
+    let n = samples_per_event.max(1);
+    let mut best = f64::INFINITY;
+    for e in events {
+        let (a, b) = (e.start.to_f64(), e.end.to_f64());
+        for k in 0..=n {
+            let beat = a + (b - a) * k as f64 / n as f64;
+            let v = event_value(e, beat).abs();
+            if v >= MIN_SPEED_MAGNITUDE {
+                best = best.min(v);
+            }
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// 低于这个量级的流速当"几乎不动"（[`min_speed_magnitude`] 与可见窗口都用它判"冻结"）。
+pub const MIN_SPEED_MAGNITUDE: f64 = 0.05;
+
+/// 每一段里抽几个点走梯形法。
 /// 每一段里抽几个点走梯形法。线性段与常值段不需要抽（见 [`integrate_until`]）。
 pub const SPEED_SAMPLES_PER_SEGMENT: usize = 8;
 

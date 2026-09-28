@@ -321,7 +321,7 @@ opm-ctl --file chart.opm.json validate && python3 ../spec/check.py chart.opm.jso
 opm-ctl --file chart.opm.json render --at 4.0 --lookahead 2.0 --out preview.png
 # 出图默认画出**窗口边界**（RPE ±675 × ±450，即 1350×900）并把边界外压暗：
 # 于是"音符跑到画面外了"在图上直接看得见（变暗但仍可见），不必自己算坐标。
-# 判定线长度是编辑器设置（RPE 格式无此字段），出图时可用 --line-len 指定：
+# 判定线长度是编辑器设置（RPE 格式无此字段），默认 **3000**（比窗口宽），出图时可用 --line-len 指定：
 opm-ctl --file chart.opm.json render --at 4.0 --line-len 1600 --out wide-line.png   # 线伸出窗口
 opm-ctl --file chart.opm.json render --at 4.0 --no-boundary --out plain.png         # 不要边界框
 # 附带的 RPE 对照（易错点）：RPE 的线/音符 alpha 是 0~255，opm 用 0~1；导入时 ÷255。

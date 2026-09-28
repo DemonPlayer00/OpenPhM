@@ -175,7 +175,7 @@ impl Default for Args {
             shot_frame: 30,
             shot_exit: false,
             boundary: true,
-            line_len: state::RPE_LINE_HALF_W * 2.0,
+            line_len: state::RPE_LINE_LEN_DEFAULT,
             audio: None,
             autoplay: false,
             audio_offset_ms: 0.0,

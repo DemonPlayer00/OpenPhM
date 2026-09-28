@@ -175,6 +175,12 @@ pub struct Line {
     /// 立刻消失）。用"最长时长"当回退量是个**正确**的下界：任何 `end ≥ 窗口起点` 的音符
     /// 都必然满足 `time ≥ 窗口起点 − 最长时长`。
     pub max_note_sec: f64,
+    /// 这条线流速的**最小非零量级**（`min |v|`，见 [`crate::perf::min_speed_magnitude`]；
+    /// 没有流速事件时是 [`crate::perf::SPEED_DEFAULT`]）。
+    ///
+    /// 决定"往后看多久"：流速越慢，音符越早进入窗口 —— 固定的 2 秒前瞻在慢流速下会**漏画**
+    /// 本该看得见的音符（实测：流速 1 时 3 秒外的音符在窗口里，却整颗没有实例）。
+    pub min_speed_abs: f64,
 }
 
 impl Line {
@@ -245,8 +251,16 @@ pub const RPE_WINDOW_HALF_H: f32 = 450.0;
 /// 窗口尺寸（= 2×半宽/半高）
 pub const RPE_WINDOW_W: f32 = RPE_WINDOW_HALF_W * 2.0;
 pub const RPE_WINDOW_H: f32 = RPE_WINDOW_HALF_H * 2.0;
-/// 判定线长度的默认值：与窗口同宽（±675）。可在 GUI/CLI 调整（`--line-len`）。
-pub const RPE_LINE_HALF_W: f32 = RPE_WINDOW_HALF_W;
+/// 判定线**长度**的默认值（用户要求：3000）。
+///
+/// 它比窗口宽（窗口是 ±675 共 1350）—— 线两端会伸出游戏画面，这是刻意的：
+/// 判定线常常被旋转/缩放，长一点更容易看清"它此刻在哪、朝哪边"。
+/// 长度是**编辑器设置**而不是格式字段（`spec/opm-format.md` 里判定线没有这个字段），
+/// GUI 的 `线半长` 与 CLI 的 `--line-len` 都能改。
+pub const RPE_LINE_LEN_DEFAULT: f32 = 3000.0;
+
+/// 判定线**半长**的默认值（= 长度的一半；渲染按半长画）。见 [`RPE_LINE_LEN_DEFAULT`]。
+pub const RPE_LINE_HALF_W: f32 = RPE_LINE_LEN_DEFAULT * 0.5;
 
 /// 谱面视图：**判定线的列表**（按 zOrder 排序，绘制顺序）
 #[derive(Clone, Debug)]
@@ -285,6 +299,10 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
         .iter()
         .map(|n| (n.end - n.time).max(0.0))
         .fold(0.0_f64, f64::max);
+    // 流速轨道上的最小量级（采样）；没有事件 ⇒ RPE 的默认 10
+    let speed_events = crate::perf::track_events(src, "speed");
+    let min_speed_abs = crate::perf::min_speed_magnitude(&speed_events, 16)
+        .unwrap_or(crate::perf::SPEED_DEFAULT);
     Some(Line {
         index,
         name: src.name.clone(),
@@ -294,6 +312,7 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
         notes,
         tracks: Default::default(),
         max_note_sec,
+        min_speed_abs,
     })
 }
 
@@ -869,7 +888,7 @@ impl EditorState {
             pending_event: None,
             lookahead: 2.0,
             show_boundary: true,
-            line_half_w: RPE_LINE_HALF_W,
+            line_half_w: RPE_LINE_HALF_W, // = 3000 的一半
             grid: GridCfg::default(),
             overlay_enabled: true,
             // 时间轴默认缩放：**放大档**（用户要求"拉长 4 倍"：原来 32 拍可见 → 8 拍可见，
@@ -1250,9 +1269,26 @@ impl EditorState {
         };
         let back = Self::PAST_NOTE_MARGIN_SEC + l.max_note_sec;
         let lo = l.notes.partition_point(|n| n.time < self.playhead - back);
-        let hi = l.notes.partition_point(|n| n.time < self.playhead + self.lookahead);
+        // 往前看多久由**流速**决定，不是固定 2 秒：音符从窗口边缘（±450 + 一个音符的余量）
+        // 走到判定线要 `510 / (120·|v|)` 秒 —— 流速 10（默认）是 0.42 秒，流速 1 是 4.25 秒。
+        // `lookahead` 是**下限**（至少往后算这么多秒，保证它仍然是个有意义的旋钮），
+        // 上限是 `MAX_BUILD_LOOKAHEAD`（流速趋近 0 时别把整份谱面都塞进实例列表）。
+        let v = l.min_speed_abs.max(crate::perf::MIN_SPEED_MAGNITUDE);
+        let speed_span = (RPE_WINDOW_HALF_H + Self::NOTE_SPAN_MARGIN) as f64
+            / (crate::perf::SPEED_UNITS_PER_SEC * v);
+        let floor = self.lookahead.min(Self::MAX_BUILD_LOOKAHEAD).max(0.05);
+        let ahead = speed_span.clamp(floor, Self::MAX_BUILD_LOOKAHEAD);
+        let hi = l.notes.partition_point(|n| n.time < self.playhead + ahead);
         lo..hi
     }
+
+    /// 判断"音符还在窗口里"时给端点留的余量（RPE y 单位）：音符自身有半高，判定线还可能被
+    /// 事件挪动，留一点免得贴边的音符被裁掉。
+    pub const NOTE_SPAN_MARGIN: f32 = 60.0;
+
+    /// 实例构建窗口的**上限**（秒）。流速趋近 0 时"穿过窗口要多久"会发散 ——
+    /// 封顶之后极端谱面（流速 0.01）里 30 秒之外的音符不会建实例（它们也都贴在判定线附近）。
+    pub const MAX_BUILD_LOOKAHEAD: f64 = 30.0;
 
     /// 播放头**之前**还要送进渲染管线的余量（秒）。
     ///

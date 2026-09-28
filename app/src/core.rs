@@ -1442,7 +1442,7 @@ impl EditCore {
                 let line_len = c
                     .get("lineLen")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(crate::state::RPE_LINE_HALF_W as f64 * 2.0) as f32;
+                    .unwrap_or(crate::state::RPE_LINE_LEN_DEFAULT as f64) as f32;
                 let boundary = c.get("boundary").and_then(|v| v.as_bool()).unwrap_or(true);
                 crate::headless::render_png(
                     &self.doc,

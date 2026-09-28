@@ -400,7 +400,7 @@ fn run() -> i32 {
                 eprintln!("render 需要 --out PNG");
                 return 2;
             };
-            let mut line_len = opm_app::state::RPE_LINE_HALF_W * 2.0;
+            let mut line_len = opm_app::state::RPE_LINE_LEN_DEFAULT;
             let mut boundary = true;
             let mut k = 0;
             while k < cli.sub_args.len() {
