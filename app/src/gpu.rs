@@ -134,6 +134,111 @@ pub fn policy_from_env(
     }
 }
 
+/// 启用哪些后端（`wgpu::Backends` 的"我们要哪些"）。
+///
+/// 为什么要它：wgpu 默认把所有后端都初始化一遍 —— 在 Linux 上这意味着**连 GL（Mesa EGL/GLX）
+/// 也一起拉起来**，实测多花约 150 ms（枚举 772 → 622 ms）。而 GL 那条路我们只在
+/// "Vulkan 里没有可用卡"时才用得到（本会话验证过：只挂 intel ICD 那次就是靠 GL 才出得了图）。
+///
+/// 所以：**能确定 Vulkan 可用时只开 Vulkan**（省掉 GL 初始化），否则保持全后端（留着回退）。
+/// "确定可用"用的是**不会触发初始化的**探测：ICD json 存在 + Vulkan loader 库存在。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendPlan {
+    /// 只开 Vulkan
+    VulkanOnly,
+    /// 全后端（保持 GL 回退）
+    All,
+}
+
+impl BackendPlan {
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendPlan::VulkanOnly => "仅 Vulkan（检测到 ICD + loader，省掉 GL 初始化）",
+            BackendPlan::All => "全部后端（保留 GL 回退）",
+        }
+    }
+}
+
+/// 后端计划（**纯函数**）：
+/// - `OPM_BACKEND=vulkan|all` 说了算（`gl` 交给 `WGPU_BACKEND`，见下）；
+/// - 用户设了 `WGPU_BACKEND` ⇒ **不动**（那是 wgpu 自己的开关，别抢）；
+/// - Linux 且 ICD json 与 loader 都在 ⇒ 只开 Vulkan；
+/// - 其余（非 Linux、探测不到 Vulkan）⇒ 全后端。
+pub fn backend_plan(
+    is_linux: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+    vulkan_icd_present: bool,
+    vulkan_loader_present: bool,
+) -> (BackendPlan, &'static str) {
+    let get = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    match get("OPM_BACKEND").as_deref() {
+        Some("vulkan") | Some("vk") => return (BackendPlan::VulkanOnly, "OPM_BACKEND=vulkan"),
+        Some("all") | Some("auto") => return (BackendPlan::All, "OPM_BACKEND=all"),
+        _ => {}
+    }
+    if get("WGPU_BACKEND").is_some() {
+        return (BackendPlan::All, "尊重 WGPU_BACKEND（用户自己指定了后端）");
+    }
+    if is_linux && vulkan_icd_present && vulkan_loader_present {
+        return (BackendPlan::VulkanOnly, "检测到 Vulkan ICD 与 loader");
+    }
+    if !is_linux {
+        return (BackendPlan::All, "非 Linux：不动后端集合");
+    }
+    (BackendPlan::All, "没探测到可用的 Vulkan：保留全后端")
+}
+
+/// Vulkan ICD 声明文件可能所在的位置（按 Vulkan loader 的查找规则：环境变量优先，其次 XDG/默认目录）
+pub fn icd_search_paths(env: &dyn Fn(&str) -> Option<String>) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out: Vec<PathBuf> = Vec::new();
+    // ① 显式指定（`VK_DRIVER_FILES` 是 `VK_ICD_FILENAMES` 的新名字）
+    for k in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+        if let Some(v) = env(k) {
+            for p in v.split(':').filter(|p| !p.trim().is_empty()) {
+                out.push(PathBuf::from(p.trim()));
+            }
+        }
+    }
+    // ② XDG 数据目录与默认目录下的 `vulkan/icd.d`
+    let dirs = env("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
+    for d in dirs.split(':').filter(|d| !d.trim().is_empty()) {
+        out.push(PathBuf::from(d.trim()).join("vulkan").join("icd.d"));
+    }
+    // ③ 兜底（有些发行版/驱动把 json 放这儿）
+    out.push(PathBuf::from("/etc/vulkan/icd.d"));
+    out
+}
+
+/// 判定"Vulkan ICD 可用"（**纯函数**）：
+/// - **显式指定了** ICD 文件（`VK_DRIVER_FILES`/`VK_ICD_FILENAMES`）时**必须全部存在** ——
+///   指了却找不到说明这套 Vulkan 配置是坏的，此时不该信它（该退回全后端，留着 GL 回退）；
+/// - 没显式指定时，看默认目录（`…/vulkan/icd.d`）里有没有 json。
+///
+/// 这一条是被自己的实验逼出来的：`VK_DRIVER_FILES=/nonexistent.json` 时 Vulkan 枚举是空的，
+/// 而**修好之前**默认会"因为看到 ICD 就只开 Vulkan" ⇒ 直接起不来（全后端时它会退到 GL 出图）。
+pub fn vulkan_icd_usable(explicit_exists: &[bool], default_dir_has_json: bool) -> bool {
+    if explicit_exists.is_empty() {
+        default_dir_has_json
+    } else {
+        explicit_exists.iter().all(|ok| *ok)
+    }
+}
+
+/// Vulkan loader 库的常见位置（`ldconfig` 太贵，直接看这几个路径就够）
+pub fn loader_candidates() -> [&'static str; 4] {
+    [
+        "/usr/lib/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/local/lib/libvulkan.so.1",
+    ]
+}
+
 /// 一句话说明当前策略（启动时打一行，用户就知道程序用了哪块卡、为什么）
 pub fn describe(policy: GpuPolicy, why: &str) -> String {
     format!("{}（{why}）", policy.label())
@@ -276,6 +381,65 @@ mod tests {
             }
         }
         assert_eq!(checked, 32 * 2, "应当覆盖全部 32 个子集 × 2 种挑卡策略");
+    }
+
+    /// 后端计划：能确定 Vulkan 可用就只开 Vulkan；用户自己的开关一概不抢
+    #[test]
+    fn backend_plan_prefers_vulkan_but_never_overrides_the_user() {
+        let none = env_of(&[]);
+        // Linux + ICD + loader ⇒ 只开 Vulkan（省掉 GL 初始化）
+        let (p, why) = backend_plan(true, &none, true, true);
+        assert_eq!(p, BackendPlan::VulkanOnly);
+        assert!(why.contains("Vulkan"), "{why}");
+        assert!(p.label().contains("仅 Vulkan"));
+        // 缺 ICD 或缺 loader ⇒ 保留全后端（**回退比省 150ms 重要**）
+        assert_eq!(backend_plan(true, &none, false, true).0, BackendPlan::All);
+        assert_eq!(backend_plan(true, &none, true, false).0, BackendPlan::All);
+        assert_eq!(backend_plan(true, &none, false, false).0, BackendPlan::All);
+        // 非 Linux 不动
+        assert_eq!(backend_plan(false, &none, true, true).0, BackendPlan::All);
+        // 用户设了 WGPU_BACKEND ⇒ 尊重它，别改后端集合
+        let (p, why) = backend_plan(true, &env_of(&[("WGPU_BACKEND", "gl")]), true, true);
+        assert_eq!(p, BackendPlan::All);
+        assert!(why.contains("WGPU_BACKEND"), "{why}");
+        // 我们的开关压过一切
+        assert_eq!(
+            backend_plan(true, &env_of(&[("OPM_BACKEND", "vulkan"), ("WGPU_BACKEND", "gl")]), false, false).0,
+            BackendPlan::VulkanOnly
+        );
+        assert_eq!(
+            backend_plan(true, &env_of(&[("OPM_BACKEND", "all")]), true, true).0,
+            BackendPlan::All
+        );
+    }
+
+    /// ICD 可用性：显式指定必须全部存在（指了却找不到 = 别信 Vulkan，退回全后端留 GL 回退）
+    #[test]
+    fn explicit_icd_paths_must_all_exist() {
+        // 没显式指定 ⇒ 看默认目录
+        assert!(vulkan_icd_usable(&[], true));
+        assert!(!vulkan_icd_usable(&[], false));
+        // 显式指定：一个不存在就不信
+        assert!(vulkan_icd_usable(&[true], false));
+        assert!(vulkan_icd_usable(&[true, true], false));
+        assert!(!vulkan_icd_usable(&[true, false], true), "缺一个也不该信");
+        assert!(!vulkan_icd_usable(&[false], true));
+    }
+
+    /// ICD 查找路径：环境变量优先、XDG 目录其次、再兜底；loader 只看几个常见路径
+    #[test]
+    fn icd_and_loader_probe_paths_are_sane() {
+        let p = icd_search_paths(&env_of(&[("VK_DRIVER_FILES", "/a/x.json:/b/y.json")]));
+        assert_eq!(p[0], std::path::PathBuf::from("/a/x.json"));
+        assert_eq!(p[1], std::path::PathBuf::from("/b/y.json"));
+        assert!(p.iter().any(|q| q.ends_with("vulkan/icd.d")));
+        // 空的/带空格的段要跳过
+        let p = icd_search_paths(&env_of(&[("VK_ICD_FILENAMES", "  : ")]));
+        assert!(p.iter().all(|q| q.to_string_lossy().contains("vulkan") || q.to_string_lossy().starts_with("/etc")));
+        // XDG_DATA_DIRS 生效
+        let p = icd_search_paths(&env_of(&[("XDG_DATA_DIRS", "/opt/share")]));
+        assert!(p.iter().any(|q| q == &std::path::PathBuf::from("/opt/share/vulkan/icd.d")));
+        assert!(loader_candidates().iter().all(|p| p.ends_with("libvulkan.so.1")));
     }
 
     /// `Default` = "交给平台"：**不给出选择**（否则"随便挑第一个"会把软件渲染那种最差候选选中）。

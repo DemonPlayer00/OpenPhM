@@ -50,6 +50,16 @@ use state::EditorState;
 /// 抽成纯读函数是因为它有两个调用点（`App::new` 的初值、`refresh_file_badge` 的事件刷新），
 /// 而"怎么拼这行字"只该有一份 —— 上一版把逻辑写在方法里，`--doc FILE` 那条启动路径
 /// 没有经过任何刷新点，于是已载入的文件被显示成"尚未保存"。
+/// 目录里有没有 `.json`（ICD 声明文件）——只看后缀，不解析内容
+fn dir_has_json(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "json"))
+        })
+        .unwrap_or(false)
+}
+
 /// wgpu 的 `DeviceType` → `opm_app::gpu::GpuKind`（库里的策略是纯逻辑，不依赖 wgpu 类型）
 fn gpu_kind_of(t: eframe::wgpu::DeviceType) -> opm_app::gpu::GpuKind {
     use eframe::wgpu::DeviceType as T;
@@ -453,6 +463,40 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // ---- 后端集合：**能确定 Vulkan 可用就只开 Vulkan**（省掉 GL 的初始化，实测 ~150 ms）----
+    //
+    // 探测本身**不触发初始化**（只看 ICD json 与 loader 库在不在），探测不到就保留全后端 ——
+    // GL 回退在本会话里真的救过场（Vulkan 里没有可用卡那次）。开关：`OPM_BACKEND=vulkan|all`；
+    // 用户设了 `WGPU_BACKEND` 时一切照旧（不抢 wgpu 自己的开关）。
+    {
+        let env = |k: &str| std::env::var(k).ok();
+        // 显式指定的 ICD 路径要么都在、要么不信（见 `gpu::vulkan_icd_usable`）
+        let explicit: Vec<bool> = ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .flat_map(|v| {
+                v.split(':')
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| std::path::Path::new(p.trim()).is_file())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let default_json = opm_app::gpu::icd_search_paths(&env)
+            .iter()
+            .any(|p| p.is_dir() && dir_has_json(p));
+        let icd = opm_app::gpu::vulkan_icd_usable(&explicit, default_json);
+        let loader = opm_app::gpu::loader_candidates().iter().any(|p| std::path::Path::new(p).is_file());
+        let (plan, why) = opm_app::gpu::backend_plan(cfg!(target_os = "linux"), &env, icd, loader);
+        println!("  图形后端          : {}（{why}）", plan.label());
+        if plan == opm_app::gpu::BackendPlan::VulkanOnly {
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(cfg_new) =
+                &mut options.wgpu_options.wgpu_setup
+            {
+                cfg_new.instance_descriptor.backends = eframe::wgpu::Backends::VULKAN;
+            }
+        }
+    }
+
     // ---- 显卡策略：**默认走核显**，独显只在显式指定时才用（见 `opm_app::gpu`）----
     //
     // 为什么要自己选：wgpu 的默认电源偏好是 `HighPerformance` ⇒ 什么都不设时会去开独显，
