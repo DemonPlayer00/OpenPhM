@@ -296,10 +296,13 @@ pub struct Decoded {
 }
 
 impl Decoded {
+    /// 帧数（每声道采样数）。坏文件里 `channels` 可能是 0 ⇒ 兜底 1，免得除零。
+    pub fn frames(&self) -> usize {
+        self.samples.len() / self.channels.max(1) as usize
+    }
     /// 时长（秒）—— **不需要输出设备也能算**：时间轴总长要的就是它。
     pub fn duration_sec(&self) -> f64 {
-        let frames = self.samples.len() / self.channels.max(1) as usize;
-        frames as f64 / self.rate.max(1) as f64
+        self.frames() as f64 / self.rate.max(1) as f64
     }
 }
 
@@ -345,14 +348,13 @@ pub fn spec(cli: Option<&str>, meta: Option<&str>) -> Option<String> {
 
 pub fn probe(path: &Path) -> Result<serde_json::Value, String> {
     let d = decode(path)?;
-    let frames = d.samples.len() / d.channels.max(1) as usize;
     Ok(serde_json::json!({
         "path": path.display().to_string(),
         "codec": d.codec,
         "sampleRate": d.rate,
         "channels": d.channels,
-        "frames": frames,
-        "durationSec": frames as f64 / d.rate.max(1) as f64,
+        "frames": d.frames(),
+        "durationSec": d.duration_sec(),
     }))
 }
 

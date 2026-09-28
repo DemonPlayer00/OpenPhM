@@ -129,30 +129,23 @@ pub fn line_tree_ui(
                     }
                 }
             });
-            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-            let total = track.events.len();
-            let selected = st.selected_event();
-            let mut clicked = None;
-            egui::ScrollArea::vertical()
-                .id_salt("events_scroll")
-                .max_height(150.0)
-                .auto_shrink([false, false])
-                .show_rows(ui, row_h, total, |ui, range| {
-                    for i in range {
-                        let e = &track.events[i];
-                        let mark = if Some(i) == selected { "▶" } else { " " };
-                        let text = format!(
-                            "{mark}{i:>4} {:>6.2}s {:>6.1}→{:<6.1} {}",
-                            tmap.sec(e.start.to_f64()),
-                            e.start_value,
-                            e.end_value,
-                            e.easing
-                        );
-                        if ui.monospace(text).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
-                });
+            let clicked = row_list(
+                ui,
+                "events_scroll",
+                150.0,
+                track.events.len(),
+                st.selected_event(),
+                |i| {
+                    let e = &track.events[i];
+                    format!(
+                        "{i:>4} {:>6.2}s {:>6.1}→{:<6.1} {}",
+                        tmap.sec(e.start.to_f64()),
+                        e.start_value,
+                        e.end_value,
+                        e.easing
+                    )
+                },
+            );
             if let Some(i) = clicked {
                 acts.push(TreeAction::SelectEvent(i));
             }
@@ -166,31 +159,50 @@ pub fn line_tree_ui(
     egui::CollapsingHeader::new(format!("子音符（{} 个；线速 {:.1}）", notes_len, line_speed))
         .default_open(true)
         .show(ui, |ui| {
-            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-            let selected = st.selected_note();
-            let mut clicked = None;
-            egui::ScrollArea::vertical()
-                .id_salt("notes_scroll")
-                .max_height(140.0)
-                .auto_shrink([false, false])
-                .show_rows(ui, row_h, notes_len, |ui, range| {
-                    for i in range {
-                        let n = &line.notes[i];
-                        let mark = if Some(i) == selected { "▶" } else { " " };
-                        let text = format!(
-                            "{mark}{i:>6}  {:>7.3}s  {:>6.1}  {}",
-                            n.time,
-                            n.lane_x,
-                            n.kind.label()
-                        );
-                        if ui.monospace(text).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
-                });
+            let clicked = row_list(
+                ui,
+                "notes_scroll",
+                140.0,
+                notes_len,
+                st.selected_note(),
+                |i| {
+                    let n = &line.notes[i];
+                    format!("{i:>6}  {:>7.3}s  {:>6.1}  {}", n.time, n.lane_x, n.kind.label())
+                },
+            );
             if let Some(i) = clicked {
                 acts.push(TreeAction::SelectNote(i));
             }
         });
+}
+
+/// 一列**虚拟滚动**的行（事件表与子音符表共用）：返回被点中的下标。
+///
+/// 两处逐字相同，只有行文本、高度、滚动 id 不同。抽出来的真正理由是 `show_rows`：
+/// 复制第二份时最容易漏掉它（改成 `for i in 0..total`），而漏了之后的症状是
+/// "谱面一大就卡"——在几十个音符的样例上看不出来。行首的 "▶" 也是在这里统一的。
+fn row_list(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    max_height: f32,
+    total: usize,
+    selected: Option<usize>,
+    row_text: impl Fn(usize) -> String,
+) -> Option<usize> {
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let mut clicked = None;
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .show_rows(ui, row_h, total, |ui, range| {
+            for i in range {
+                let mark = if Some(i) == selected { "▶" } else { " " };
+                if ui.monospace(format!("{mark}{}", row_text(i))).clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    clicked
 }
 

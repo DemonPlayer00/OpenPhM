@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use crate::codec::{self, Fidelity, Format};
 use crate::broadcast::{topics_of, Broadcast, Origin, Subscribers, Subscription, Topic, TopicFilter, TopicKind};
-use crate::cmd::{parse_beat, validate, EASINGS};
+use crate::cmd::{is_easing, parse_beat};
 use crate::doc::{Beat, Document, Event, JudgeLine, Note, NoteKind, TRACKS};
 use crate::journal::{read_track, Change, Journal, LineProps};
 
@@ -452,14 +452,10 @@ impl EditCore {
         }
         let mut fid = codec::Fidelity::new("opm", "容器（zip）".to_owned());
         let entries = codec::container::unpack(&bytes, &mut fid)?;
-        // **"这是哪一种包"只能等解开、看过条目名才知道**：RPE 谱面包里有 `info.yml`
-        let is_package = entries.iter().any(|e| e.name == codec::package::INFO_NAME);
-        let (doc, assets) = if is_package {
-            codec::package::read_entries(entries, &mut fid)?
-        } else {
-            let c = codec::container::read_entries(entries, &mut fid)?;
-            (c.doc, c.assets)
-        };
+        // **"这是哪一种包"只能等解开、看过条目名才知道**（RPE 谱面包里有 `info.yml`）——
+        // 判据在 `codec::EntryKind::of` 一处（见那里的注释：分错了就是整份文档按错格式解析）
+        let kind = codec::EntryKind::of(&entries);
+        let (doc, assets) = kind.read(entries, &mut fid)?;
         // 来源格式跟着**内容**走（与旧行为一致）：容器 ⇒ `opm`，RPE 谱面包 ⇒ `rpe`。
         // 它决定"保存时默认写回哪种格式"（RPE 进就 RPE 出），也是会话元数据里记的那一项。
         let format = codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm);
@@ -502,13 +498,9 @@ impl EditCore {
         }
         let session = codec::container::read_session(dir);
         let mut fid = codec::Fidelity::new("opm", "无压缩文件夹".to_owned());
-        let is_package = entries.iter().any(|e| e.name == codec::package::INFO_NAME);
-        let (doc, assets) = if is_package {
-            codec::package::read_entries(entries, &mut fid)?
-        } else {
-            let c = codec::container::read_entries(entries, &mut fid)?;
-            (c.doc, c.assets)
-        };
+        // 与"从文件开"走同一个判据（`codec::EntryKind`）
+        let kind = codec::EntryKind::of(&entries);
+        let (doc, assets) = kind.read(entries, &mut fid)?;
         // 来源格式：**会话元数据优先**（它记的是"原来那个文件是什么形态"—— 摊开之后目录里只剩
         // 一份 `opm.json`，光看内容分不出它原来是 `.opm` 容器还是无压缩文件夹，而"继续编辑之后
         // Ctrl+S 写回哪种形态"要的正是前者）；没有元数据时才按内容判。
@@ -532,7 +524,7 @@ impl EditCore {
             .and_then(|s| s.source.clone())
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from)
-            .or_else(|| (!ours).then(|| dir.join(if is_package { codec::package::CHART_NAME } else { codec::container::CHART_NAME })));
+            .or_else(|| (!ours).then(|| dir.join(kind.chart_name())));
         let unsaved = session.as_ref().is_some_and(codec::container::Session::has_unsaved);
         fid.note(format!(
             "无压缩形态：{} 个文件（资源 {} 个）",
@@ -920,15 +912,8 @@ impl EditCore {
                     "opm",
                     if shape.is_folder() { "无压缩文件夹".to_owned() } else { "容器（zip）".to_owned() },
                 );
-                // 资源**先按当前字段**收集（字段里可能还是 `/tmp/x/song.ogg` 这样的外部路径，
-                // 那时才读得到盘）；随后才把字段规范成包内相对名。
-                let assets = codec::container::collect_assets(
-                    &self.doc,
-                    &self.assets,
-                    base_dir.as_deref(),
-                    &mut fid,
-                );
-                let (doc_for_write, renames) = self.normalized_for_write(&assets, &mut fid);
+                let (assets, doc_for_write, renames) =
+                    self.package_assets_and_doc(base_dir.as_deref(), &mut fid);
                 if shape.is_folder() {
                     let dir = dir_target.as_deref().unwrap_or(path);
                     let entries = codec::container::entries_for_dir(&doc_for_write, &assets);
@@ -941,10 +926,7 @@ impl EditCore {
                         backend.name()
                     ));
                 }
-                fid.finalize();
-                self.assets = assets; // 存完把资源留在内存里，下次保存不必再读盘
-                self.land_renames(renames);
-                (file_target.clone(), fid)
+                self.finish_package(fid, assets, renames, &file_target)
             }
             SaveShape::RpeSingle => {
                 let fid = codec::rpe::save_file(&self.doc, &file_target, self.rpe_target)?;
@@ -957,13 +939,8 @@ impl EditCore {
                     "rpe",
                     if shape.is_folder() { "谱面包（无压缩文件夹）".to_owned() } else { "谱面包（zip）".to_owned() },
                 );
-                let assets = codec::container::collect_assets(
-                    &self.doc,
-                    &self.assets,
-                    base_dir.as_deref(),
-                    &mut fid,
-                );
-                let (doc_for_write, renames) = self.normalized_for_write(&assets, &mut fid);
+                let (assets, doc_for_write, renames) =
+                    self.package_assets_and_doc(base_dir.as_deref(), &mut fid);
                 let entries = codec::package::build_entries(
                     &doc_for_write,
                     self.rpe_target,
@@ -979,10 +956,7 @@ impl EditCore {
                     std::fs::write(path, bytes).map_err(|e| format!("写入失败: {e}"))?;
                     fid.note(format!("谱面包已打包（打包后端：{}）", backend.name()));
                 }
-                fid.finalize();
-                self.assets = assets;
-                self.land_renames(renames);
-                (file_target.clone(), fid)
+                self.finish_package(fid, assets, renames, &file_target)
             }
         };
         self.path = Some(target.clone());
@@ -996,6 +970,39 @@ impl EditCore {
         // 当成最新（用户刚存过盘，缓存却说他还有未保存改动 —— 那就成了骗人）。
         let _ = self.snapshot_session();
         Ok((target, fid))
+    }
+
+    /// **打包保存的第一段**（两种打包格式共用）：收集资源 + 规范化资源名。
+    ///
+    /// 顺序不能换：资源要**按当前字段**收集（字段里可能还是 `/tmp/x/song.ogg` 这样的外部路径，
+    /// 那时才读得到盘），收完才把字段改成包内相对名 —— 反过来就找不到文件了。
+    /// 抽出来的理由：opm 与 RPE 两条路曾各写一遍，而"改名清单"这种东西一旦漏了一条，
+    /// 表现是"包里有两个名字一样的资源"（不是报错）。
+    fn package_assets_and_doc(
+        &self,
+        base_dir: Option<&Path>,
+        fid: &mut codec::Fidelity,
+    ) -> (Vec<crate::zip::Entry>, Document, Vec<AssetRename>) {
+        let assets = codec::container::collect_assets(&self.doc, &self.assets, base_dir, fid);
+        let (doc_for_write, renames) = self.normalized_for_write(&assets, fid);
+        (assets, doc_for_write, renames)
+    }
+
+    /// **打包保存的最后一段**（两种打包格式共用）：文件真的写出去了，才做这些。
+    ///
+    /// 收尾顺序也是规矩：资源留在内存（下次保存不必再读盘）、改名**走命令路径**落到文档
+    /// （见 [`EditCore::land_renames`]）、最后交付保真度报告。
+    fn finish_package(
+        &mut self,
+        mut fid: codec::Fidelity,
+        assets: Vec<crate::zip::Entry>,
+        renames: Vec<AssetRename>,
+        file_target: &Path,
+    ) -> (PathBuf, codec::Fidelity) {
+        fid.finalize();
+        self.assets = assets;
+        self.land_renames(renames);
+        (file_target.to_path_buf(), fid)
     }
 
     /// 资源名规范化：把 `meta.audio`/`meta.background` 里的外部路径改成**包内文件名**，
@@ -1241,28 +1248,36 @@ impl EditCore {
     }
 
     pub fn undo(&mut self) -> Result<Option<String>, String> {
-        let topics = self.journal.undo_top().map(topics_of);
+        self.time_travel(false)
+    }
+
+    pub fn redo(&mut self) -> Result<Option<String>, String> {
+        self.time_travel(true)
+    }
+
+    /// 撤销 / 重做：**同一段收尾**，只有"往哪边走"不同。
+    ///
+    /// 为什么合成一个：撤销与重做的后处理必须对称 —— 少一次 `refresh_overlaps_all` 或
+    /// 漏 `revision += 1`，表现是"撤销之后状态栏不脏了/重叠数还是旧的"，而这类不一致
+    /// 只在撤销与重做各写一遍时才会出现（而人只会去测他刚才改的那一边）。
+    fn time_travel(&mut self, forward: bool) -> Result<Option<String>, String> {
+        let (topics, verb) = if forward {
+            (self.journal.redo_top().map(topics_of), "redo")
+        } else {
+            (self.journal.undo_top().map(topics_of), "undo")
+        };
         let origin = self.origin;
-        let r = self.journal.undo(&mut self.doc)?;
+        let r = if forward {
+            self.journal.redo(&mut self.doc)?
+        } else {
+            self.journal.undo(&mut self.doc)?
+        };
         if let Some(ref label) = r {
             self.revision += 1;
             // 一次撤销可能跨多条线（事务）⇒ 全量重算，别猜
             self.refresh_overlaps_all();
             let changes = self.journal.recent(8);
-            self.emit(origin, format!("undo: {label}"), topics.unwrap_or_else(Self::all_topics), changes);
-        }
-        Ok(r)
-    }
-
-    pub fn redo(&mut self) -> Result<Option<String>, String> {
-        let topics = self.journal.redo_top().map(topics_of);
-        let origin = self.origin;
-        let r = self.journal.redo(&mut self.doc)?;
-        if let Some(ref label) = r {
-            self.revision += 1;
-            self.refresh_overlaps_all();
-            let changes = self.journal.recent(8);
-            self.emit(origin, format!("redo: {label}"), topics.unwrap_or_else(Self::all_topics), changes);
+            self.emit(origin, format!("{verb}: {label}"), topics.unwrap_or_else(Self::all_topics), changes);
         }
         Ok(r)
     }
@@ -1395,7 +1410,9 @@ impl EditCore {
                 }));
             }
             "dump" => return Ok(self.doc.to_json()),
-            "validate" => return Ok(validate_json(&self.doc)),
+            // 校验结果 JSON **只有一份实现**（`cmd::validate_json`）：`opm-ctl --file x validate`
+            // 与 GUI 的这条命令出去的是同一份文本，不给"命令行说有错、界面说没有"留缝
+            "validate" => return Ok(crate::cmd::validate_json(&self.doc)),
             "ping" => return Ok(json!({"pong": true, "revision": self.revision})),
             "save" => {
                 let path = c.get("path").and_then(|v| v.as_str()).map(PathBuf::from);
@@ -1761,7 +1778,7 @@ impl EditCore {
                     .and_then(|v| v.as_str())
                     .unwrap_or("linear")
                     .to_owned();
-                if !EASINGS.contains(&easing.as_str()) {
+                if !is_easing(&easing) {
                     return Err(format!("未知缓动 {easing:?}"));
                 }
                 let ev = Event::new(
@@ -1804,7 +1821,7 @@ impl EditCore {
                             "endValue" => after.end_value = v.clone(),
                             "easing" => {
                                 let s = v.as_str().unwrap_or("linear");
-                                if !EASINGS.contains(&s) {
+                                if !is_easing(&s) {
                                     return Err(format!("未知缓动 {s:?}"));
                                 }
                                 after.easing = s.to_owned();
@@ -1918,15 +1935,21 @@ impl EditCore {
                         ev.end.to_f64()
                     ));
                 }
-                let mid = match (&ev.start_value, &ev.end_value) {
-                    (Value::Number(a), Value::Number(b)) => {
-                        let a = a.as_f64().unwrap_or(0.0);
-                        let b = b.as_f64().unwrap_or(0.0);
-                        let span = (ev.end.to_f64() - ev.start.to_f64()).max(1e-9);
-                        let t = (at.to_f64() - ev.start.to_f64()) / span;
-                        json!(a + (b - a) * t)
-                    }
-                    _ => ev.start_value.clone(),
+                // 切点上的值**问求值器**（`perf::track_value`）：它带缓动，且按轨道选求值方式
+                // （流速只按线性 —— 见 `perf::speed_value`）。
+                //
+                // 这里曾写死"线性插值 + `Value::Number` 守卫"：于是一条非线性缓动的事件被切一刀，
+                // 切点上的数与**预览显示的**不是同一个数 —— 切完当场多出一个跳变，
+                // 而"切一刀不改变表演"正是这个操作的全部意义。
+                let mid = if matches!(
+                    (&ev.start_value, &ev.end_value),
+                    (Value::Number(_), Value::Number(_))
+                ) {
+                    json!(crate::perf::track_value(&track, std::slice::from_ref(&ev), at.to_f64())
+                        .unwrap_or_default())
+                } else {
+                    // 非数值端点：原样搬运（求值器把它们算成 0，那是预览的口径，不是这里的口径）
+                    ev.start_value.clone()
                 };
                 let mut after = before.clone();
                 let mut a = ev.clone();
@@ -2241,23 +2264,6 @@ fn apply_note_set(n: &mut Note, set: Option<&Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_json(doc: &Document) -> Value {
-    let issues = validate(doc);
-    let errors = issues
-        .iter()
-        .filter(|i| i.severity == crate::cmd::Severity::Error)
-        .count();
-    json!({
-        "errors": errors,
-        "warnings": issues.len() - errors,
-        "issues": issues.iter().map(|i| json!({
-            "severity": match i.severity { crate::cmd::Severity::Error => "ERROR", crate::cmd::Severity::Warn => "WARN" },
-            "pointer": i.pointer,
-            "message": i.message,
-        })).collect::<Vec<_>>(),
-    })
-}
-
 /// 共享句柄：GUI 线程与控制通道线程各自持一份 Arc
 pub type SharedCore = Arc<Mutex<EditCore>>;
 
@@ -2280,6 +2286,61 @@ mod tests {
         let r = c.exec(&cmd);
         assert_eq!(r["ok"], serde_json::json!(true), "命令失败：{cmd} → {r}");
         r
+    }
+
+    /// `split_event` 在切点上取的值 = **预览在那一刻显示的值**（带缓动、且流速按线性）。
+    ///
+    /// 这条钉住的是一个"两份实现分家"的坑：切割点上的值曾经由这里**另写一遍线性插值**算出来，
+    /// 与 `perf::event_value` 无关 —— 于是给一条 `inOutCubic` 的移动事件切一刀，
+    /// 切点上的数与预览不是同一个数，切完当场多出一个跳变。
+    #[test]
+    fn splitting_an_event_uses_the_evaluator_not_a_second_interpolation() {
+        let mut c = EditCore::new();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                               "startBeat": [0, 1], "endBeat": [4, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "inOutCubic"}),
+        );
+        let ev = c.doc().judge_lines[0].layers[0].move_x[0].clone();
+        let at = crate::doc::Beat::new(1, 1); // 1/4 处：缓动在这里明显不等于线性
+        // 预览在 1 拍处的值（**唯一的求值口径**）
+        let want = crate::perf::event_value(&ev, at.to_f64());
+        let linear = 25.0; // 线性插值会给的数（= 100 × 1/4）
+        assert!((want - linear).abs() > 1.0, "样例本身的缓动要看得出来：{want} vs {linear}");
+
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "split_event", "line": 0, "layer": 0, "track": "moveX",
+                               "index": 0, "atBeat": [1, 1]}),
+        );
+        let list = &c.doc().judge_lines[0].layers[0].move_x;
+        assert_eq!(list.len(), 2, "切一刀要变成两条");
+        let cut = list[0].end_value.as_f64().unwrap();
+        assert!((cut - want).abs() < 1e-9, "切点上的值应当是 {want}，实际 {cut}");
+        assert!(
+            (list[1].start_value.as_f64().unwrap() - want).abs() < 1e-9,
+            "后半段的起点要接着它（否则表演在切点跳变）"
+        );
+    }
+
+    /// 流速事件被切开时按**线性**取值（`easing` 字段不参与 —— 见 `perf::speed_value`）
+    #[test]
+    fn splitting_a_speed_event_uses_the_linear_value() {
+        let mut c = EditCore::new();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "speed",
+                               "startBeat": [0, 1], "endBeat": [4, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "inOutCubic"}),
+        );
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "split_event", "line": 0, "layer": 0, "track": "speed",
+                               "index": 0, "atBeat": [1, 1]}),
+        );
+        let cut = c.doc().judge_lines[0].layers[0].speed[0].end_value.as_f64().unwrap();
+        assert!((cut - 25.0).abs() < 1e-9, "流速只看线性：0→100 在 1/4 处是 25，实际 {cut}");
     }
 
     /// `normalize` 命令与**导入侧同一条规则**：重叠时**后一条的起点不动**，裁的是前一条；

@@ -36,8 +36,11 @@ impl LineProps {
     }
 }
 
-/// 轨道标识（日志里必须可读，故用字符串而不是下标）
-pub const TRACKS: [&str; 5] = ["moveX", "moveY", "rotate", "alpha", "speed"];
+/// 轨道标识（日志里必须可读，故用字符串而不是下标）。
+///
+/// **不另立一份表**：与 `doc::TRACKS` 是同一件事 —— 两份手抄的轨道名会在加轨道那天分家，
+/// 而那时报错里列的"可选 track"还是旧的那几条。
+pub use crate::doc::TRACKS;
 
 fn track_of<'a>(layer: &'a Layer, track: &str) -> Option<&'a Vec<Event>> {
     layer.track(track)

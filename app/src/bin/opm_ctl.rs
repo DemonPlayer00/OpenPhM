@@ -307,33 +307,36 @@ fn run() -> i32 {
         // 事件重叠：与 GUI 状态栏那个"⚠ N 处事件重叠"**同一份实现**（`EditCore::overlaps`）。
         // 退出码：0 = 没有重叠，4 = 有（便于脚本 `opm-ctl --file x overlaps && …` 判断）
         Some("overlaps") => {
-            let list = core.overlaps();
+            // JSON 那一支**直接问核心要**（`{"op":"overlaps"}`）：字段映射在 `core` 里已经有一份，
+            // 这里再抄一遍就会出现"命令通道多一个字段、CLI 少一个"（而且没人会发现）。
             if cli.json {
-                let items: Vec<serde_json::Value> = list
-                    .iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "line": o.line, "layer": o.layer, "track": o.track,
-                            "prev": o.prev, "next": o.next,
-                            "startBeat": [o.start.n, o.start.d], "endBeat": [o.end.n, o.end.d],
-                            "pointer": o.pointer(), "label": o.label(),
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({"count": list.len(), "items": items})
-                );
-            } else if list.is_empty() {
-                println!("  没有事件重叠");
-            } else {
-                for o in list {
-                    println!("  {}  {}", o.pointer(), o.label());
+                let v = {
+                    let mut c = core;
+                    c.exec(&serde_json::json!({"op": "overlaps"}))
+                };
+                // 打**结果体**，不打 `exec` 的外壳（`{"ok":…,"revision":…}` 是 `--cmd` 那条路的形状）：
+                // `--json overlaps` 的输出是脚本在用的契约，`{"count":…,"items":[…]}` 不能改层级
+                let body = v.get("result").cloned().unwrap_or(v);
+                println!("{body}");
+                let n = body.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+                if n > 0 {
+                    return 4;
                 }
-                println!("[{}] {} 处事件重叠", if list.is_empty() { "PASS" } else { "WARN" }, list.len());
-            }
-            if !list.is_empty() {
-                return 4;
+            } else {
+                let list = core.overlaps();
+                if list.is_empty() {
+                    println!("  没有事件重叠");
+                } else {
+                    for o in list {
+                        println!("  {}  {}", o.pointer(), o.label());
+                    }
+                    println!(
+                        "[{}] {} 处事件重叠",
+                        if list.is_empty() { "PASS" } else { "WARN" },
+                        list.len()
+                    );
+                    return 4;
+                }
             }
         }
         Some("summary") => {

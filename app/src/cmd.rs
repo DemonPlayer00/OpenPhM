@@ -21,12 +21,18 @@ pub struct Issue {
     pub message: String,
 }
 
-pub const EASINGS: [&str; 29] = [
-    "linear", "outSine", "inSine", "outQuad", "inQuad", "inOutSine", "inOutQuad", "outCubic",
-    "inCubic", "outQuart", "inQuart", "inOutCubic", "inOutQuart", "outQuint", "inQuint", "outExpo",
-    "inExpo", "outCirc", "inCirc", "outBack", "inBack", "inOutCirc", "inOutBack", "outElastic",
-    "inElastic", "outBounce", "inBounce", "inOutBounce", "inOutElastic",
-];
+/// 全部合法缓动名 —— **数据源是 `spec/easing.json`**，这里不再手抄一份。
+///
+/// 以前这里是一个 29 个字符串的常量表。两份表在"加第 30 个缓动"那天必然分家，
+/// 症状是"RPE 导入认它、`set_event` 不认它"（或反过来），而那只在真有人用那个缓动时才显形。
+pub fn easings() -> Vec<&'static str> {
+    crate::codec::easing_names()
+}
+
+/// 这个名字是不是已知缓动（**校验的唯一判据**）
+pub fn is_easing(name: &str) -> bool {
+    crate::codec::rpe_id_of_easing(name).is_some()
+}
 
 // ---------------------------------------------------------------- 缓动的两段选择
 
@@ -182,8 +188,8 @@ pub fn easing_name(curve: EaseCurve, variant: EaseVariant) -> &'static str {
         return "linear";
     }
     let want = curve.clamp_variant(variant);
-    // 拼出来的一定在 `EASINGS` 里（往返测试逐个钉住），所以能返回 'static
-    for name in EASINGS {
+    // 拼出来的一定在 spec 的表里（往返测试逐个钉住），所以能返回 'static
+    for name in easings() {
         if split_easing(name) == Some((curve, Some(want))) {
             return name;
         }
@@ -308,7 +314,7 @@ pub fn validate(doc: &Document) -> Vec<Issue> {
                             );
                         }
                     }
-                    if !EASINGS.contains(&e.easing.as_str()) {
+                    if !is_easing(&e.easing) {
                         err!(&format!("{ep}.easing"), format!("未知缓动 {:?}", e.easing));
                     }
                     prev_end = Some(e.end);
@@ -548,7 +554,7 @@ mod easing_split_tests {
     /// 就会把用户的缓动换成另一个名字）。
     #[test]
     fn every_easing_name_round_trips_through_the_two_part_selection() {
-        for name in EASINGS {
+        for name in easings() {
             let (curve, variant) = split_easing(name).unwrap_or_else(|| panic!("拆不开 {name}"));
             match variant {
                 Some(v) => assert_eq!(easing_name(curve, v), name, "{name} 往返不一致"),
@@ -566,7 +572,7 @@ mod easing_split_tests {
         for curve in EaseCurve::ALL {
             for v in EaseVariant::ALL {
                 let name = easing_name(curve, v);
-                assert!(EASINGS.contains(&name), "{curve:?}+{v:?} 拼出了非法名字 {name}");
+                assert!(is_easing(name), "{curve:?}+{v:?} 拼出了非法名字 {name}");
             }
         }
         // 线性的变体是空的；quint/expo 只有 in/out（RPE 里没有 inOutQuint / inOutExpo）
@@ -580,7 +586,7 @@ mod easing_split_tests {
         for c in EaseCurve::ALL {
             for v in c.variants() {
                 assert!(
-                    EASINGS.contains(&easing_name(c, *v)),
+                    is_easing(easing_name(c, *v)),
                     "{c:?}+{v:?} 是下拉里会出现的一格，名字必须合法"
                 );
             }
@@ -603,9 +609,9 @@ mod easing_split_tests {
             }
         }
         seen.sort_unstable();
-        let mut want: Vec<&str> = EASINGS.to_vec();
+        let mut want: Vec<&str> = easings();
         want.sort_unstable();
-        assert_eq!(seen, want, "下拉能选出的名字应正好等于 EASINGS");
+        assert_eq!(seen, want, "下拉能选出的名字应正好等于 spec 里的那 29 个");
     }
 
     /// 认不出的名字：返回 `None`，不去猜一个（界面按"未知"显示原文，不动它）
@@ -636,7 +642,7 @@ mod easing_split_tests {
         for c in EaseCurve::ALL {
             for v in EaseVariant::ALL {
                 let got = easing_name(c, c.clamp_variant(v));
-                assert!(EASINGS.contains(&got), "{c:?}+{v:?} → {got}");
+                assert!(is_easing(got), "{c:?}+{v:?} → {got}");
             }
         }
     }

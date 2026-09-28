@@ -842,6 +842,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("opm-7z-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // 只在下面 unix 那一支里用得到（Windows 上那段整块不编译）—— 显式带上 cfg，
+        // 免得 Windows 那份构建多一条 "unused variable" 警告
+        #[cfg(unix)]
         let fake = dir.join("my7z");
         #[cfg(unix)]
         {

@@ -210,24 +210,6 @@ impl NoteKind {
             _ => None,
         }
     }
-    /// 映射到 `spec/note-types.json` 的官方格式整数（codec 边界才用）
-    pub fn to_official(self) -> u8 {
-        match self {
-            NoteKind::Tap => 1,
-            NoteKind::Drag => 2,
-            NoteKind::Hold => 3,
-            NoteKind::Flick => 4,
-        }
-    }
-    /// 映射到 RPE 整数 —— **与官方不同**，这正是最容易踩的坑
-    pub fn to_rpe(self) -> u8 {
-        match self {
-            NoteKind::Tap => 1,
-            NoteKind::Hold => 2,
-            NoteKind::Flick => 3,
-            NoteKind::Drag => 4,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

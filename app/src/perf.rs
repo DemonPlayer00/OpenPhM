@@ -286,21 +286,34 @@ pub fn eval_events(events: &[Event], beat: f64) -> Option<f64> {
     }
 }
 
+/// 事件在拍 `beat` 处的**归一化进度** `t`（夹在 `[0,1]`；零长事件按 `1e-9` 兜底）。
+///
+/// 夹取就是"空隙里保持前值、末尾之后保持终值"的来源（见 [`eval_events`]）。
+fn event_t(e: &Event, beat: f64) -> f64 {
+    let (a, b) = (e.start.to_f64(), e.end.to_f64());
+    let span = (b - a).max(1e-9);
+    ((beat - a) / span).clamp(0.0, 1.0)
+}
+
+/// 按进度 `t` 在两个端点之间取值（缺哪一端就退化成另一端；两端都缺 ⇒ 0）。
+///
+/// 与 [`event_t`] 一起构成"取值"的**唯一一份**实现：[`event_value`] 与 [`speed_value`]
+/// 的区别只有 `t` 要不要过缓动，这一层的端点/缺值规则没有第二条路。
+fn interp(e: &Event, t: f64) -> f64 {
+    match (as_f64(&e.start_value), as_f64(&e.end_value)) {
+        (Some(v0), Some(v1)) => v0 + (v1 - v0) * t,
+        (Some(v0), None) => v0,
+        (None, Some(v1)) => v1,
+        (None, None) => 0.0,
+    }
+}
+
 /// 单条事件在拍 `beat` 处的值（按它自己的缓动）。
 ///
 /// 从 [`eval_events`] 里抽出来的：流速积分要在**段内**反复求值，
 /// 值怎么算只该有一份实现 —— 两份实现迟早会在某个缓动上分家。
 pub fn event_value(e: &Event, beat: f64) -> f64 {
-    let (a, b) = (e.start.to_f64(), e.end.to_f64());
-    let span = (b - a).max(1e-9);
-    let t = ((beat - a) / span).clamp(0.0, 1.0);
-    let (v0, v1) = (as_f64(&e.start_value), as_f64(&e.end_value));
-    match (v0, v1) {
-        (Some(v0), Some(v1)) => v0 + (v1 - v0) * ease(&e.easing, t),
-        (Some(v0), None) => v0,
-        (None, Some(v1)) => v1,
-        (None, None) => 0.0,
-    }
+    interp(e, ease(&e.easing, event_t(e, beat)))
 }
 
 /// **流速事件的值：只按线性取**（`easing` 字段被忽略 —— 见模块头"只实现 linear"）。
@@ -313,16 +326,8 @@ pub fn event_value(e: &Event, beat: f64) -> f64 {
 /// 导入的谱面里若真有非线性缓动的流速事件，**文档原样保留**（`easing` 不改写），
 /// 只是预览/求值按线性算 —— 导入报告里会写明，检查器里也标出来。
 pub fn speed_value(e: &Event, beat: f64) -> f64 {
-    let (a, b) = (e.start.to_f64(), e.end.to_f64());
-    let span = (b - a).max(1e-9);
-    let t = ((beat - a) / span).clamp(0.0, 1.0);
-    let (v0, v1) = (as_f64(&e.start_value), as_f64(&e.end_value));
-    match (v0, v1) {
-        (Some(v0), Some(v1)) => v0 + (v1 - v0) * t,
-        (Some(v0), None) => v0,
-        (None, Some(v1)) => v1,
-        (None, None) => 0.0,
-    }
+    // 线性 = 不过缓动：`t` 本身就是缓动后的 `t`
+    interp(e, event_t(e, beat))
 }
 
 /// 一条轨道在拍 `beat` 处的值 —— **"哪条轨道用哪种求值"的唯一判断处**。
@@ -668,29 +673,50 @@ pub fn first_layer<'a>(line: &'a JudgeLine) -> Option<&'a Layer> {
     line.layers.first()
 }
 
+/// **五条轨道的求值：只有这一份实现**（顺序与 `TrackId` / `doc::TRACKS` 一致：
+/// `moveX, moveY, rotate, alpha, speed`）。
+///
+/// 为什么必须只有一份：这里曾经有两份手抄的循环 —— 一份借用 `&[Vec<Event>;5]`（`perf_at`）、
+/// 一份借用视图（`state::Line::perf`），结果在**流速那条轨道上分家了**（一边按缓动、一边按线性
+/// ——而"流速只按 linear 求值"才是定的规矩）。两份实现里"看起来一样"的那四条轨道，
+/// 只是还没轮到它们分家而已。每一条都经 [`track_value`]（"哪条轨道用哪种求值"的唯一判断处）。
+pub fn perf_of(tracks: &[&[Event]; 5], beat: f64) -> LinePerf {
+    let mut p = LinePerf::default();
+    let mut v = [0.0f64; 5];
+    let mut has = [false; 5];
+    for (i, ev) in tracks.iter().enumerate() {
+        if let Some(x) = track_value(crate::doc::TRACKS[i], ev, beat) {
+            v[i] = x;
+            has[i] = true;
+        }
+    }
+    if has[0] {
+        p.x = v[0] as f32;
+    }
+    if has[1] {
+        p.y = v[1] as f32;
+    }
+    if has[2] {
+        p.rotate_deg = v[2] as f32;
+    }
+    if has[3] {
+        p.alpha = (v[3] as f32).clamp(0.0, 1.0);
+    }
+    if has[4] {
+        p.speed = v[4] as f32;
+    }
+    p
+}
+
 /// 求某条判定线在**秒** t 处的表演状态。
 ///
 /// `tracks` 是预先按 `[moveX, moveY, rotate, alpha, speed]` 取好的事件表 ——
 /// 让调用方可以缓存（每帧对每条线求值 5 次二分，代价可忽略）。
 pub fn perf_at(tracks: &[Vec<Event>; 5], tmap: &TimeMap, sec: f64) -> LinePerf {
-    let beat = tmap.beat(sec);
-    let mut p = LinePerf::default();
-    if let Some(v) = eval_events(&tracks[0], beat) {
-        p.x = v as f32;
-    }
-    if let Some(v) = eval_events(&tracks[1], beat) {
-        p.y = v as f32;
-    }
-    if let Some(v) = eval_events(&tracks[2], beat) {
-        p.rotate_deg = v as f32;
-    }
-    if let Some(v) = eval_events(&tracks[3], beat) {
-        p.alpha = (v as f32).clamp(0.0, 1.0);
-    }
-    if let Some(v) = eval_events(&tracks[4], beat) {
-        p.speed = v as f32;
-    }
-    p
+    let ev: [&[Event]; 5] = [
+        &tracks[0], &tracks[1], &tracks[2], &tracks[3], &tracks[4],
+    ];
+    perf_of(&ev, tmap.beat(sec))
 }
 
 /// 把一条轨道采样成折线（供时间轴画曲线）：每个事件取 `per_event+1` 个点。

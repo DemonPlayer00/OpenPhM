@@ -13,7 +13,6 @@
 //! 3. **坏了就当空的**：配置读不动/解析失败不报错阻塞启动 —— 这是便利功能，不是数据。
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,13 +81,11 @@ fn version_1() -> u32 {
     1
 }
 
-/// 现在（Unix 秒）
-pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// 现在（Unix 秒）。
+///
+/// **转发到 `codec::container::now_secs`**：那一个已经存在，而本文件里也有地方直接用它
+/// （崩溃恢复那一段）—— 两份"现在"不会算出两个时间，但会让"谁的时钟"这个问题有两个答案。
+pub use crate::codec::container::now_secs;
 
 /// 配置文件路径：`$XDG_CONFIG_HOME/OpenPhM/recents.json` →
 /// `~/.config/OpenPhM/recents.json` → `./.opm-recents.json`

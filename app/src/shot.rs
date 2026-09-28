@@ -4,6 +4,12 @@
 //! 我把它抽成方法时**把守卫漏掉了**，于是没给 `--shot` 时也会在 `frames == shot_frame`（默认 30）发一次
 //! 截图请求，下一帧拿到图就对 `None` 做 `unwrap()` —— **鼠标一动就疯狂重绘、30 帧几秒就到，于是"一移动就崩"**。
 //! 用户报的 panic 就是这个。抽成纯函数 + 单测之后，"没给 --shot 时必须什么都不做"这条再也丢不了。
+//!
+//! 除此之外这里也放**写 PNG 的那一份实现**：出图有两个入口（GUI 的 `--shot` 与无头的
+//! `headless::render_to_file`），编码参数（RGBA8、`png` crate）只该有一处 —— 以前两边各写一份，
+//! 连"要不要先建父目录"都不一样。
+
+use std::path::Path;
 
 /// 这一帧该对截图做什么
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +34,34 @@ pub fn shot_step(configured: Option<&str>, frames: u32, shot_frame: u32, got_ima
         (Some(_), false) if frames == shot_frame => ShotStep::Request,
         _ => ShotStep::Idle,
     }
+}
+
+/// 把 RGBA8 像素写成 PNG —— **出图的两个入口共用这一份**（GUI `--shot`、无头 `--render`）。
+///
+/// 父目录不存在就建（`--shot /tmp/x/a.png` 是常见写法）；编码参数固定 RGBA8，
+/// 与 `png` crate 的那套样板只在这里出现一次。
+pub fn write_png_rgba(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败 {}: {e}", dir.display()))?;
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("创建文件失败: {e}"))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| format!("PNG 头写入失败: {e}"))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|e| format!("PNG 数据写入失败: {e}"))?;
+    Ok(())
+}
+
+/// `egui::ColorImage`（**预乘** RGBA）→ 写 PNG。给 GUI 的 `--shot` 用。
+pub fn write_png_image(img: &egui::ColorImage, path: &Path) -> Result<(), String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(img.pixels.len() * 4);
+    for p in &img.pixels {
+        buf.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
+    }
+    write_png_rgba(path, img.width() as u32, img.height() as u32, &buf)
 }
 
 #[cfg(test)]

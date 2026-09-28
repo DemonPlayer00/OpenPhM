@@ -196,12 +196,19 @@ pub fn write_entries_to_dir(
     Ok(())
 }
 
-/// 旧名（等价于"把资源摊到 `<key>` 目录"）：保留给既有调用点，内部走 [`extract_container_into`]
-/// 的**资源部分**（不写 `opm.json` —— 那个需要文档）。
-pub fn extract_assets(assets: &[zip::Entry], key: &str) -> Result<Vec<(String, PathBuf)>, String> {
-    let dir = extract_dir(key);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建缓存目录失败 {}: {e}", dir.display()))?;
-    let mut out = Vec::with_capacity(assets.len());
+/// 把资源逐个落到 `dir`，并追加进 `out`（"包内名 → 落盘路径"）。
+///
+/// **只取文件名**：容器内可能是 `assets/song.ogg` 这种带目录的名字，而 `../` 之类不许写到
+/// 缓存目录之外（名字只用于定位，不参与"写到哪"）。
+///
+/// 这段规则曾经有两份：`extract_container_into` 与一个叫 `extract_assets` 的旧函数
+/// （后者还声称"内部走前者"，实际是抄了一份，而且**已经没有调用点**）。
+/// "越界写"这种规则漏掉一份的后果不是报错，是文件被写到目录外面 —— 只留一处。
+fn write_assets(
+    dir: &Path,
+    assets: &[zip::Entry],
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
     for a in assets {
         let file = Path::new(&a.name)
             .file_name()
@@ -211,7 +218,7 @@ pub fn extract_assets(assets: &[zip::Entry], key: &str) -> Result<Vec<(String, P
         std::fs::write(&p, &a.data).map_err(|e| format!("写缓存失败 {}: {e}", p.display()))?;
         out.push((a.name.clone(), p));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// 写容器到文件；返回用的后端
@@ -320,17 +327,7 @@ pub fn extract_container_into(
     let chart_path = dir.join(CHART_NAME);
     std::fs::write(&chart_path, chart).map_err(|e| format!("写 {} 失败: {e}", chart_path.display()))?;
     out.push((CHART_NAME.to_owned(), chart_path));
-    for a in assets {
-        // 容器内可能是 `assets/song.ogg` 这种带目录的名字：**只取文件名**落到缓存里，
-        // 避免越界写（`../` 之类）—— 名字只用于定位，不参与"写到哪"
-        let file = Path::new(&a.name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("asset.bin");
-        let p = dir.join(file);
-        std::fs::write(&p, &a.data).map_err(|e| format!("写缓存失败 {}: {e}", p.display()))?;
-        out.push((a.name.clone(), p));
-    }
+    write_assets(dir, assets, &mut out)?;
     Ok(out)
 }
 
@@ -653,14 +650,18 @@ mod tests {
     }
 
     /// 资源摊到缓存：只取文件名（容器内的 `../` 不能写到缓存目录之外）
+    ///
+    /// 走的是真正摊缓存的那个入口（[`extract_container_into`]）—— 以前这里调的是一个
+    /// 只有本测试在用的 `extract_assets`，于是"越界写"这条规则在两条路上各有一份，
+    /// 而测试只盯着没人走的那一份。
     #[test]
     fn extraction_is_sandboxed_to_the_cache_dir() {
         let assets = vec![
             zip::Entry { name: "../../evil.txt".to_owned(), data: b"nope".to_vec() },
             zip::Entry { name: "assets/sub/song.ogg".to_owned(), data: b"ok".to_vec() },
         ];
-        let out = extract_assets(&assets, "test-sandbox").unwrap();
         let dir = extract_dir("test-sandbox");
+        let out = extract_container_into(&dir, &Document::default(), &assets).unwrap();
         for (_, p) in &out {
             assert!(p.starts_with(&dir), "落盘路径越界：{}", p.display());
         }
@@ -674,12 +675,8 @@ mod tests {
 mod cache_tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("opm-cache-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    // 临时目录助手：实现搬到 `testkit`（`session` 那边也有一份一模一样的）
+    use crate::testkit::tmp_dir as tmp;
 
     /// 解压目录 = `<临时目录>/opm/<key>`（用户指定：Linux `/tmp/opm`、Windows `%TEMP%\opm`）
     #[test]

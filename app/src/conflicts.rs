@@ -74,6 +74,9 @@ mod tests {
     use opm_app::core::EditCore;
     use serde_json::json;
 
+    // 一帧里画出来的所有文本：实现搬到 `testkit`（三个面板的测试曾各抄一份）
+    use crate::testkit::drawn_texts as texts;
+
     /// 造两处重叠（同一条线的 alpha 轨道上放三条互相覆盖的事件）
     fn two_overlaps() -> EditCore {
         let mut c = EditCore::new();
@@ -85,25 +88,6 @@ mod tests {
         }
         assert!(!c.overlaps().is_empty(), "样例要有重叠");
         c
-    }
-
-    fn texts(out: &egui::FullOutput) -> Vec<String> {
-        fn walk(shape: &egui::epaint::Shape, acc: &mut Vec<String>) {
-            match shape {
-                egui::epaint::Shape::Text(t) => acc.push(t.galley.text().to_owned()),
-                egui::epaint::Shape::Vec(v) => {
-                    for s in v {
-                        walk(s, acc);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut acc = Vec::new();
-        for cs in &out.shapes {
-            walk(&cs.shape, &mut acc);
-        }
-        acc
     }
 
     /// 面板真的列出了每一条重叠（标题带条数、条目文案来自 `Overlap::label`），

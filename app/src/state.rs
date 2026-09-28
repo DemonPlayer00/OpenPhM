@@ -96,6 +96,14 @@ impl TrackId {
     pub fn key(self) -> &'static str {
         TRACKS[self as usize]
     }
+    /// 字符串键 → 轨道（**"键"与枚举的换算只此一份**）。
+    ///
+    /// 控制通道的 `{"op":"select","track":…}`、`OPM_EDIT_AUTO=event:<track>,…`、
+    /// 冲突浏览器的跳转都要反查；各自手写 `.find(|id| id.key() == s)` 时，
+    /// 少写一处就是"某一条轨道选不上"（而且只在那一条路径上）。
+    pub fn from_key(key: &str) -> Option<TrackId> {
+        TrackId::ALL.iter().copied().find(|t| t.key() == key)
+    }
     pub fn label(self) -> &'static str {
         match self {
             TrackId::MoveX => "移动 X",
@@ -343,6 +351,26 @@ impl FlowCache {
     fn rebuild_table(&mut self, events: &[Event], tmap: &TimeMap) {
         self.table = crate::perf::SpeedTable::build(events, tmap, tmap.end_beat);
     }
+    /// 一颗音符的 **`(头 H, 尾 H, 新的提示下标)`** —— 算这个**只有这一处**。
+    ///
+    /// 头与尾各要一次 `h_at_hinted`（hold 的尾巴是另一个时刻，而且可能落在改动点之后，
+    /// 见 [`FlowCache::mark_from_sec`]）；提示下标一路带下去，于是整条线重建是 O(音符)
+    /// 而不是每颗各做一次二分。整表重建与异步补算必须给出一模一样的数 —— 所以共用它。
+    fn note_floors(
+        table: &crate::perf::SpeedTable,
+        events: &[Event],
+        tmap: &TimeMap,
+        n: &Note,
+        hint: usize,
+    ) -> (f64, f64, usize) {
+        let (h, hi) = table.h_at_hinted(events, tmap, n.time, hint);
+        if n.kind == NoteKind::Hold {
+            let (t, hi) = table.h_at_hinted(events, tmap, n.end, hi);
+            (h, t, hi)
+        } else {
+            (h, h, hi)
+        }
+    }
     /// 整条线一次算好（**加载时**、以及音符表变了之后走这里）
     fn rebuild(&mut self, notes: &[Note], events: &[Event], tmap: &TimeMap) {
         self.head.clear();
@@ -351,13 +379,7 @@ impl FlowCache {
         self.tail.reserve(notes.len());
         let mut hint = 0usize;
         for n in notes {
-            let (h, hi) = self.table.h_at_hinted(events, tmap, n.time, hint);
-            hint = hi;
-            let (t, hi) = if n.kind == NoteKind::Hold {
-                self.table.h_at_hinted(events, tmap, n.end, hint)
-            } else {
-                (h, hint)
-            };
+            let (h, t, hi) = Self::note_floors(&self.table, events, tmap, n, hint);
             hint = hi;
             self.head.push(h);
             self.tail.push(t);
@@ -386,13 +408,7 @@ impl FlowCache {
         }
         let mut hint = 0usize;
         for i in span.clone() {
-            let (h, hi) = self.table.h_at_hinted(events, tmap, notes[i].time, hint);
-            hint = hi;
-            let (t, hi) = if notes[i].kind == NoteKind::Hold {
-                self.table.h_at_hinted(events, tmap, notes[i].end, hint)
-            } else {
-                (h, hint)
-            };
+            let (h, t, hi) = Self::note_floors(&self.table, events, tmap, &notes[i], hint);
             hint = hi;
             self.head[i] = h;
             self.tail[i] = t;
@@ -462,7 +478,7 @@ impl Line {
     }
     /// 在给定**秒**处求这条线的表演状态
     pub fn perf(&self, tmap: &TimeMap, sec: f64) -> LinePerf {
-        let beat = tmap.beat(sec);
+        // 五条轨道的求值在 `perf::perf_of` 一处（那边解释过为什么不能各写一份）
         let ev: [&[Event]; 5] = [
             &self.tracks[0].events,
             &self.tracks[1].events,
@@ -470,25 +486,7 @@ impl Line {
             &self.tracks[3].events,
             &self.tracks[4].events,
         ];
-        // 直接在这里按轨道求值：避免为"借用视图"再抄一份数组
-        let mut p = LinePerf::default();
-        if let Some(v) = crate::perf::eval_events(ev[0], beat) {
-            p.x = v as f32;
-        }
-        if let Some(v) = crate::perf::eval_events(ev[1], beat) {
-            p.y = v as f32;
-        }
-        if let Some(v) = crate::perf::eval_events(ev[2], beat) {
-            p.rotate_deg = v as f32;
-        }
-        if let Some(v) = crate::perf::eval_events(ev[3], beat) {
-            p.alpha = (v as f32).clamp(0.0, 1.0);
-        }
-        // 流速轨只按线性（`track_value` 是"哪条轨道用哪种求值"的唯一判断处）
-        if let Some(v) = crate::perf::track_value("speed", ev[4], beat) {
-            p.speed = v as f32;
-        }
-        p
+        crate::perf::perf_of(&ev, tmap.beat(sec))
     }
     /// 命中判定：屏幕坐标（RPE）是否落在这条线上（用于点选判定线）
     pub fn hit(&self, tmap: &TimeMap, sec: f64, point: [f32; 2], tol: f32, line_half_w: f32) -> bool {
@@ -1380,6 +1378,19 @@ impl EditorState {
     /// 清空选区
     pub fn clear_selection(&mut self) {
         self.sel.clear();
+    }
+    /// **按文档下标**选中判定线；返回是否找到。
+    ///
+    /// 文档下标 ≠ 视图下标（视图里可能有"线壳"，见 `EditorState::line_shell`）——
+    /// 这个换算只该有一处：控制通道选线、冲突浏览器跳转、`OPM_EDIT_AUTO` 走的都是它。
+    pub fn select_line_doc(&mut self, index: usize) -> bool {
+        match self.chart.lines.iter().position(|l| l.index == index) {
+            Some(view) => {
+                self.selected_line = view;
+                true
+            }
+            None => false,
+        }
     }
     /// 换轨道：事件那一半的旧下标就没意义了
     pub fn clear_event_selection(&mut self) {

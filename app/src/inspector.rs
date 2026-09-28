@@ -353,25 +353,8 @@ mod tests {
     use opm_app::view;
     use serde_json::json;
 
-    /// 一帧里画出来的所有文本（用于断言"这一栏真的画了什么"）
-    fn drawn_texts(out: &egui::FullOutput) -> Vec<String> {
-        fn walk(shape: &egui::epaint::Shape, acc: &mut Vec<String>) {
-            match shape {
-                egui::epaint::Shape::Text(t) => acc.push(t.galley.text().to_owned()),
-                egui::epaint::Shape::Vec(v) => {
-                    for s in v {
-                        walk(s, acc);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut acc = Vec::new();
-        for cs in &out.shapes {
-            walk(&cs.shape, &mut acc);
-        }
-        acc
-    }
+    // 一帧里画出来的所有文本（用于断言"这一栏真的画了什么"）：实现搬到 `testkit`
+    use crate::testkit::drawn_texts;
 
     /// 选中一条线 + 一个事件 + 一个音符的检查器快照
     fn sample() -> (EditCore, EditorState, Inspector) {

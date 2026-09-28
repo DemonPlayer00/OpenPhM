@@ -14,8 +14,13 @@ use wgpu::util::DeviceExt;
 use crate::perf;
 use crate::state::{Chart, EditorState, Note, NoteKind, RPE_WINDOW_HALF_H, RPE_WINDOW_HALF_W};
 
-pub const RPE_W: f32 = 1350.0;
-pub const RPE_H: f32 = 900.0;
+/// 演奏区（RPE 官方窗口）的宽高 —— **取自 `state` 的那一份定义**。
+///
+/// 这里曾经各写一遍 `1350.0 / 900.0`：着色器按它算 letterbox，而页面上每一条边界、
+/// 吸附与命中都用 `state::RPE_WINDOW_*`。两个"同一件事"的常量只要有一个被改，
+/// 自研管线与 egui 画笔就会错位 —— 而错位看起来像"渲染有 bug"，不像"常量有第二份"。
+pub const RPE_W: f32 = crate::state::RPE_WINDOW_W;
+pub const RPE_H: f32 = crate::state::RPE_WINDOW_H;
 
 /// 每个 RPE 单位对应多少物理像素（与着色器里的 `scale_px` 必须一致）
 pub fn rpe_scale(viewport_px: [f32; 2]) -> f32 {
@@ -315,14 +320,10 @@ impl egui_wgpu::CallbackTrait for PlayfieldFrame {
             0.0,
             1.0,
         );
-        pass.set_pipeline(&pf.pipeline);
-        pass.set_bind_group(0, &pf.bind_group, &[]);
-        pass.set_vertex_buffer(0, pf.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, pf.instance_buf.slice(..));
+        // 画法与 `Playfield::draw` 是同一段 —— 共用它：两份 set_pipeline/set_bind_group/
+        // set_vertex_buffer 在"加一个顶点缓冲"那天只会被改到一处，另一处照旧画得出图但画错了
         let n = (self.instances.len() as u32).min(pf.capacity);
-        if n > 0 {
-            pass.draw(0..4, 0..n);
-        }
+        pf.draw(pass, n, self.viewport_px);
 
         // 恢复全屏 viewport，避免影响同一个 pass 里后续的 egui 绘制
         pass.set_viewport(0.0, 0.0, pf.screen_px[0], pf.screen_px[1], 0.0, 1.0);

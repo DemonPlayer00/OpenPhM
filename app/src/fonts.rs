@@ -220,13 +220,8 @@ fn face_index(path: &str, want: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
-        let map: Vec<(String, String)> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |k: &str| map.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone())
-    }
+    // "把环境当输入"的闭包：实现搬到 `testkit`（显卡策略那边也用它）
+    use crate::testkit::env_of;
 
     /// 默认 = 内嵌（不读任何系统字体）
     #[test]

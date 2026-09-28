@@ -170,6 +170,15 @@ pub fn easing_count() -> usize {
     easing_table().len()
 }
 
+/// 全部缓动名，按 `spec/easing.json` 里的 `id` 升序。
+///
+/// **命令层的"合法缓动"就该用它**：那边曾经手抄一份 29 个名字的常量表 ——
+/// 两份表在"加第 30 个缓动"那天必然分家，而症状是"RPE 导入认它、`set_event` 不认它"
+/// （或者反过来），并且只在真的有人用那个缓动时才看得出来。
+pub fn easing_names() -> Vec<&'static str> {
+    easing_table().iter().map(|(_, n)| n.as_str()).collect()
+}
+
 /// `spec/note-types.json` 里某个格式的 名字→整数 表
 fn note_type_table(format: &str) -> &'static Vec<(String, i64)> {
     static T: OnceLock<std::collections::HashMap<String, Vec<(String, i64)>>> = OnceLock::new();
@@ -220,6 +229,55 @@ pub fn note_kind_from_official(v: i64) -> Option<NoteKind> {
         .iter()
         .find(|(_, n)| *n == v)
         .and_then(|(k, _)| NoteKind::parse(k))
+}
+
+// ---------------------------------------------------------------- 条目的"哪一种谱面"
+
+/// 一串条目属于**哪种谱面**：opm 容器，还是 RPE 谱面包（Phira 的 `.pez`）。
+///
+/// 判据只有一条：**看有没有 `info.yml`**（RPE 谱面包的清单文件，opm 容器没有）。
+///
+/// 为什么值得单独一个类型：这条判断以前写在两处（从**文件**开、从**目录**开），
+/// 而两处必须永远一致 —— 分错的后果不是"读得差一点"，是**整份文档按错格式解析**；
+/// "谱面本体叫什么名字"（`opm.json` / `chart.json`）也跟着它走，那个三元表达式同样各写了一遍。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// opm 容器 / 无压缩文件夹
+    Opm,
+    /// RPE 谱面包
+    RpePackage,
+}
+
+impl EntryKind {
+    /// 从条目名判断（**唯一判据**）
+    pub fn of(entries: &[crate::zip::Entry]) -> EntryKind {
+        if entries.iter().any(|e| e.name == package::INFO_NAME) {
+            EntryKind::RpePackage
+        } else {
+            EntryKind::Opm
+        }
+    }
+    /// 谱面本体在这类包里的名字（摊成目录、恢复保存目标时要用）
+    pub fn chart_name(self) -> &'static str {
+        match self {
+            EntryKind::Opm => container::CHART_NAME,
+            EntryKind::RpePackage => package::CHART_NAME,
+        }
+    }
+    /// 按这一类读出 `(文档, 资源)`
+    pub fn read(
+        self,
+        entries: Vec<crate::zip::Entry>,
+        fid: &mut Fidelity,
+    ) -> Result<(Document, Vec<crate::zip::Entry>), String> {
+        match self {
+            EntryKind::Opm => {
+                let c = container::read_entries(entries, fid)?;
+                Ok((c.doc, c.assets))
+            }
+            EntryKind::RpePackage => package::read_entries(entries, fid),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 拍 ↔ 数值

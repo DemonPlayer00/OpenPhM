@@ -245,7 +245,7 @@ pub fn render_png(
     drop(data);
     readback.unmap();
 
-    write_png(out, width, height, &pixels)?;
+    crate::shot::write_png_rgba(out, width, height, &pixels)?;
     println!(
         "  渲染完成：{}（{}×{}，实例 {}，播放头 {:.3}s）",
         out.display(),
@@ -254,17 +254,5 @@ pub fn render_png(
         count,
         playhead_sec
     );
-    Ok(())
-}
-
-fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("创建文件失败: {e}"))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().map_err(|e| format!("PNG 头写入失败: {e}"))?;
-    writer
-        .write_image_data(rgba)
-        .map_err(|e| format!("PNG 数据写入失败: {e}"))?;
     Ok(())
 }

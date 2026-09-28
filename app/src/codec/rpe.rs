@@ -688,7 +688,10 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
         .collect();
 
     // ---- 判定线 ----
-    let last_beat = chart_end(doc);
+    // 谱面时长**用文档自己的那一份**（`Document::chart_end` = 全部音符与事件的 max）：
+    // 这里曾另有一份"取每条轨道最后一条事件"的计算，而"最后一条"按**起点**排序 ——
+    // 一旦某条轨道上"起点最晚的那条"不是"结束最晚的那条"，导出的 `chartTime` 就比真实谱面短。
+    let last_beat = doc.chart_end();
     let mut lines: Vec<Value> = Vec::with_capacity(doc.judge_lines.len());
     for (li, line) in doc.judge_lines.iter().enumerate() {
         let mut o = Map::new();
@@ -879,24 +882,4 @@ fn export_note(n: &Note, target: RpeTarget, fid: &mut Fidelity) -> Value {
         ));
     }
     Value::Object(o)
-}
-
-/// 谱面结束拍（导出时给 `chartTime` 用）
-pub fn chart_end(doc: &Document) -> Beat {
-    let mut end = Beat::zero();
-    for line in &doc.judge_lines {
-        for n in &line.notes {
-            end = end.max(n.end_beat());
-        }
-        for layer in &line.layers {
-            for track in crate::doc::TRACKS {
-                if let Some(list) = layer.track(track) {
-                    if let Some(last) = list.last() {
-                        end = end.max(last.end);
-                    }
-                }
-            }
-        }
-    }
-    end
 }

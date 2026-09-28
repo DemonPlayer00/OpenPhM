@@ -216,3 +216,66 @@ fn the_speed_curve_is_sampled_linearly() {
     assert!((mid_linear - 5.0).abs() < 1e-3, "只线性时中点应是 5.0，实际 {mid_linear}");
     assert!(mid_eased < 3.0, "认缓动时中点应明显低于 5.0，实际 {mid_eased}");
 }
+
+/// **两条求值入口必须给出同一个表演状态**：`perf_at`（借用 `[Vec<Event>; 5]` 表）
+/// 与视图侧的 `Line::perf`（借用 `TrackView`）。
+///
+/// 它们曾是两份手抄的五轨道循环，并在**流速**那条轨道上分家了：`perf_at` 走 `eval_events`
+/// （认缓动），视图走 `track_value`（流速只按线性）。于是同一份谱面，`opm-ctl`/无头渲染
+/// 看到的流速与界面/检查器看到的不是一个数 —— 现在两者都经 `perf::perf_of`。
+///
+/// 样例特意用**非线性缓动的流速事件**：线性样例对这份分家是瞎的。
+#[test]
+fn the_two_evaluation_entries_agree_even_with_an_eased_speed_event() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry { start: Beat::zero(), bpm: 180.0, foreign: Default::default() }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    l.layers[0].speed.push(Event::new(
+        Beat::zero(),
+        Beat::new(4, 1),
+        json!(10.0),
+        json!(2.0),
+        "outBounce", // 流速不认它 —— 这正是分家处
+    ));
+    doc.judge_lines.push(l);
+
+    let tm = TimeMap::from_doc(&doc);
+    let st = opm_app::state::EditorState::new(opm_app::state::chart_from_doc(&doc));
+    let tracks = opm_app::state::tracks_of(&doc, 0, &tm);
+    // `perf_at` 要的是 `[Vec<Event>; 5]`（预先取好的事件表）；视图那份由 `tracks_of` 给
+    let flat: [Vec<Event>; 5] = std::array::from_fn(|i| tracks[i].events.clone());
+    for sec in [0.0, 0.15, 0.4, 0.9, 1.3, 5.0] {
+        let a = perf_at(&flat, &tm, sec);
+        let b = st.chart.lines[0].perf(&tm, sec);
+        assert!(
+            (a.speed - b.speed).abs() < 1e-6,
+            "{sec}s：两条入口的流速不一致（{a:?} vs {b:?}）"
+        );
+        assert!((a.x - b.x).abs() < 1e-6 && (a.alpha - b.alpha).abs() < 1e-6);
+    }
+    // 顺带钉住"流速只按线性"：中点应是 6.0（10 与 2 的中值），不是 outBounce 给的数
+    let mid = st.chart.lines[0].perf(&tm, tm.sec(2.0)).speed;
+    assert!((mid - 6.0).abs() < 1e-3, "流速中点应为线性中值 6.0，实际 {mid}");
+}
+
+/// 本文件顶部那份 `NAMES` 与 `spec/easing.json` 必须一致。
+///
+/// 重列一遍是**刻意**的（测试不该依赖被测实现里的表），但"刻意重列"和"悄悄过期"只差一步：
+/// 加第 30 个缓动时这里不会红，直到有人发现"新缓动没被测过"。所以拿 spec 钉住它 ——
+/// 仍然不读实现，读的是数据源。
+#[test]
+fn the_relisted_easing_names_match_the_spec_file() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../../spec/easing.json")).expect("spec JSON");
+    let mut want: Vec<&str> = spec["easings"]
+        .as_array()
+        .expect("spec 里有 easings 数组")
+        .iter()
+        .map(|e| e["name"].as_str().expect("每个缓动都有 name"))
+        .collect();
+    want.sort_unstable();
+    let mut got: Vec<&str> = NAMES.to_vec();
+    got.sort_unstable();
+    assert_eq!(got, want, "重列的 29 个名字要与 spec 一致");
+}

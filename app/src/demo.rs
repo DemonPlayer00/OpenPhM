@@ -185,7 +185,7 @@ mod tests {
             assert_eq!(names, want, "线 {li} 的轨道要覆盖五条");
             for (_t, from, to, easing) in plan {
                 assert!(from.is_finite() && to.is_finite());
-                assert!(crate::cmd::EASINGS.contains(&easing), "未知缓动 {easing}");
+                assert!(crate::cmd::is_easing(&easing), "未知缓动 {easing}");
             }
         }
     }

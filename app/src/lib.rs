@@ -55,3 +55,8 @@ pub mod state;
 pub mod timeline;
 pub mod view;
 pub mod zip;
+
+/// **测试公用件**：只在 `cfg(test)` 下编译（不进产物）。放的是"在多个模块里逐字出现过"的
+/// 测试助手 —— 判据见模块头。
+#[cfg(test)]
+pub mod testkit;

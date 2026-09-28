@@ -4303,3 +4303,86 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
 这套模型里"值"是一个在时间轴上处处有定义的分段函数（前缀积分那一套同理），
 凡是"没覆盖就回落到默认"的写法都是错的。这次两处都是同一个毛病：
 **用"有没有事件覆盖这个时刻"当成了"有没有值"**。
+
+## 7.76 整理：全仓重复实现审计与合并（用户"检查是否有重复实现，有则合并"）（2026-09-28）
+
+一次**以"同一件事被写了两遍"为线索**的整理，不是风格整理。方法（可复现）：
+
+1. **词法级克隆检测**：把 46 个 `.rs` 文件切成 token 流（去注释/字符串、标识符匿名化、数字归一），
+   取 45 token 的滑动窗口做哈希，同一 hash 出现在两处即候选克隆区，再合并相邻窗口成长区间；
+   阈值降到 28 token 复跑一遍（漏报比误报贵）。
+2. **同名单/近签名扫描**：`fn <name>` 跨模块重名、`Env`/`tmp` 之类的助手名。
+3. **三个平行读者**（UI 层 / 数据层 / 渲染交互层）逐文件读，只报"读过行号"的结论，并按
+   (a) 语义相同可直接合、(b) 等价但刻意分开、(c) **已经漂移**三档分类 —— (c) 才是这次的主要收获。
+
+### 合并掉的（生产代码）
+
+| 原来两份 | 现在一处 | 性质 |
+|---|---|---|
+| `cmd::validate_json` ↔ `core::validate_json` | `cmd::validate_json` | 逐字复制 |
+| `headless::write_png` ↔ `main::write_png` | `shot::write_png_rgba` / `write_png_image` | 同一段 png 样板，连"建不建父目录"都不一样 |
+| `perf::event_value` ↔ `perf::speed_value` 的端点/夹取 | `event_t` + `interp` | 我自己上两轮引入的复制 |
+| `perf_at` ↔ `state::Line::perf`（五轨道求值） | `perf::perf_of` | **(c) 漂移**：流速那条一边认缓动、一边按线性 |
+| `FlowCache::rebuild` ↔ `build_span` 的每音符 H | `FlowCache::note_floors` | 同一算式两处 |
+| 缺 7z 门槛模态（启动页 / 编辑页） | `App::missing_7z_gate` | 连文案都是手抄的 |
+| 载入文档后的收尾（打开 / 从缓存继续） | `App::after_document_loaded` | 少一次 `reload_audio` = 新谱面配旧音乐 |
+| 7z 门槛的"按包内名找谱面"三元表达式 | `codec::EntryKind` | **(c)**：`EntryKind` 同时管判据与谱面名 |
+| `container::extract_assets` ↔ `extract_container_into` 的资源循环 | `container::write_assets` | 前者**没有调用点**，注释还谎称"内部走后者" |
+| opm/RPE 两条打包保存的收尾 | `EditCore::package_assets_and_doc` / `finish_package` | 顺序即规矩 |
+| `rpe::chart_end` ↔ `Document::chart_end` | `Document::chart_end` | **(c) 真 bug**：`list.last()` 漏掉"起点更晚但结束更早"的情况 |
+| `TrackId::ALL.iter().find(key)`（4 处） | `TrackId::from_key` | 少写一处 = 某条轨道选不上 |
+| `lines.iter().position(index)`（2 处） | `EditorState::select_line_doc` | 文档下标 ≠ 视图下标 |
+| `split_event` 的线性插值 ↔ 求值器 | `perf::track_value` | **(c) 真 bug**：切点值与预览不一致（见下） |
+| `journal::TRACKS` ↔ `doc::TRACKS` | `pub use doc::TRACKS` | 逐字复制，只有报错文案用它 |
+| `recents::now_secs` ↔ `container::now_secs` | `pub use` 后者 | 逐字复制 |
+| `doc::NoteKind::to_official/to_rpe` | 删（spec 表已是唯一源） | **零调用点**，且违反 `spec/*.json` 注释里的禁令 |
+| `cmd::EASINGS`（手抄 29 个名字） | `codec::easing_names()` / `is_easing()` | 加第 30 个缓动时必然分家 |
+| `audio::probe` 内联时长 ↔ `Decoded::duration_sec` | `Decoded::frames()` + `duration_sec()` | 同一算式两处（兜底除数也要一致） |
+| `tree.rs` 两个虚拟滚动列表 | `row_list(...)` | 复制第二份最容易漏掉 `show_rows` |
+| `render::RPE_W/H` ↔ `state::RPE_WINDOW_W/H` | 常量取后者 | 两个"同一个 1350×900" |
+| `Playfield::draw` ↔ `PaintCallback::paint` 里的 4 行 | `pf.draw(...)` | 加顶点缓冲时会只改一处 |
+| `testkit`：`drawn_texts`（3 份）、`env_of`（2 份）、`tmp_dir`（2 份） | `src/testkit.rs` | 测试助手，判据见模块头 |
+
+### 两处 (c) 类漂移的细节（都补了回归测试）
+
+- **`perf_at` vs 视图求值**：两者都是"5 条轨道 → `LinePerf`"，但流速那条一个走
+  `eval_events`（认缓动）、一个走 `track_value`（流速只按线性）。今天只有 `perf_at` 没有生产调用者
+  才没爆出来（它的测试样例全是 `linear`，把漂移那份钉住了）。现在两者都经 `perf::perf_of`，
+  测试 `the_two_evaluation_entries_agree_even_with_an_eased_speed_event` 用
+  **非线性缓动的流速事件**钉住"两条入口给出同一个数"。
+- **`rpe::chart_end`**：`list.last()` 取的是"起点最晚那条"，不一定是"结束最晚那条"
+  —— 导出的 `chartTime` 因此可能比真实谱面短，播放器按它截断。测试
+  `exported_chart_time_is_the_max_end_not_the_last_by_start` 用"长事件在前、短事件在后"钉住。
+- **`split_event` 的切点值**：原来在命令里**又写了一遍线性插值**，与 `perf::event_value` 无关
+  ⇒ 给一条 `inOutCubic` 的事件切一刀，切点上的值与预览不是同一个数（切完当场一个跳变）。
+  改成问 `perf::track_value`（按轨道选求值：流速线性、其余认缓动），两条测试钉住
+  （`splitting_an_event_uses_the_evaluator_not_a_second_interpolation`、
+  `splitting_a_speed_event_uses_the_linear_value`）。
+
+### 刻意**没有**合、以及为什么（写下来免得下次又当成漏网）
+
+- **`Change::apply` ↔ `revert`**：互为逆操作的 110 行 match。合成"按方向参数"的单个函数
+  会让 `before`/`after` 的分支变成运行期判断，**可读性换不来安全性**；逆向正确性靠往返测试。
+- **`GridCfg::snap_beat/snap_lane` ↔ `EditorState::snap_beat/snap_lane`**：前者按**配置的**
+  `beat_div`、后者按**画得出来的** `effective_beat_div`（缩放抽稀）—— "吸到看得见的格点"是刻意的。
+- **`PendingHold` ↔ `PendingEvent`**：区间规则（`follow_span`/`resize_span`/`span_of`）**已经**共用；
+  剩下的是字段与一行转发，改成内嵌 `SpanDraft` 要动 ~29 处字段访问，不划算。
+- **`recents::age_text` ↔ `session::age_text`**：同一屏幕上两种分档（"刚刚" vs "45 秒前"）。
+  谁对是**文案取舍**，不是合并问题 —— 留待用户定。
+- **`doc::TRACKS` 之外的 `state::TrackId::key()`**：已经是转发，不是第二份表。
+- **`overlay.rs` 测试里 15 份"跑一帧 egui"的泵**：形状相同的 `RawInput` + `run_ui` + 取动作，
+  但每处的状态/事件/`keys_enabled` 都不同，抽成一个参数巨多的 helper 只会把断言推远。
+- **`container` ↔ `package` 的资源收集**（`collect_assets` ↔ `take_asset`）：**还有真漂移**（未合并）。
+  container 用 `Path::file_name()`（只认宿主分隔符），package 用 `codec::asset_base_name`（`/` 与 `\` 都切）
+  ⇒ Windows 作者写的 `music\song.ogg` 在两条路上得到不同的包内名。合并方案是
+  `codec::collect_asset_entry(what, name, have, base_dir, fid) -> Option<Entry>`（以 `asset_base_name` 为准），
+  container 循环调它两次、`take_asset` 退化成单名包装。**这属于改行为**（会改变导出包里的名字），
+  单独一轮做更稳。
+
+### 验收
+
+- 全测试：**321 通过 / 0 失败 / 0 warning**（Linux debug；另加 release 与
+  `x86_64-pc-windows-gnu` debug+release 四份产物重建）；
+- 三个平行审计报告（UI 层 / 数据层 / 渲染交互层）各自给出"读过行号"的清单与 (a)/(b)/(c) 分类，
+  其中"检查过、确认没有重复"的部分同样写在报告里（覆盖率也是结论）；
+- 词法克隆检测脚本与三份报告在会话里可复现（阈值与判据如上）。

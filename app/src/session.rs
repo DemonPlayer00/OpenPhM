@@ -245,12 +245,8 @@ pub fn size_text(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("opm-session-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    // 临时目录助手：实现搬到 `testkit`（`codec::container` 那边也有一份一模一样的）
+    use crate::testkit::tmp_dir as tmp;
 
     /// 缓存目录（带一份会话元数据）；`exe` 决定它算谁的
     fn cache_dir(root: &Path, key: &str, exe: &str, dirty: bool) -> PathBuf {

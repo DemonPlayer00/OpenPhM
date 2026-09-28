@@ -171,7 +171,7 @@ fn rpe_import_maps_fields_correctly() {
 fn tracks_are_normalized_on_import() {
     let (doc, _fid) = import(messy_rpe());
     let line = &doc.judge_lines[0];
-    let chart_end = rpe::chart_end(&doc);
+    let chart_end = doc.chart_end();
 
     // 层 0 的 moveX：原本从拍 2 开始 → 导入后从 0 开始，且最后一条延拓到谱面结束
     let mx = &line.layers[0].move_x;
@@ -233,7 +233,7 @@ fn rpe_roundtrip_preserves_modeled_data() {
         .expect("规范化为给它补了一条常量延拓段");
     assert_eq!(
         tail["endTime"],
-        codec::beat_to_triple(rpe::chart_end(&doc1)),
+        codec::beat_to_triple(doc1.chart_end()),
         "延拓段覆盖到谱面结束"
     );
     assert_eq!(tail["start"].as_f64(), Some(300.0), "延拓段的值 = 原斜坡的终值");
@@ -455,3 +455,39 @@ fn load_into_broadcasts_all_topics() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+
+/// **RPE 导出的 `chartTime` 取"全部事件的最大终点"**，而不是"每条轨道起点最晚那条的终点"。
+///
+/// 后者曾是这个文件里的第二份实现（`rpe::chart_end`，只取 `list.last()`）：一条轨道上
+/// "起点最晚的事件"不一定是"结束最晚的事件"（长事件后面又放了一条短事件就会这样），
+/// 于是导出的 `chartTime` 比真实谱面短 —— 播放器按它截断，末尾的表演就没了。
+#[test]
+fn exported_chart_time_is_the_max_end_not_the_last_by_start() {
+    let mut doc = Document::default();
+    // 一条**长**事件在前，一条**短**的在后（起点更晚、终点更早）
+    let mut l = opm_app::doc::JudgeLine::default();
+    l.layers[0].move_x.push(opm_app::doc::Event::new(
+        opm_app::doc::Beat::zero(),
+        opm_app::doc::Beat::new(16, 1),
+        json!(0.0),
+        json!(100.0),
+        "linear",
+    ));
+    l.layers[0].move_x.push(opm_app::doc::Event::new(
+        opm_app::doc::Beat::new(4, 1),
+        opm_app::doc::Beat::new(6, 1),
+        json!(50.0),
+        json!(50.0),
+        "linear",
+    ));
+    doc.judge_lines.push(l);
+    assert_eq!(doc.chart_end(), opm_app::doc::Beat::new(16, 1), "文档口径就是最大终点");
+
+    let (text, _fid) = rpe::save_str(&doc, rpe::RpeTarget::default());
+    let root: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        root["chartTime"],
+        json!(16.0_f64),
+        "chartTime 要跟 `Document::chart_end` 一致（实际 {text}）"
+    );
+}

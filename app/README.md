@@ -1430,6 +1430,35 @@ GUI 里对应工具栏的 `边界框` 勾选框与 `线半长` 拖动框；无�
 └──────────────────────────────────────────────────────────┘
 ```
 
+## 同一件事只写一遍：重复实现的合并（2026-09-28）
+
+一次全仓审计（词法级克隆检测 + 三个平行读者逐文件读），把"同一件事被写了两遍"的地方合并到一处。
+**判据不是"长得像"，而是"改了其中一份、另一份会不会错"** —— 结论按三档分：
+(a) 语义相同可直接合、(b) 等价但刻意分开、(c) **已经漂移**（这档才是有价值的部分）。
+
+合并掉的（详见 `OpenPhM-框架选型.md` §7.76）：`validate_json`、PNG 写盘、五轨道求值
+（`perf::perf_of`：原来 `perf_at` 认缓动、`Line::perf` 按线性）、`FlowCache` 的每音符 H、
+缺 7z 门槛模态、载入文档后的收尾、`codec::EntryKind`（判"这是哪种包"+ 谱面名）、
+`container::write_assets`（旧的 `extract_assets` 已无调用点）、打包保存的收尾、
+`TrackId::from_key`、`EditorState::select_line_doc`、`journal::TRACKS`、`recents::now_secs`、
+`cmd::EASINGS`（改为从 `spec/easing.json` 派生）、`audio::probe` 的时长、
+`tree.rs` 的两个虚拟滚动列表、`render::RPE_W/H`（取 `state::RPE_WINDOW_*`）、
+以及测试助手（`src/testkit.rs`：`drawn_texts` ×3、`env_of` ×2、`tmp_dir` ×2）。
+
+**顺手抓到的三处漂移**（都有回归测试钉住）：
+
+1. `perf_at` 与视图侧对**流速**轨道一个认缓动、一个按线性 —— 同一份谱面，CLI/无头渲染与界面
+   看到的流速不是一个数；现在两条入口都经 `perf::perf_of`。
+2. RPE 导出的 `chartTime` 用了"起点最晚那条事件的终点"（`list.last()`），
+   而它是"起点最晚"不是"结束最晚" ⇒ 谱面末尾会被播发器截断；现在统一用 `Document::chart_end()`。
+3. `split_event` 的切点值**又写了一遍线性插值**（与求值器无关）⇒ 给一条 `inOutCubic` 的事件切一刀，
+   切点上的值与预览不是同一个数，切完当场一个跳变；现在问 `perf::track_value`
+   （按轨道选求值：流速线性、其余认缓动）。
+
+刻意**没有**合的：`Change::apply`/`revert`（互为逆操作，合成一个反而更易错）、
+`GridCfg` 与 `EditorState` 的吸附（前者按配置细分、后者按**画得出来的**细分，是刻意的）、
+`recents` 与 `session` 的"多久以前"（分档是文案取舍，留给用户定）。
+
 ## 关键设计
 
 - **演奏区用 viewport 映射，不靠裁剪**：`PlayfieldFrame::paint()` 用 `info.viewport_in_pixels()` 把 viewport 设成回调矩形，着色器按

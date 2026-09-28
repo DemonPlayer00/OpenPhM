@@ -34,6 +34,10 @@ mod inspector;
 mod statusbar;
 mod overlay;
 mod tree;
+// 测试公用件：与库里那份是**同一份文件**（这几个面板模块本来就既进库也进本程序，
+// 见 `lib.rs` 的模块表；两边的 `cfg(test)` 各自成立，助手只有一份源码）
+#[cfg(test)]
+mod testkit;
 use overlay::{OverlayAction, OverlayCfg};
 use tree::{line_tree_ui, TreeAction};
 
@@ -435,7 +439,7 @@ fn main() -> eframe::Result<()> {
             let mut it = rest.splitn(2, ',');
             let track = it.next().unwrap_or("").trim().to_owned();
             let n = nums(it.next().unwrap_or(""));
-            let id = state::TrackId::ALL.iter().find(|t| t.key() == track).copied();
+            let id = state::TrackId::from_key(&track);
             match (id, n.len()) {
                 (Some(id), 2) => {
                     state.begin_pending_event(id, n[0]);
@@ -1484,6 +1488,18 @@ impl App {
         self.refresh_file_badge();
     }
 
+    /// **载入一份文档之后的收尾**：文件字段 → 最近打开 → 音乐。
+    ///
+    /// `open_doc` 与 `continue_cached` 共用这一条：两份手抄的收尾迟早分家，
+    /// 而少一次 `reload_audio` 就等于"新谱面配着旧音乐"（听不出来，直到播放对不上）。
+    /// `from` 只用于日志里"音乐是跟着谁换的"。
+    fn after_document_loaded(&mut self, from: &str) {
+        self.sync_file_fields(); // 打开之后：文件夹/名字/格式提示/状态栏标识都跟着新文件走
+        self.remember_recent();
+        // **音乐跟着谱面走**：走与新建/元数据改动同一条入口（内部会同步时间轴总长）
+        self.reload_audio(from);
+    }
+
     /// 重算状态栏那份文档标识（格式 / 文件名 / 保存状态）。**只在事件上调用**：
     /// 换文件、存盘、文档被改动（`apply_dirty`）。
     fn refresh_file_badge(&mut self) {
@@ -1833,6 +1849,26 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    /// 缺 7z 的门槛模态：**启动页与编辑页共用这一份**（文案、下载页 URL、`fetch`/`quit` 的处置）。
+    ///
+    /// 为什么抽出来：同一件事曾在两处各画一遍 —— 连"打开浏览器失败：…"那句都是手抄的，
+    /// 改一处忘一处就会出现"启动页说装好要重启、编辑页没说"这类不一致。
+    /// 返回"用户点了退出"；启动页还要额外看"窗口是否被关"（它有自己的事件循环）。
+    fn missing_7z_gate(&mut self, ctx: &egui::Context) -> bool {
+        let Some(msg) = self.seven_zip_missing.clone() else {
+            return false;
+        };
+        let out = opm_app::recents::missing_7z_modal(ctx, &msg, cfg!(windows));
+        if out.fetch {
+            let next = match filedialog::open_url(zip::SEVEN_ZIP_URL) {
+                Ok(()) => format!("{msg}\n（已用浏览器打开下载页；装好之后重启 OpenPhM）"),
+                Err(e) => format!("{msg}\n（打开浏览器失败：{e}；地址：{}）", zip::SEVEN_ZIP_URL),
+            };
+            self.seven_zip_missing = Some(next);
+        }
+        out.quit
+    }
+
     /// 按启动页表单里的值创建空谱面（曲名/谱面作者/音乐作者/音乐路径/基础 BPM）。
     /// 校验在 `NewChartForm::validate`（曲名必填、BPM 为正）。**返回是否真的建成了** ——
     /// 调用方靠它决定"进编辑页"还是"留在模态里看原因"：失败却把人送进编辑页，
@@ -2031,10 +2067,7 @@ impl App {
                     self.console_log.push((false, format!("共 {n} 项降级（其余字段已按原义转换）")));
                 }
             }
-            self.sync_file_fields(); // 打开之后：文件夹/名字/格式提示都跟着新文件走
-            self.remember_recent();
-            // **音乐跟着谱面走**：走与新建/元数据改动同一条入口（内部会同步时间轴总长）
-            self.reload_audio("打开谱面");
+            self.after_document_loaded("打开谱面");
         } else {
             self.console_log.push((
                 false,
@@ -2248,13 +2281,11 @@ impl App {
                 control::ViewCmd::Select { line, track, note, event, notes, events } => {
                     // 选中是视图状态：直接改 EditorState，不碰文档
                     if let Some(li) = line {
-                        if let Some(view) = self.state.chart.lines.iter().position(|l| l.index == li) {
-                            self.state.selected_line = view;
-                        }
+                        self.state.select_line_doc(li);
                     }
                     if let Some(t) = track {
-                        if let Some(id) = state::TrackId::ALL.iter().find(|id| id.key() == t) {
-                            self.state.selected_track = *id;
+                        if let Some(id) = state::TrackId::from_key(&t) {
+                            self.state.selected_track = id;
                         }
                     }
                     // **多选口径优先**（整批替换）；否则退回单选；都没给就清空。
@@ -2265,10 +2296,7 @@ impl App {
                         let picked: Vec<opm_app::state::EventSel> = es
                             .iter()
                             .filter_map(|(t, i)| {
-                                opm_app::state::TrackId::ALL
-                                    .iter()
-                                    .find(|id| id.key() == t)
-                                    .map(|id| (*id, *i))
+                                opm_app::state::TrackId::from_key(t).map(|id| (id, *i))
                             })
                             .collect();
                         if let Some((t, _)) = picked.first() {
@@ -2573,7 +2601,7 @@ impl App {
         );
         match (step, got) {
             (opm_app::shot::ShotStep::Save(path), Some(img)) => {
-                match write_png(&img, std::path::Path::new(&path)) {
+                match opm_app::shot::write_png_image(&img, std::path::Path::new(&path)) {
                     Ok(()) => println!("  已自截屏          : {path}（{}×{}）", img.width(), img.height()),
                     Err(e) => eprintln!("  自截屏失败: {e}"),
                 }
@@ -2797,11 +2825,9 @@ impl App {
                     self.console_log
                         .push((true, format!("保存目标：{}", p.display())));
                 }
-                self.sync_file_fields();
-                self.remember_recent();
-                self.reload_audio("从缓存继续");
-                // 缓存里那份可能比磁盘上的文件新：先按"未保存"呈现，状态栏的脏标识随之重算
-                self.refresh_file_badge();
+                // 缓存里那份可能比磁盘上的文件新：先按"未保存"呈现
+                //（`sync_file_fields` 内部的 `refresh_file_badge` 已按当前核心重算脏标识）
+                self.after_document_loaded("从缓存继续");
                 true
             }
             Err(e) => {
@@ -2943,8 +2969,7 @@ impl App {
         // 行快照只在"列表变了"或"时刻走远了（30 秒）"时重算 —— 不是每帧
         self.refresh_list_rows_if_stale();
         // 缺 7z = 一道**关不掉的门槛**（`.opm` 容器靠它打包/解包，没它交付不出正式格式）
-        let gate = self.seven_zip_missing.clone();
-        let gated = gate.is_some();
+        let gated = self.seven_zip_missing.is_some();
         let mut action = opm_app::recents::start_screen_ui(
             ui,
             screen,
@@ -2961,21 +2986,10 @@ impl App {
                 action = Some(a);
             }
         }
-        if let Some(text) = &gate {
+        if gated {
             // 门槛期间列表的动作一律作废（遮罩底下本来就点不到，这里是第二道保险）
             action = None;
-            let out = opm_app::recents::missing_7z_modal(ctx, text, cfg!(windows));
-            if out.fetch {
-                let next = match filedialog::open_url(zip::SEVEN_ZIP_URL) {
-                    Ok(()) => format!("{text}\n（已用浏览器打开下载页；装好之后重启 OpenPhM）"),
-                    Err(e) => format!(
-                        "{text}\n（打开浏览器失败：{e}；地址：{}）",
-                        zip::SEVEN_ZIP_URL
-                    ),
-                };
-                self.seven_zip_missing = Some(next);
-            }
-            if out.quit || ctx.input(|i| i.viewport().close_requested()) {
+            if self.missing_7z_gate(&ctx) || ctx.input(|i| i.viewport().close_requested()) {
                 self.quit_now(&ctx);
             }
         }
@@ -3640,12 +3654,9 @@ impl eframe::App for App {
                 self.show_conflicts = false;
             }
             if let Some(j) = jump {
-                if let Some(view) = self.state.chart.lines.iter().position(|l| l.index == j.line_doc)
-                {
-                    self.state.selected_line = view;
-                }
-                if let Some(id) = state::TrackId::ALL.iter().find(|id| id.key() == j.track) {
-                    self.state.selected_track = *id;
+                self.state.select_line_doc(j.line_doc);
+                if let Some(id) = state::TrackId::from_key(&j.track) {
+                    self.state.selected_track = id;
                 }
                 self.state.select_event(self.state.selected_track, j.event);
                 let t = self.state.chart.tmap.sec(j.beat);
@@ -4264,27 +4275,13 @@ impl eframe::App for App {
 
         // ---- 缺少 7z（**最后画**：画序决定谁在上面，它必须在所有面板之上）----
         //
-        // 与启动页上的那一份是**同一个实现**（`recents::missing_7z_modal` + `dialog` 模块）：
+        // 与启动页上的那一份是**同一个实现**（[`App::missing_7z_gate`]）：
         // 同一件事在两处画成两种样子，就是这个文件里最容易长出来的不一致。
         // 它只在"带着 `--doc` 直接进编辑页、而系统里没有 7z"这条路上出现（无 `--doc` 时
         // 启动页就会把它拦住），所以这里不重复解释门槛的理由。
-        if let Some(msg) = self.seven_zip_missing.clone() {
+        if self.seven_zip_missing.is_some() {
             let ctx = ui.ctx().clone();
-            let out = opm_app::recents::missing_7z_modal(&ctx, &msg, cfg!(windows));
-            if out.fetch {
-                match filedialog::open_url(zip::SEVEN_ZIP_URL) {
-                    Ok(()) => {
-                        self.seven_zip_missing = Some(format!(
-                            "{msg}\n（已用浏览器打开下载页；装好之后重启 OpenPhM）"
-                        ));
-                    }
-                    Err(e) => {
-                        self.seven_zip_missing =
-                            Some(format!("{msg}\n（打开浏览器失败：{e}；地址：{}）", zip::SEVEN_ZIP_URL));
-                    }
-                }
-            }
-            if out.quit {
+            if self.missing_7z_gate(&ctx) {
                 self.quit_now(&ctx);
             }
         }
@@ -4391,26 +4388,6 @@ impl eframe::App for App {
             self.pending_layout_anim = false;
         }
     }
-}
-
-/// 把 egui 的 `ColorImage` 写成 PNG（复用已有的 `png` 依赖，不额外引 crate）
-fn write_png(img: &egui::ColorImage, path: &std::path::Path) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-    }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width() as u32, img.height() as u32);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-    // ColorImage 是 premultiplied RGBA
-    let mut buf: Vec<u8> = Vec::with_capacity(img.pixels.len() * 4);
-    for p in &img.pixels {
-        buf.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
-    }
-    writer.write_image_data(&buf).map_err(|e| e.to_string())
 }
 
 /// 解析该用哪个音频文件：`--audio FILE` 优先，其次谱面 `meta.audio`（相对谱面目录），

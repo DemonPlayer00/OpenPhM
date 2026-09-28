@@ -171,6 +171,8 @@ pub fn overlay_hidden_text(h_held: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 一帧里画出来的所有文本：实现搬到 `testkit`（三个面板的测试曾各抄一份）
+    use crate::testkit::drawn_texts as texts;
 
     fn view<'a>(offset: &'a mut f64) -> StatusView<'a> {
         StatusView {
@@ -191,25 +193,6 @@ mod tests {
             floor_rebuild: None,
             diagnostics: None,
         }
-    }
-
-    fn texts(out: &egui::FullOutput) -> Vec<String> {
-        fn walk(shape: &egui::epaint::Shape, acc: &mut Vec<String>) {
-            match shape {
-                egui::epaint::Shape::Text(t) => acc.push(t.galley.text().to_owned()),
-                egui::epaint::Shape::Vec(v) => {
-                    for s in v {
-                        walk(s, acc);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut acc = Vec::new();
-        for cs in &out.shapes {
-            walk(&cs.shape, &mut acc);
-        }
-        acc
     }
 
     fn draw<'a>(v: &mut StatusView<'a>) -> (StatusAction, Vec<String>) {
