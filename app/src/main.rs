@@ -3688,24 +3688,72 @@ impl eframe::App for App {
                 t += step;
                 beat += mult;
             }
+            // ---- 读数：**按可用宽度逐级省略**（用户：窄窗口下不能被裁、不能撞字）----
+            //
+            // 优先级：① 总长/拍线（它是"读数"）② 颜色图例（解释那三条线是什么）
+            // ③ 右上角"线 #N · 轨道 X"（**第一个让位**：左侧「事件轨道」那行本来就写着同样的信息）。
+            // 判据是**真的量一遍文字宽度**（`layout_no_wrap`），不是按字符数猜 —— 等宽字体里
+            // 中文与数字宽度不同，猜必然出错。
+            let font = egui::FontId::monospace(10.0);
+            let text_w = |s: &str| {
+                // 量宽度要 `&mut FontsView`（`layout_*` 会往字形图集里塞东西）⇒ `fonts_mut`
+                ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                })
+            };
+            // 头一行也分级：挤到连它都放不下时，只留"总长"（宁可少写，也不要被面板边缘裁掉半句）
+            let head_full = format!("总长 {dur:.1}s ｜ 拍线 1/{mult}（{step:.3}s）");
+            let head_short = format!("总长 {dur:.1}s");
+            let head = if text_w(&head_full) + 12.0 <= tl_rect.width() {
+                head_full
+            } else {
+                head_short
+            };
             p.text(
                 tl_rect.min + egui::vec2(6.0, 4.0),
                 egui::Align2::LEFT_TOP,
-                format!("总长 {dur:.1}s ｜ 拍线 1/{mult}（{step:.3}s）"),
-                egui::FontId::monospace(10.0),
+                &head,
+                font.clone(),
                 egui::Color32::from_rgb(120, 125, 160),
             );
-            // 第二行放**颜色图例**：一行塞不下时会跟右上角那行"线 #N · 轨道 X"撞字（缩放到 170%
-            // 时亲眼看到），拆成两行各自有位置，也更好读。
-            p.text(
-                tl_rect.min + egui::vec2(6.0, 17.0),
-                egui::Align2::LEFT_TOP,
+            // 右上角那条：放得下才画（留 18px 让两边不贴在一起）
+            if let Some(line) = self.state.selected() {
+                let track_s = format!(
+                    "线 #{} · 轨道 {}（{} 条事件）",
+                    line.index,
+                    self.state.selected_track.key(),
+                    line.track(self.state.selected_track).events.len()
+                );
+                if text_w(&head) + text_w(&track_s) + 18.0 <= tl_rect.width() {
+                    p.text(
+                        tl_rect.min + egui::vec2(tl_rect.width() - 6.0, 4.0),
+                        egui::Align2::RIGHT_TOP,
+                        track_s,
+                        font.clone(),
+                        egui::Color32::from_rgb(120, 220, 160),
+                    );
+                }
+            }
+            // 第二行的颜色图例：从长到短挑一个放得下的；一个都放不下就不画（宁可少一行，也不撞字）
+            let legends = [
                 format!(
                     "黄线 = 编辑区起点 ｜ 浅色 = 编辑区窗口（{span_lo:.1}→{span_hi:.1}s）｜ 白线 = 播放头"
                 ),
-                egui::FontId::monospace(10.0),
-                egui::Color32::from_rgb(150, 155, 185),
-            );
+                format!("黄线=起点 ｜ 浅色=编辑区窗口 {span_lo:.1}→{span_hi:.1}s ｜ 白线=播放头"),
+                format!("黄线=起点 ｜ 浅色=窗口 {span_lo:.0}→{span_hi:.0}s"),
+                "黄线=起点 ｜ 浅色=窗口".to_owned(),
+            ];
+            if let Some(legend) = legends.iter().find(|s| text_w(s) + 12.0 <= tl_rect.width()) {
+                p.text(
+                    tl_rect.min + egui::vec2(6.0, 17.0),
+                    egui::Align2::LEFT_TOP,
+                    legend,
+                    font,
+                    egui::Color32::from_rgb(150, 155, 185),
+                );
+            }
 
             // ---- 事件与子音符（当前判定线）----
             // 判定线的事件轨道是"表演"的本体，时间轴上必须看得见：
@@ -3770,18 +3818,6 @@ impl eframe::App for App {
                         col,
                     );
                 }
-                p.text(
-                    tl_rect.min + egui::vec2(tl_rect.width() - 6.0, 4.0),
-                    egui::Align2::RIGHT_TOP,
-                    format!(
-                        "线 #{} · 轨道 {}（{} 条事件）",
-                        line.index,
-                        self.state.selected_track.key(),
-                        track.events.len()
-                    ),
-                    egui::FontId::monospace(10.0),
-                    egui::Color32::from_rgb(120, 220, 160),
-                );
             }
 
             // ---- **黄线 = 起点**（用户定义）----
