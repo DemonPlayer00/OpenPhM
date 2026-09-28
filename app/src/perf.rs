@@ -604,6 +604,17 @@ impl LinePerf {
             local[0] * s + local[1] * c + self.y,
         ]
     }
+    /// 逆变换：RPE 屏幕坐标 → **线本地**坐标（旋转 + 平移都可逆）。
+    ///
+    /// 两个用处：点选判定线（`Line::hit`），以及渲染侧把**窗口矩形**搬回本地空间当候选筛
+    /// （见 `render::build_instances`：候选集按位置选，不按时间窗口选）。
+    pub fn apply_inv(&self, screen: [f32; 2]) -> [f32; 2] {
+        let (s, c) = (-self.rotate_deg).to_radians().sin_cos();
+        let dx = screen[0] - self.x;
+        let dy = screen[1] - self.y;
+        [dx * c - dy * s, dx * s + dy * c]
+    }
+
     /// 线的旋转角（弧度），给实例用
     pub fn rotate_rad(&self) -> f32 {
         self.rotate_deg.to_radians()

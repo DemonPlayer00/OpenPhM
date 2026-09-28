@@ -1515,3 +1515,65 @@ fn two_negative_speed_events_each_count() {
     });
     assert!(!drawn, "负流速段里线下的音符不该被画出来，实际画了");
 }
+
+/// **流速换过符号时，"构建窗口"不能再用时间算**（用户报："第二个负流速事件和不存在一样，
+/// 无法正确控制音符的位置和速度"）。
+///
+/// 谱面：流速 0~2 秒 = 10、2~4 秒 = −10、4~6 秒 = −20（BPM 120 ⇒ 1 拍 = 0.5 秒）。
+/// 播放头 0.2 秒时，3.5 秒那颗的偏移是
+///
+/// ```text
+///   H(0.2) = 10 × 0.2 × 120 = 240 ｜ H(2.0) = 2400 ｜ H(3.5) = 2400 − 10 × 1.5 × 120 = 600
+///   偏移 = 600 − 240 = 360   ← 稳稳地落在 ±450 的窗口里
+/// ```
+///
+/// 但"穿过窗口要多久"那条时间窗口（`510/(120·|v|)`）算出的是 **0.425 秒**，
+/// 被 `lookahead` 抬到 2 秒 ⇒ 只往后看 2 秒 ⇒ **3.3 秒之外那颗整颗没有实例**。
+/// 正负相消让音符在窗口里"赖着不走"，任何时间窗口都算不准 —— 所以候选集现在按**位置**选。
+#[test]
+fn a_note_inside_the_window_is_drawn_even_when_the_flow_speed_changes_sign() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 120.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    let beat = |b: f64| Beat::new((b * 4.0).round() as i64, 4);
+    for (a, b, v) in [(0.0, 4.0, 10.0), (4.0, 8.0, -10.0), (8.0, 12.0, -20.0)] {
+        l.layers[0].track_mut("speed").unwrap().push(Event::new(
+            beat(a),
+            beat(b),
+            json!(v),
+            json!(v),
+            "linear",
+        ));
+    }
+    l.notes.push(DocNote::new(DocKind::Tap, beat(7.0), 0.0)); // 3.5 秒
+    doc.judge_lines.push(l);
+
+    let mut st = EditorState::new(chart_from_doc(&doc));
+    st.selected_line = usize::MAX;
+    let at = |st: &mut EditorState, t: f64| -> Option<f32> {
+        st.playhead = t;
+        let mut inst = Vec::new();
+        build_instances(st, &mut inst);
+        inst.iter()
+            .find(|q| {
+                let c = q.color();
+                (c[0] - 0.35).abs() < 0.02
+                    && (c[1] - 0.65).abs() < 0.02
+                    && (c[2] - 1.0).abs() < 0.02
+            })
+            .map(|q| q.center()[1])
+    };
+    // 播放头 0.2 秒：偏移 +360（在窗口里）⇒ **必须画出来**
+    let got = at(&mut st, 0.2).expect("偏移 +360 的音符在窗口里，必须被画出来（时间窗口把它漏了）");
+    assert!((got - 360.0).abs() < 1.0, "应画在 360，实际 {got}");
+    // 播放头 0.4 秒：H(0.4) = 480 ⇒ 偏移 +120（仍在窗口里）⇒ 照样画（不是"只漏一颗"的偶发）
+    let got = at(&mut st, 0.4).expect("偏移变小但仍在线上的音符必须被画出来");
+    assert!((got - 120.0).abs() < 1.0, "应画在 120，实际 {got}");
+    // 播放头 0.6 秒：H(0.6) = 720 ⇒ 偏移 −120（判定线**之下**）⇒ 按规则②不画
+    assert!(at(&mut st, 0.6).is_none(), "判定线之下的音符不该被画出来");
+}

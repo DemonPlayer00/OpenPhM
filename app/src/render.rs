@@ -530,6 +530,35 @@ fn push_hit_fx(
     }
 }
 
+/// 把 RPE 窗口矩形（±675 × ±450）**逆变换**回这条线的本地空间，返回它的 AABB `(lo, hi)`。
+///
+/// 用途：`build_instances` 的候选筛 —— "音符在屏幕上的包围盒是否与窗口相交"这件事，
+/// 在本地空间里等价于"音符的本地包围盒是否与这个框相交"（旋转不改变距离，
+/// 而实例的旋转角就是判定线的旋转角 ⇒ 本地空间里音符是轴对齐的）。候选筛只求**保守**
+/// （宁可多留几颗让它走到后面那道屏幕判据），所以取 AABB 而不是精确的旋转矩形。
+fn local_window_box(perf: &perf::LinePerf) -> ([f32; 2], [f32; 2]) {
+    let mut lo = [f32::INFINITY; 2];
+    let mut hi = [f32::NEG_INFINITY; 2];
+    // 旋转矩形的 AABB 由四个角决定（再带上四边中点：多算两次，防的是我自己写错角标）
+    for (sx, sy) in [
+        (-1.0_f32, -1.0_f32),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (1.0, 1.0),
+        (0.0, -1.0),
+        (0.0, 1.0),
+        (-1.0, 0.0),
+        (1.0, 0.0),
+    ] {
+        let p = perf.apply_inv([sx * RPE_WINDOW_HALF_W, sy * RPE_WINDOW_HALF_H]);
+        lo[0] = lo[0].min(p[0]);
+        lo[1] = lo[1].min(p[1]);
+        hi[0] = hi[0].max(p[0]);
+        hi[1] = hi[1].max(p[1]);
+    }
+    (lo, hi)
+}
+
 /// 构建演奏区实例（CPU 侧）。
 ///
 /// 顺序即绘制顺序：`Chart.lines` 已按 zOrder 排好（小的先画、大的盖在上面）。
@@ -576,8 +605,27 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
         // 流速事件改了之后，"它之后"的音符位置会过期；那些还没被异步补上的音符在这里**现算**
         // （`floor_offset_now`）。两条路径共用同一份积分实现 ⇒ 现算的值与预算好的值一致，
         // 异步补得快慢**不影响画面**，只影响每帧的代价。
+        //
+        // ---- 候选集：**按位置选，不按时间窗口选** ----
+        //
+        // 时间窗口（`510/(120·|v|)`）在**流速换过符号**的谱面上是错的：正负相消时，
+        // 一颗远在几秒之外的音符可能仍然贴在窗口里。实测（流速 10 → −10 → −20，
+        // 播放头 0.2 s）：3.5 秒那颗的偏移是 **360**（稳稳在 ±450 里），
+        // 却被"2.2 秒窗口"挡在外面 ⇒ 整颗没有实例 —— 表现在界面上就是
+        // "第二个负流速事件和不存在一样，音符的位置和速度都不受它控制"（用户 2026-09-28 报的）。
+        //
+        // 现在候选集用**算出来的位置**判：把窗口矩形**逆变换**回这条线的本地空间，取它的 AABB，
+        // 再放宽一个音符的半个外接框 + 余量；落在里面的音符才继续做屏幕包围盒与绘制。
+        // 于是"增速/减速/换向/长 hold"都不影响正确性 —— 候选集与判定线被搬到哪里也无关。
+        // 代价：每帧扫这条线的全部音符（缓存命中时 ~4 ns/颗；10 万音符 ≈ 0.5 ms，
+        // `tests/floor_bench.rs` 量得出来），而不是只扫"窗口里那几颗"。
         let h_now = line.h_at(state.playhead, tmap);
-        for idx in state.visible_range_of(li) {
+        let (box_lo, box_hi) = local_window_box(&perf);
+        // 时间窗口只剩一个用途：**还没重算**（脏）的音符拿它兜底 —— 那些音符的位置现在是现算的，
+        // 一颗一颗现算太贵（~160 ns/颗），所以只算窗口里的；窗口外的那几颗下一帧补上
+        // （`pump_floors` 每帧补 4096 条，且优先补播放头之后的）。
+        let window = state.visible_range_of(li);
+        for idx in 0..line.notes.len() {
             let note = &line.notes[idx];
             // 音符自身的 speed（文档字段，默认 1.0）乘在**离判定线的距离**上：
             // RPE/prpr 就是这么用的（它不改到达时刻，只改"落多远"）。**带符号** ——
@@ -588,10 +636,19 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             if spd.abs() < 1e-3 {
                 continue;
             }
+            // 横向先筛一道：只用 `lane_x`（不碰缓存）。取**最宽**的音符半宽当界，
+            // 于是这一道是保守的，命中的才去看纵向。
+            if note.lane_x + MAX_NOTE_HALF_W < box_lo[0] - EditorState::NOTE_SPAN_MARGIN
+                || note.lane_x - MAX_NOTE_HALF_W > box_hi[0] + EditorState::NOTE_SPAN_MARGIN
+            {
+                continue;
+            }
             // 这颗音符此刻离判定线多远（判据与画法都只用这一个数）
-            let lead_h = line
-                .floor_offset(idx, h_now)
-                .unwrap_or_else(|| line.floor_offset_now(note.time, h_now, tmap));
+            let lead_h = match line.floor_offset(idx, h_now) {
+                Some(v) => v,
+                None if window.contains(&idx) => line.floor_offset_now(note.time, h_now, tmap),
+                None => continue,
+            };
             let lead = (lead_h * spd) as f32;
             let age = state.playhead - note.time;
             // ---- 画不画：**位置 < 0 ⇒ 在判定线之下 ⇒ 不显示**（用户口径）----
@@ -628,6 +685,25 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 lead_h
             };
             let tail_y = (tail_h * spd) as f32;
+            // ---- 候选筛（本地空间，保守）：头尾那一段连它的半宽半高都在本地窗口框之外 ⇒
+            //      一定看不见，不必做变换与屏幕包围盒 ----
+            //
+            // 本地空间里音符是**轴对齐**的（实例的旋转角就是判定线的旋转角）：x 是 `lane_x ± nw/2`，
+            // y 是 `[min(头,尾) − nh/2, max(头,尾) + nh/2]`；判定线被移开/旋转时窗口框也跟着搬
+            // （`local_window_box`），所以"判定线被搬到别处、音符其实在屏幕里"那种情形照样命中。
+            let (nw, nh) = match note.kind {
+                NoteKind::Hold => (HOLD_W, NOTE_H),
+                _ => (NOTE_W, NOTE_H),
+            };
+            let slack = EditorState::NOTE_SPAN_MARGIN;
+            let (ny_lo, ny_hi) = (y_local.min(tail_y) - nh * 0.5, y_local.max(tail_y) + nh * 0.5);
+            if note.lane_x + nw * 0.5 < box_lo[0] - slack
+                || note.lane_x - nw * 0.5 > box_hi[0] + slack
+                || ny_hi < box_lo[1] - slack
+                || ny_lo > box_hi[1] + slack
+            {
+                continue;
+            }
             // ---- 可见性判据：**按屏幕上的位置**，不是"离判定线多远" ----
             //
             // 这里修的是一个真 bug：判据曾经只看**线本地**的偏移（`|offset| > 510 就跳过`），
@@ -635,10 +711,6 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             // 的 y 是 **+360**（明明在窗口里），却被当成"离判定线太远"整颗丢掉；
             // 线旋转 90° 时，偏移 660 的音符落在屏幕上 x=-660（±675 之内）同样被丢掉。
             // 现在判据是"这颗音符（连它自己的半宽半高）在屏幕上的包围盒是否与窗口相交"。
-            let (nw, nh) = match note.kind {
-                NoteKind::Hold => (HOLD_W, NOTE_H),
-                _ => (NOTE_W, NOTE_H),
-            };
             let head_pt = perf.apply([note.lane_x, y_local]);
             let tail_pt = perf.apply([note.lane_x, tail_y]);
             // 旋转过的方块在屏幕上的外接半径（保守：宁可多建几个实例，也不能漏画看得见的）
@@ -749,6 +821,10 @@ pub fn build_instances_all(state: &EditorState, out: &mut Vec<NoteInstance>) {
 const NOTE_W: f32 = 92.0;
 const NOTE_H: f32 = 26.0;
 const HOLD_W: f32 = 78.0;
+
+/// 四种音符里最宽的半宽（`NOTE_W / 2`）。候选筛的第一道（只看 `lane_x`）用它当界 ——
+/// 保守（宁可多留几颗），但**不碰缓存**，于是横向就在窗口外的音符一颗都不用管。
+const MAX_NOTE_HALF_W: f32 = NOTE_W * 0.5;
 
 const SHADER: &str = r#"
 struct Uniforms {

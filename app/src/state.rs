@@ -493,11 +493,7 @@ impl Line {
     pub fn hit(&self, tmap: &TimeMap, sec: f64, point: [f32; 2], tol: f32, line_half_w: f32) -> bool {
         let p = self.perf(tmap, sec);
         // 逆变换回本地坐标（旋转可逆），再看 |y_local| 与 |x_local|
-        let (s, c) = (-p.rotate_deg).to_radians().sin_cos();
-        let dx = point[0] - p.x;
-        let dy = point[1] - p.y;
-        let lx = dx * c - dy * s;
-        let ly = dx * s + dy * c;
+        let [lx, ly] = p.apply_inv(point);
         ly.abs() <= tol && lx.abs() <= line_half_w
     }
 
