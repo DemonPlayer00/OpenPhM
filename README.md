@@ -194,5 +194,29 @@ cargo build --target x86_64-pc-windows-gnu --release   # 交叉编译 Windows ex
 
 ## 许可证
 
-**GPL-3.0-or-later**（见 `app/Cargo.toml` 的 `license` 字段）。仓库里还没有 `LICENSE` 文件全文 ——
-要分发请照 GPL-3.0-or-later 的条款；需要我把全文补进来就说一声。
+**GNU General Public License v3.0 或更高版本**（GPL-3.0-or-later）。全文见 [`LICENSE`](LICENSE)
+（GPL-3.0 标准文本，674 行 / 35147 字节，未作任何修改）；`app/Cargo.toml` 的 `license` 字段同此声明。
+
+```text
+Copyright (C) 2026 OpenPhM 作者（仓库：https://github.com/DemonPlayer00/OpenPhM）
+
+本程序是自由软件：你可以按自由软件基金会发布的 GNU 通用公共许可证条款重新发布和/或修改它，
+条款为第 3 版或（按你的选择）任何更高版本。
+
+本程序分发的目的是希望它有用，但**没有任何担保**，甚至没有适销性或特定用途适用性的默示担保。
+详见 GNU 通用公共许可证。
+
+你应该已经随本程序收到了 GNU 通用公共许可证的副本（见 `LICENSE`）；如果没有，
+见 <https://www.gnu.org/licenses/>。
+```
+
+**"or later" 是什么意思**：你可以按 GPL-3.0 的条款使用本项目，**也可以**按任何更新的 GPL 版本使用它
+（这是本项目在 `Cargo.toml` 里选的档位）。想按 GPL-3.0 **only** 使用、或想把本项目**并入**不兼容
+GPL 的工程，都需要另外的授权 —— 那要联系作者。
+
+**为什么是 GPL**：这个档位是**框架选型时定下的硬约束**，整套依赖按"与 GPL-3.0-or-later 兼容、且允许
+静态链接"逐项复核过（`wgpu` / `egui` / `eframe` / `egui-wgpu` 为 MIT OR Apache-2.0，`winit` 是**单一**
+Apache-2.0）。被否掉的方案里就有这类结构性冲突：音频硬依赖专有 BASS（禁止再许可）、JUCE 的 AGPLv3
+（与 GPL-3.0 不兼容）、slint 的 `GPL-3.0-only`（未授予 or-later）。逐项复核见
+[`OpenPhM-框架选型.md`](OpenPhM-框架选型.md) §3（候选矩阵）与 §11（修正记录）。RPE 的编解码是**自己写的**
+（不链接生态里的参考实现），所以"格式互通"不会带来许可上的连带。
