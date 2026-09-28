@@ -3640,6 +3640,25 @@ impl eframe::App for App {
             let dur = self.state.timeline_duration().max(0.001);
             let x_of = |t: f64| tl_rect.min.x + (t / dur) as f32 * tl_rect.width();
 
+            // ---- **编辑区窗口**（浅色带）----
+            //
+            // 时间轴上要能一眼看出"编辑区现在显示的是哪一段"：那一段就是**编辑区底层到顶层**的时间跨度
+            // （底部 = 播放头退回 `lead_beats`，顶部 = 再往上 `overlay_beats` 拍；与 `overlay::draw`
+            // 里的 anchor 同一套定义，见 `EditorState::edit_area_span`）。
+            // 画在拍线**之前**：它是底衬，不能把拍线与事件压灰。
+            let (span_raw_lo, span_raw_hi) = self.state.edit_area_span(self.overlay.lead_beats);
+            // **夹到轴内**：播放头在 0 附近时，编辑区底部落在 0 之前（叠加层本来就会显示一点"前导"），
+            // 不夹的话黄线与浅色带会被画到轴外 —— 画了等于没画，而且读数会显示负时间。
+            let span_lo = span_raw_lo.max(0.0);
+            let span_hi = span_raw_hi.clamp(0.0, dur);
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x_of(span_lo), tl_rect.min.y),
+                    egui::pos2(x_of(span_hi), tl_rect.max.y),
+                ),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(210, 220, 245, 26),
+            );
             // 拍线（自适应抽稀）：整谱可见时拍线密度会远超像素密度 ——
             // 20 万音符的谱面曾按原步长画出 5 万条线，把帧时间拖到 20 ms（且镶嵌开销不计入 ui_ms）。
             let px_per_sec = tl_rect.width() / dur as f32;
@@ -3672,9 +3691,20 @@ impl eframe::App for App {
             p.text(
                 tl_rect.min + egui::vec2(6.0, 4.0),
                 egui::Align2::LEFT_TOP,
-                format!("拍线 1/{mult} 步长（{step:.3}s），共 {} 条", (dur / step) as u64),
+                format!("总长 {dur:.1}s ｜ 拍线 1/{mult}（{step:.3}s）"),
                 egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(120, 125, 160),
+            );
+            // 第二行放**颜色图例**：一行塞不下时会跟右上角那行"线 #N · 轨道 X"撞字（缩放到 170%
+            // 时亲眼看到），拆成两行各自有位置，也更好读。
+            p.text(
+                tl_rect.min + egui::vec2(6.0, 17.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "黄线 = 编辑区起点 ｜ 浅色 = 编辑区窗口（{span_lo:.1}→{span_hi:.1}s）｜ 白线 = 播放头"
+                ),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(150, 155, 185),
             );
 
             // ---- 事件与子音符（当前判定线）----
@@ -3754,21 +3784,21 @@ impl eframe::App for App {
                 );
             }
 
-            // 可见窗口
-            let vis = self.state.visible_range();
-            p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x_of(vis.0), tl_rect.min.y),
-                    egui::pos2(x_of(vis.1), tl_rect.max.y),
-                ),
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(90, 130, 220, 28),
+            // ---- **黄线 = 起点**（用户定义）----
+            //
+            // 它标的是**编辑区底部**那一时刻（= 浅色窗口的左沿），也就是"从这里往上就是我在编的那一段"。
+            // 播放头在它上方 `lead_beats` 拍，所以两者**必须画成两种东西**：黄线是起点，
+            // 播放头是下面那条细白线（拖动时间轴时看它）。
+            let sx = x_of(span_lo);
+            p.line_segment(
+                [egui::pos2(sx, tl_rect.min.y), egui::pos2(sx, tl_rect.max.y)],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 210, 70)),
             );
-            // 播放头
+            // 播放头（细白线，压在黄线之上、与它区分开）
             let px = x_of(self.state.playhead);
             p.line_segment(
                 [egui::pos2(px, tl_rect.min.y), egui::pos2(px, tl_rect.max.y)],
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(240, 240, 120)),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 238, 245)),
             );
 
             if resp.clicked() || resp.dragged() {
