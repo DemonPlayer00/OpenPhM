@@ -2915,3 +2915,51 @@ impl NewChartForm { fn asset_mut(field) / set_asset(field, path) }
 **没有真的点过那两个"浏览…"按钮、也没弹过真的 kdialog**（本会话无法往 Wayland 窗口注入鼠标）：
 "动作 → 过滤器"的映射与"过滤器 → argv"的拼接分别由单测钉住，模态本身有截图，但"点下去弹出来的
 确实是音频框"这条链路只有人工确认才算最终验证。
+
+## 7.50 退出编辑器时检查未保存：把"关窗"接进已有的未保存守卫（2026-09-28）
+
+用户："**退出编辑器时检查是否未保存，有则提示**"
+
+### 已有的东西（不重造）
+
+"未保存守卫"本来就在：`GuardAction::{NewDoc, OpenDialog}` + `GuardChoice::{Save, Discard, Cancel}`
++ `dialog::modal` 画的三选一（**Krita 那三个**，不是常见的两个 —— 少了「返回」就没法反悔）。
+缺的只是**把"关窗"也算成一件会丢文档的事**。
+
+### 做法：eframe 的官方否决式 + 一处 `quit_allowed` 旗子
+
+```rust
+if ctx.input(|i| i.viewport().close_requested()) && !self.quit_allowed {
+    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);   // 先否决这次关闭
+    if dirty { self.guard_for = Some(GuardAction::Quit) }        // 有改动 ⇒ 弹守卫
+    else     { self.pending_quit = true }                        // 干净 ⇒ 放行走
+}
+```
+
+- `close_requested()` + `CancelClose` 是 eframe 自己文档里写的用法（`epi.rs`：
+  "If you need to abort an exit check `ctx.input(|i| i.viewport().close_requested())`"）；
+- **`quit_allowed` 是必须的**：`ViewportCommand::Close` 同样会让下一帧 `close_requested()` 为真 ⇒
+  不加旗子，程序化退出（`--shot-exit`、bench 收尾、7z 门槛的「退出」）会被自己的守卫拦下来等人点按钮，
+  自动化当场卡死。所以那些地方统一走 `quit_now()`（先立旗子再 Close），只有"真的点了叉"才过守卫；
+- `GuardAction::Quit` 这一档只多两处：文案里的「退出」，以及 `start_guarded` 里立 `pending_quit`
+  （关闭需要 `Context`，守卫那一层没有，于是交给帧里处理）。
+
+### 守卫从"启动页的一部分"改成"整帧的一部分"
+
+原来它画在 `launch_page` 里（因为触发它的两个动作都在启动页）。关窗可以从**任何**一页发生，
+所以抽成 `App::unsaved_guard(ctx)`，在 `ui()` 最前面调用一次 —— **不用管调用顺序**：
+`dialog::modal` 走 `egui::Modal`（Foreground 层 + 遮罩 + 自己吞输入），层级与画它的时机无关。
+两页共用一个守卫，也就不会有"哪个页面才有效"的区别。
+
+### 验证（`OPM_CLOSE_AUTO` 是这轮新加的钩子：在第 N 帧模拟点叉）
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 有未保存改动 + 关窗（启动页） | 拦下 | 进程**还活着**（`kill -0` 为真）✓ |
+| 有未保存改动 + 关窗（**编辑页**，`OPM_LAUNCH_AUTO=skip`） | 拦下并盖在编辑页上 | 截图 `artifacts/unsaved-guard-on-quit.png`：编辑器变暗，弹窗写着"谱面「demo-50」…**退出**之前要先保存吗？"✓ |
+| 干净文档 + 关窗 | 直接退 | 自己退出，`exit=0` ✓（走的就是守卫放行后的 `pending_quit` 那条路） |
+| **回归**：`--shot-exit` 在有未保存改动时 | 照旧退出 | `exit=0` ✓（旗子按预期挡掉了自我拦截） |
+
+**没验到**：守卫里「保存」与「不保存」两个**按钮**（往 Wayland 窗口注入点击在本会话是断的）。
+不过「不保存」之后要走的那条路（`start_guarded(Quit)` → `pending_quit` → `quit_now`）与上表第三行同源，
+已经跑通过。

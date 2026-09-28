@@ -157,6 +157,8 @@ enum GuardChoice {
 enum GuardAction {
     NewDoc,
     OpenDialog,
+    /// 退出程序（关窗）—— **唯一没有撤销机会**的那个动作
+    Quit,
 }
 
 /// 启动耗时探针：把"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。
@@ -776,6 +778,13 @@ struct App {
     /// `OPM_LAUNCH_AUTO` 的值（**启动时读一次**）：启动页用它替人做选择（截图/CI）。
     /// 放在字段里而不是每帧 `env::var` —— 那是纯粹的启动期钩子，帧里不该有 env 查询。
     launch_auto: Option<String>,
+    /// `OPM_CLOSE_AUTO=<帧号>`：在那一帧**模拟点右上角的叉**（发一个 Close 请求）——
+    /// 验证"未保存就退出"的守卫用（本会话没法往 Wayland 窗口注入点击）。
+    close_auto: Option<u64>,
+    /// 守卫放行后的退出待办（帧里执行，那里有 `Context`）
+    pending_quit: bool,
+    /// 我们自己已经发过 `Close` ⇒ 下一帧的 `close_requested()` 不再过守卫
+    quit_allowed: bool,
 
     recents: recents::Recents,
     /// 启动页列表的**行快照**（显示什么在这里算好；帧里只画字符串）。
@@ -959,6 +968,11 @@ impl App {
             trace_startup: false,
             // 启动期钩子：**只在这里读一次**（帧里不该有 env 查询）
             launch_auto: std::env::var("OPM_LAUNCH_AUTO").ok(),
+            close_auto: std::env::var("OPM_CLOSE_AUTO")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
+            pending_quit: false,
+            quit_allowed: false,
             guard_for: match dialog_at_start.as_deref() {
                 Some("guard") => Some(GuardAction::NewDoc),
                 _ => None,
@@ -1307,6 +1321,82 @@ impl App {
         }
     }
 
+    /// **未保存守卫**：有未保存改动时先问「保存｜不保存｜返回」，用户选完才继续。
+    ///
+    /// 三个选项而不是两个（Krita 的做法）：少了「返回」就没法反悔 —— 用户点开"新建"只是想看看，
+    /// 结果被迫在"保存"和"丢弃"之间选一个。`dismissed`（Esc/点遮罩）等价于「返回」。
+    ///
+    /// 画在 `ui()` 的**最前面**也能盖住整页：`dialog::modal` 走 `egui::Modal`（Foreground 层 +
+    /// 遮罩 + 自己吞输入），层级与调用顺序无关 —— 于是同一个守卫在启动页与编辑页都有效。
+    fn unsaved_guard(&mut self, ctx: &egui::Context) {
+        // ---- 未保存守卫：有未保存改动时先问「保存｜不保存｜返回」----
+        //
+        // 这是 Krita 的三个选项，不是常见的两个：少了「返回」就没法反悔 ——
+        // 用户点开"新建"只是想看看，结果被迫在"保存"和"丢弃"之间选一个。
+        if let Some(goal) = self.guard_for {
+            let mut decide: Option<GuardChoice> = None;
+            let name = {
+                let c = self.core.lock().unwrap();
+                c.doc().meta.name.clone()
+            };
+            let out = opm_app::dialog::modal(
+                &ctx,
+                "opm_unsaved_guard",
+                opm_app::dialog::W_NARROW,
+                |ui| {
+                    opm_app::dialog::title(ui, "有未保存的改动");
+                    ui.label(format!(
+                        "谱面「{name}」自上次保存后有改动。{}之前要先保存吗？",
+                        match goal {
+                            GuardAction::NewDoc => "新建",
+                            GuardAction::OpenDialog => "打开别的谱面",
+                            GuardAction::Quit => "退出",
+                        }
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 保存").clicked() {
+                            decide = Some(GuardChoice::Save);
+                        }
+                        if ui
+                            .button("🗑 不保存")
+                            .on_hover_text("丢弃这些改动")
+                            .clicked()
+                        {
+                            decide = Some(GuardChoice::Discard);
+                        }
+                        if ui
+                            .button("↩ 返回")
+                            .on_hover_text("什么都不做，回到编辑器")
+                            .clicked()
+                        {
+                            decide = Some(GuardChoice::Cancel);
+                        }
+                    });
+                },
+            );
+            if out.dismissed {
+                decide = Some(GuardChoice::Cancel);
+            }
+            match decide {
+                Some(GuardChoice::Save) => {
+                    // 保存（可能先弹保存窗口拿到目标）→ 保存成功后继续原动作
+                    self.guard_for = None;
+                    self.ensure_target_then_save();
+                    if !self.core.lock().unwrap().is_dirty() {
+                        self.start_guarded(goal);
+                    }
+                }
+                Some(GuardChoice::Discard) => {
+                    self.guard_for = None;
+                    self.start_guarded(goal);
+                }
+                Some(GuardChoice::Cancel) => self.guard_for = None,
+                None => {}
+            }
+        }
+    }
+
     /// 草稿目标（界面上那行"保存目标"）→ 路径。空串表示"还没指定"。
     fn target_path(&self) -> Option<std::path::PathBuf> {
         let t = self.target_draft.trim();
@@ -1381,7 +1471,19 @@ impl App {
                 self.pending_launch_new = true;
             }
             GuardAction::OpenDialog => self.open_via_system(),
+            // 关闭需要 `Context`（这一层拿不到）：立个旗子，由帧里那个 `pending_quit` 处理
+            GuardAction::Quit => self.pending_quit = true,
         }
+    }
+
+    /// **我们自己**决定退出（截屏、bench、7z 门槛，以及守卫放行之后）。
+    ///
+    /// 先立 `quit_allowed` 再发 `Close`：`ViewportCommand::Close` 同样会让下一帧的
+    /// `close_requested()` 为真 —— 不加这个旗子，程序化退出会被自己的"未保存守卫"拦下来等人点按钮
+    /// （`--shot-exit` 与 bench 会当场卡住）。
+    fn quit_now(&mut self, ctx: &egui::Context) {
+        self.quit_allowed = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// 按启动页表单里的值创建空谱面（曲名/谱面作者/音乐作者/音乐路径/基础 BPM）。
@@ -2086,7 +2188,7 @@ impl App {
                 }
                 let _ = std::io::stdout().flush();
                 if self.args.shot_exit {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.quit_now(&ctx);
                 } else {
                     self.args.shot = None;
                 }
@@ -2324,7 +2426,7 @@ impl App {
                 self.seven_zip_missing = Some(next);
             }
             if out.quit || ctx.input(|i| i.viewport().close_requested()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.quit_now(&ctx);
             }
         }
         // 自动化钩子（截图/CI 用）：`OPM_LAUNCH_AUTO=skip|new|create:<曲名>|open:<path>|recent:<n>`
@@ -2507,6 +2609,35 @@ impl eframe::App for App {
                 );
             }
         }
+
+        // ---- 退出检查：**关窗是唯一没有撤销机会的操作** ----
+        //
+        // 走 eframe 的官方否决式（`eframe::epi` 里就写着这条用法）：看到关闭请求先 `CancelClose`，
+        // 然后决定是放行、还是把"未保存守卫"摊开让用户选（保存 / 不保存 / 返回）。
+        // `quit_allowed` 只给**我们自己**发的 Close 用（截屏、bench、7z 门槛都走 `quit_now`）——
+        // 不加这个旗子，程序化退出会被自己的守卫拦下来等人点按钮。
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_allowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            let dirty = self.core.lock().map(|c| c.is_dirty()).unwrap_or(false);
+            if dirty {
+                self.guard_for = Some(GuardAction::Quit);
+            } else {
+                self.pending_quit = true; // 干净就走，不停留
+            }
+        }
+        if self.pending_quit {
+            self.pending_quit = false;
+            self.quit_now(&ctx);
+        }
+        // 自动化钩子：把"点右上角的叉"变成可复现的一步（`OPM_CLOSE_AUTO=<帧号>`）。
+        // **故意不立 `quit_allowed`** —— 要的就是"用户点了叉"这件事本身，守卫该拦就得拦。
+        if self.close_auto.is_some_and(|n| u64::from(self.frames) >= n) {
+            self.close_auto = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // 守卫画在最前面也能盖住整页（`egui::Modal` 的层级与调用顺序无关），
+        // 于是启动页与编辑页共用同一个守卫 —— 关窗不再有"哪一页才有效"的区别。
+        self.unsaved_guard(&ctx);
 
         // ---- 启动页：**一屏**（谱面列表）+ 盖在它上面的模态 ----
         //
@@ -2909,73 +3040,6 @@ impl eframe::App for App {
         // 打开程序先看这一屏：最近打开的谱面在左，动作在右。它**不是模态框**，而是整屏布局 ——
         // 第一屏没有"下面的编辑器"可遮，用 CentralPanel 直接铺开更简单也更像系统里的启动页。
         // 遮住编辑器不等于禁用：下面那一帧仍然照常构建（见本函数末尾的早退）。
-        // ---- 未保存守卫：有未保存改动时先问「保存｜不保存｜返回」----
-        //
-        // 这是 Krita 的三个选项，不是常见的两个：少了「返回」就没法反悔 ——
-        // 用户点开"新建"只是想看看，结果被迫在"保存"和"丢弃"之间选一个。
-        if let Some(goal) = self.guard_for {
-            let ctx = ui.ctx().clone();
-            let mut decide: Option<GuardChoice> = None;
-            let name = {
-                let c = self.core.lock().unwrap();
-                c.doc().meta.name.clone()
-            };
-            let out = opm_app::dialog::modal(
-                &ctx,
-                "opm_unsaved_guard",
-                opm_app::dialog::W_NARROW,
-                |ui| {
-                    opm_app::dialog::title(ui, "有未保存的改动");
-                    ui.label(format!(
-                        "谱面「{name}」自上次保存后有改动。{}之前要先保存吗？",
-                        match goal {
-                            GuardAction::NewDoc => "新建",
-                            GuardAction::OpenDialog => "打开别的谱面",
-                        }
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("💾 保存").clicked() {
-                            decide = Some(GuardChoice::Save);
-                        }
-                        if ui
-                            .button("🗑 不保存")
-                            .on_hover_text("丢弃这些改动")
-                            .clicked()
-                        {
-                            decide = Some(GuardChoice::Discard);
-                        }
-                        if ui
-                            .button("↩ 返回")
-                            .on_hover_text("什么都不做，回到编辑器")
-                            .clicked()
-                        {
-                            decide = Some(GuardChoice::Cancel);
-                        }
-                    });
-                },
-            );
-            if out.dismissed {
-                decide = Some(GuardChoice::Cancel);
-            }
-            match decide {
-                Some(GuardChoice::Save) => {
-                    // 保存（可能先弹保存窗口拿到目标）→ 保存成功后继续原动作
-                    self.guard_for = None;
-                    self.ensure_target_then_save();
-                    if !self.core.lock().unwrap().is_dirty() {
-                        self.start_guarded(goal);
-                    }
-                }
-                Some(GuardChoice::Discard) => {
-                    self.guard_for = None;
-                    self.start_guarded(goal);
-                }
-                Some(GuardChoice::Cancel) => self.guard_for = None,
-                None => {}
-            }
-        }
-
         // ---- 文件对话框：保存 / 另存为 / 打开 / 新建（用系统文件对话框）----
         //
         // 为什么是"对话框"而不是顶栏一排按钮：保存/另存为/打开是**互斥的一次性决定**，
@@ -3702,7 +3766,7 @@ impl eframe::App for App {
                 }
             }
             if out.quit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.quit_now(&ctx);
             }
         }
 
@@ -3744,7 +3808,7 @@ impl eframe::App for App {
                     if !self.reported {
                         self.report();
                     }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.quit_now(&ctx);
                 }
                 // 空闲阶段：不连续重绘。
                 // idle_fps > 0 → 心跳；idle_fps == 0 → 只在空闲时段结束时唤醒一帧（否则事件驱动下永远轮不到这里收尾）
@@ -3767,7 +3831,7 @@ impl eframe::App for App {
             if !self.reported {
                 self.report();
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.quit_now(&ctx);
             return;
         }
 
