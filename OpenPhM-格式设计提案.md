@@ -304,9 +304,14 @@
 
 ### 9.3 GPL 合规清单（方案 C 下的实际口径）
 
-- [ ] 仓库根 `LICENSE`（GPLv3 全文）+ 各 `Cargo.toml` 的 SPDX 字段写 **`GPL-3.0-or-later`**（方案 C 下无冲突）。
-- [ ] 每个源文件加 SPDX 头（`SPDX-License-Identifier: GPL-3.0-or-later`），避免"文件头与清单不一致"的歧义。
-- [ ] `NOTICE`/`README` 列明第三方组件与**文档署名**：`phira-docs`（CC-BY-4.0）是 RPE 语义的主要依据，**必须署名**。
+- [x] 仓库根 `LICENSE`（GPLv3 全文）+ 各 `Cargo.toml` 的 SPDX 字段写 **`GPL-3.0-or-later`**（方案 C 下无冲突）。
+      —— **2026-09-28 已落地**：`LICENSE` = GPL-3.0 标准文本（674 行 / 35147 字节，逐字节未改），
+      `app/Cargo.toml` 的 `license = "GPL-3.0-or-later"`。
+- [x] 每个源文件加 SPDX 头（`SPDX-License-Identifier: GPL-3.0-or-later`），避免"文件头与清单不一致"的歧义。
+      —— **2026-09-28 已落地**：50 个 `.rs`/`.py` 都带 SPDX + 版权行（`// SPDX-License-Identifier: …`）。
+- [x] `NOTICE`/`README` 列明第三方组件与**文档署名**：`phira-docs`（CC-BY-4.0）是 RPE 语义的主要依据，**必须署名**。
+      —— **2026-09-28 已落地**：README 的「许可证 → 第三方与出处」列了 `phira-docs`（CC-BY-4.0）、
+      `Lchzh Docs`、`TeamFlos/phira`（只作行为参考）、思源黑体（OFL-1.1，许可原文已随字体入库）、Rust 依赖。
 - [ ] **Corresponding Source**：自己发布二进制时，源码即本仓库；第三方 crate 走 `cargo vendor`（或等价手段）随附，确保可复现。
 - [ ] CI 加**许可证门禁**（Rust 用 `cargo deny check licenses`；其他栈用等价工具，如 `license-checker`）。allow-list 至少含：MIT / Apache-2.0 / MPL-2.0 / ISC / BSD-* / Zlib / Unicode-3.0 / CC-BY-4.0（仅文档）/ GPL-3.0-or-later。**无许可证的 crate 会被判为 `unlicensed` 并直接拦住构建**——`sasa` 这类问题本该在这里就被发现；Phira 上游没有 `deny.toml`，别指望它替你把关。
 - [ ] 若日后加入网络服务组件：GPLv3 **§13 明确允许**与 AGPLv3 组合，不必为此换证。

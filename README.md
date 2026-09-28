@@ -223,3 +223,19 @@ Apache-2.0）。被否掉的方案里就有这类结构性冲突：音频硬依�
 （与 GPL-3.0 不兼容）、slint 的 `GPL-3.0-only`（未授予 or-later）。逐项复核见
 [`OpenPhM-框架选型.md`](OpenPhM-框架选型.md) §3（候选矩阵）与 §11（修正记录）。RPE 的编解码是**自己写的**
 （不链接生态里的参考实现），所以"格式互通"不会带来许可上的连带。
+
+### 第三方与出处（署名义务）
+
+这个编辑器的格式语义不是凭印象写的 —— 下面这些来源决定了字段与行为，按各自的许可**必须署名**：
+
+| 来源 / 组件 | 许可 | 在本项目里承担什么 |
+|---|---|---|
+| **[Phira Documents（`phira-docs`）](https://teamflos.github.io/phira-docs/chart-standard/chart-format/index.html)** | **CC-BY-4.0** | RPE 语义与字段表的**主要依据**（事件 / 音符 / 流速 / 时间单位）。据此**自行实现**，未搬运其文档或示例代码 |
+| [Lchzh Docs](https://docs.lchzh.top/learning/phigros/) | 许可见原站（**未核实**） | 官谱（official）字段的对照依据；本项目**未实现**该格式的读写 |
+| [TeamFlos/phira](https://github.com/TeamFlos/phira)（含 `prpr`） | GPL-3.0-only | **只作行为参考**（读源码学语义，读代码不产生副本）：不链接、不复制其代码 / 注释 / 文档文本 |
+| **思源黑体 CN Regular**（© Adobe） | **SIL OFL-1.1** | 内嵌 CJK 字体（`include_bytes!` 进二进制）；许可原文随字体入库：[`app/assets/fonts/SourceHanSansCN-LICENSE.txt`](app/assets/fonts/SourceHanSansCN-LICENSE.txt) |
+| Rust 依赖：`wgpu` / `egui` / `eframe` / `egui-wgpu` / `winit` / `symphonia` / `cpal` / `serde` / `png` … | MIT OR Apache-2.0、单一 Apache-2.0、MPL-2.0 等 | 全部与 GPL-3.0-or-later 兼容且允许静态链接；完整清单见 `app/Cargo.lock` |
+
+**本项目没有链接任何 GPL-3.0-only 组件**（生态里的参考实现 `prpr` 是 GPL-3.0-only）——
+所以 `-or-later` 这个档位全程成立。这也是"RPE 编解码自己写"的直接原因，
+逐项核对见 [`OpenPhM-格式设计提案.md`](OpenPhM-格式设计提案.md) §9。
