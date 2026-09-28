@@ -479,9 +479,23 @@ wgpu 的默认电源偏好是 `HighPerformance`，于是**什么都不设**时�
 | `OPM_GPU=discrete` / `OPM_GPU=integrated` | 明确要独显 / 明确要核显（程序自己的开关，优先级最高） |
 | `WGPU_POWER_PREF=high|low|none` | 尊重 wgpu 自己的偏好变量 |
 
-**只有独显的机器不受影响**（核显优先在"没有核显"时仍然用独显；软件渲染 llvmpipe 排最后）。
 非 Linux 平台不干预（Windows/macOS 的高性能/省电由系统设置决定）。启动日志会把
 `显卡策略` / 每个`适配器候选` / `显卡选用` 三行打出来 —— 用了哪块卡、为什么，一眼可核对。
+
+**在各种硬件组合上都验过**（本机能做的：直接换枚举集合来模拟；选择逻辑本身**完全不看厂商**，
+只吃 `wgpu::DeviceType`，所以"AMD/Intel 独显"与"NVIDIA 独显"走的是同一条路）：
+
+| 组合 | 怎么模拟 | 结果 |
+|---|---|---|
+| 核显 + 独显（本机真实） | —— | 选核显（AMD 610M） |
+| **只有核显** | 只挂 `radeon_icd.json` | 选核显 ✓ |
+| **只有独显** | 只挂 `nvidia_icd.json` | **照样选独显** ✓（不会因为"核显优先"就不给用硬件） |
+| 只有虚拟卡 / 只有软件渲染 | `WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1` | 选 llvmpipe（`Gl/Cpu`）✓（比开不了窗口好） |
+| 后端退化（Vulkan 里没有可用卡） | 只挂 `intel_icd.json`（本机无 Intel 卡） | 自动退到 GL 的 AMD 适配器并正常出图 ✓ |
+| 完全没后端 | `WGPU_BACKEND=vulkan` + 假 ICD 路径 | eframe 报 `FailedToCreateSurfaceForAnyBackend` 后**可读退出**（不 panic）✓ |
+
+另有 64 种适配器子集 × 2 种策略的穷举单测（不变量：有硬件绝不选软件、有核显必选核显、
+只有独显必用它、结果确定），以及"策略不看厂商"的结构性测试。
 
 ## 快速放置音符：Q/W/E/R（hold 跟随鼠标）
 

@@ -2379,3 +2379,41 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 **只验证了"用了哪块卡"，没量功耗** —— 功耗差别是常识判断，不是本次实测数据。
 
 `cargo test` 新增 4 条（策略判定：默认/prime-run 标记/开关优先级/挑卡打分），共 **177 条全绿、0 警告**。
+
+### 7.43.1 在各种 GPU 组合上检查这套机制（2026-09-28）
+
+用户："**检查gpu选择机制是否能在不同gpu组合上运作（单核显，单独显，非nvidia独显等）。**"
+
+本机只有"AMD 核显 + NVIDIA 独显"一种物理组合，所以分两条路查：
+
+**① 逻辑层：穷举 + 结构性保证。** `pick_index` 是纯函数，于是把 5 种适配器类别
+（核显/独显/虚拟/软件/其它）的**全部 32 个子集 × 2 种挑卡策略 = 64 组**都跑一遍，断言四条不变量：
+有硬件适配器就**绝不**选软件渲染；`IntegratedFirst` 下有核显必选核显；`DiscreteFirst` 下有独显必选独显；
+同样输入两次结果相同。另外钉住"**只有独显时仍然用独显**"与"只有软件渲染时也只能用它"。
+**厂商无关**是结构性的：`GpuKind` 里根本没有厂商信息，策略只吃 `wgpu::DeviceType` ⇒
+"非 NVIDIA 独显（AMD/Intel）"与 NVIDIA 独显走的是同一条代码路径。
+
+**② 实测层：换枚举集合来模拟各种组合**（Vulkan ICD 过滤 / 后端开关）：
+
+| 组合 | 怎么模拟 | 实测结果 |
+|---|---|---|
+| 核显 + 独显（真实） | —— | AMD Radeon 610M（Integrated） |
+| 只有核显 | 只挂 `radeon_icd.json` | AMD 610M ✓ |
+| 只有独显 | 只挂 `nvidia_icd.json` | **NVIDIA RTX 5070** ✓ |
+| 只有软件渲染 | `WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1` | llvmpipe（`Gl/Cpu`）✓ |
+| 后端退化（Vulkan 无可用卡） | 只挂 `intel_icd.json`（本机无 Intel 卡） | 退到 GL 的 AMD 适配器并正常出图 ✓ |
+| 完全没后端 | `WGPU_BACKEND=vulkan` + 假 ICD 路径 | eframe：`FailedToCreateSurfaceForAnyBackend`，可读错误退出（不 panic）✓ |
+| wgpu 自己的偏好变量 | `WGPU_POWER_PREF=high` | 独显 ✓（自定义选择器下仍尊重它） |
+| prime-run / DRI_PRIME / OPM_GPU | 见 §7.43 | 独显 / 核显，均符合预期 ✓ |
+
+**顺手发现并修掉的一处语义漏洞**：`GpuPolicy::Default`（"交给平台"）原先也会走 `pick_index`，
+而它的打分全为 0 ⇒ `max_by_key` 取第一个，恰好可能选中 `Cpu` 这种最差候选。虽然 `main.rs` 对 Default
+根本不装选择器、走不到那里，但"沉默地随便挑一个"是错的语义 ⇒ 改成 **Default 返回 `None`**（明确不发表意见），
+并加了一条测试钉住它。
+
+**边界（实测澄清）**："一个后端都用不了"这种情况**轮不到选择器** —— wgpu 先要建 surface，
+eframe 在更早一步就报错退出了。选择器只在"有适配器可挑"时运行；候选全都不能出图到该 surface 时，
+它才返回 `Err("没有可用的图形适配器")`。这条边界写进了 `main.rs` 的注释。
+
+**未能验证的**：真机上只有 NVIDIA 一块独显，所以"非 NVIDIA 独显"是靠"逻辑不看厂商"+ 单测保证的，
+不是靠插一块 AMD 独显跑出来的 —— 如实标注。

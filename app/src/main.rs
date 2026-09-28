@@ -410,6 +410,10 @@ fn main() -> eframe::Result<()> {
     // 为什么要自己选：wgpu 的默认电源偏好是 `HighPerformance` ⇒ 什么都不设时会去开独显，
     // 而编谱这种 2D 活儿核显足够，独显白烧功耗与发热（用户明确要求）。
     // 选择器拿到的是**全部候选适配器**，所以能按策略挑，并把决定打出来（谁都能核对）。
+    //
+    // 边界（实测）：**"一个后端都用不了"轮不到这个选择器** —— wgpu 先要建 surface，
+    // 没有可用后端时 eframe 直接报 `FailedToCreateSurfaceForAnyBackend` 并以可读错误退出；
+    // 这里的选择器只在"有适配器可挑"时运行（候选全部不能出图到 surface 时会返回下面那句 Err）。
     let (gpu_policy, gpu_why) =
         opm_app::gpu::policy_from_env(cfg!(target_os = "linux"), &|k| std::env::var(k).ok());
     println!("  显卡策略          : {}", opm_app::gpu::describe(gpu_policy, gpu_why));
