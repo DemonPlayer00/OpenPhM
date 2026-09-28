@@ -148,6 +148,10 @@ pub fn load_value(v: Value) -> Result<RpeImport, String> {
     }
 
     // ---- 事件轨道规范化（补空隙 / 裁重叠 / 首事件从 0 起 / 末事件延拓）----
+    //
+    // 规范化要问求值器"切点上的值"（裁重叠那一步），而求值要按**秒**长把缓动采样成折线
+    // ⇒ 必须先有拍↔秒映射。BPM 表在上面已经读完、谱面末尾拍刚算出来。
+    let tmap = crate::perf::TimeMap::from_parts(&bpm_list, chart_end);
     for (li, line) in judge_lines.iter_mut().enumerate() {
         for (gi, layer) in line.layers.iter_mut().enumerate() {
             for track in crate::doc::TRACKS {
@@ -159,7 +163,7 @@ pub fn load_value(v: Value) -> Result<RpeImport, String> {
                     continue;
                 }
                 let ptr = format!("/judgeLineList[{li}].eventLayers[{gi}].{track}Events");
-                let (norm, _) = normalize_track(list, chart_end, &ptr, &mut fid);
+                let (norm, _) = normalize_track(list, &tmap, chart_end, &ptr, &mut fid);
                 if let Some(slot) = layer.track_mut(track) {
                     *slot = norm;
                 }
@@ -506,13 +510,18 @@ fn import_event(
             "judgeLineList[{li}].eventLayers[{gi}].speedEvents[{ei}] 标了贝塞尔 —— RPE 的流速事件不支持贝塞尔，已按普通缓动处理"
         ));
     }
-    // 流速轨只按线性求值（`perf::speed_value`）：缓动名**原样保留**（不偷偷改别人的文件），
-    // 但预览/求值走线性 —— 这件事必须写进保真度报告，否则"导入后位置和游戏不一样"会查无实据。
+    // 流速轨的缓动**现在是真的生效的**（缓动按折线实现，见 `perf::event_knots`），
+    // 语义取 RPE **1.7.0** 的说法："缓动作用在流速值上、再积分成位置"。
+    //
+    // 但 1.6.2~1.6.x 的谱面里这个字段的语义不同（phira-docs：作用在 floorPosition 上；
+    // prpr 干脆忽略它）—— 这件事必须写进保真度报告，否则"导入后位置和原游戏不一样"会查无实据。
     if track == "speed" && easing != "linear" {
         fid.warn_grouped_note(
-            "流速事件的缓动",
+            "流速事件的缓动（按 1.7.0 语义求值）",
             &format!("/judgeLineList[{li}].eventLayers[{gi}].speedEvents[{ei}]"),
-            "opm 的流速事件只按 linear 求值（音符位置是它的积分，线性有闭式解）；缓动名原样保留、导出时照旧写回，但预览与音符位置按线性算",
+            "opm 按 RPE 1.7.0 的语义求值：缓动作用在**流速值**上、再积分成位置；来源若是 1.6.x，\
+             它把缓动作用在 floorPosition 上（prpr 则忽略缓动），预览可能与原游戏不一致。\
+             缓动名原样保留、导出照旧写回",
         );
     }
     // 其它字段（easingLeft/easingRight/linkgroup/自定义）原样保留

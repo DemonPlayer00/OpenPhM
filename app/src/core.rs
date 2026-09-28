@@ -1937,8 +1937,8 @@ impl EditCore {
                         ev.end.to_f64()
                     ));
                 }
-                // 切点上的值**问求值器**（`perf::track_value`）：它带缓动，且按轨道选求值方式
-                // （流速只按线性 —— 见 `perf::speed_value`）。
+                // 切点上的值**问求值器**（`perf::track_value`）：它带缓动（折线实现），
+                // 五条轨道同一条口径。
                 //
                 // 这里曾写死"线性插值 + `Value::Number` 守卫"：于是一条非线性缓动的事件被切一刀，
                 // 切点上的数与**预览显示的**不是同一个数 —— 切完当场多出一个跳变，
@@ -1947,7 +1947,8 @@ impl EditCore {
                     (&ev.start_value, &ev.end_value),
                     (Value::Number(_), Value::Number(_))
                 ) {
-                    json!(crate::perf::track_value(&track, std::slice::from_ref(&ev), at.to_f64())
+                    let tmap = crate::perf::TimeMap::from_doc(&self.doc);
+                    json!(crate::perf::track_value(std::slice::from_ref(&ev), at.to_f64(), &tmap)
                         .unwrap_or_default())
                 } else {
                     // 非数值端点：原样搬运（求值器把它们算成 0，那是预览的口径，不是这里的口径）
@@ -1994,7 +1995,7 @@ impl EditCore {
             // 值已经按位等于目标的轨道一律**跳过** —— 于是"只改 X"不会顺手切别人的块。
             // 整条命令是**一个撤销步**（事务）。
             //
-            // 流速轨**不在其中**：它不是"坐标"（用户口径：流速只按 linear 求值，且音符位置是它的积分）。
+            // 流速轨**不在其中**：它不是"坐标"（音符位置是它的积分，不是一次就位的目标）。
             "set_target" => {
                 let line_idx = line_arg(c)?;
                 let layer_idx = c.get("layer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -2026,7 +2027,10 @@ impl EditCore {
                     let neutral = crate::state::TrackId::from_key(track)
                         .map(crate::edit::track_neutral_value)
                         .unwrap_or(0.0);
-                    let current = crate::perf::track_value(track, &list, at.to_f64()).unwrap_or(neutral);
+                    // "此刻的值" = 求值器的值（缓动折线 + 端点按定义）—— 判"要不要写"用的就是它
+                    let tmap = crate::perf::TimeMap::from_doc(&self.doc);
+                    let current =
+                        crate::perf::track_value(&list, at.to_f64(), &tmap).unwrap_or(neutral);
                     if current.to_bits() == v.to_bits() {
                         plan.push(json!({"track": track, "action": "skip", "why": "已经是这个值"}));
                         continue;
@@ -2137,6 +2141,7 @@ impl EditCore {
                 // 早先这里另有一份实现，规则**与导入侧相反**（把后一条事件挪到前一条的终点）——
                 // 于是同一个 bug 有第三种表现：刚放好的事件被 `normalize` 挪走。
                 let end = add_beat(self.doc.chart_end(), Beat::new(1024, 1)).ok_or("拍数溢出")?;
+                let tmap = crate::perf::TimeMap::from_parts(&self.doc.bpm_list, self.doc.chart_end());
                 let mut fixes = 0usize;
                 let mut touched: Vec<(usize, usize, String, Vec<Event>, Vec<Event>)> = Vec::new();
                 for (li, line) in self.doc.judge_lines.iter().enumerate() {
@@ -2150,6 +2155,7 @@ impl EditCore {
                             let mut fid = codec::Fidelity::new("normalize", String::new());
                             let (after, st) = codec::normalize_track(
                                 before.clone(),
+                                &tmap,
                                 end,
                                 &format!("/judgeLines[{li}].layers[{yi}].{track}"),
                                 &mut fid,
@@ -2446,7 +2452,8 @@ mod tests {
         let ev = c.doc().judge_lines[0].layers[0].move_x[0].clone();
         let at = crate::doc::Beat::new(1, 1); // 1/4 处：缓动在这里明显不等于线性
         // 预览在 1 拍处的值（**唯一的求值口径**）
-        let want = crate::perf::event_value(&ev, at.to_f64());
+        let tmap = crate::perf::TimeMap::from_doc(c.doc());
+        let want = crate::perf::event_value(&ev, at.to_f64(), &tmap);
         let linear = 25.0; // 线性插值会给的数（= 100 × 1/4）
         assert!((want - linear).abs() > 1.0, "样例本身的缓动要看得出来：{want} vs {linear}");
 
@@ -2465,9 +2472,9 @@ mod tests {
         );
     }
 
-    /// 流速事件被切开时按**线性**取值（`easing` 字段不参与 —— 见 `perf::speed_value`）
+    /// 流速事件被切开时，切点上的值 = **求值器给的值**（缓动照旧生效 —— 流速不再"只看线性"）
     #[test]
-    fn splitting_a_speed_event_uses_the_linear_value() {
+    fn splitting_a_speed_event_uses_the_evaluated_value() {
         let mut c = EditCore::new();
         exec_ok(
             &mut c,
@@ -2475,13 +2482,19 @@ mod tests {
                                "startBeat": [0, 1], "endBeat": [4, 1],
                                "startValue": 0.0, "endValue": 100.0, "easing": "inOutCubic"}),
         );
+        let ev = c.doc().judge_lines[0].layers[0].speed[0].clone();
+        let at = crate::doc::Beat::new(1, 1);
+        let tmap = crate::perf::TimeMap::from_doc(c.doc());
+        let want = crate::perf::event_value(&ev, at.to_f64(), &tmap);
+        // 这块按折线求值 ⇒ 明显不等于线性插值的 25，正是"流速也认缓动"的证据
+        assert!((want - 25.0).abs() > 1e-6, "样例的缓动要看得出来：{want} vs 25");
         exec_ok(
             &mut c,
             serde_json::json!({"op": "split_event", "line": 0, "layer": 0, "track": "speed",
                                "index": 0, "atBeat": [1, 1]}),
         );
         let cut = c.doc().judge_lines[0].layers[0].speed[0].end_value.as_f64().unwrap();
-        assert!((cut - 25.0).abs() < 1e-9, "流速只看线性：0→100 在 1/4 处是 25，实际 {cut}");
+        assert!((cut - want).abs() < 1e-9, "切点应当是求值器的值 {want}，实际 {cut}");
     }
 
     /// `normalize` 命令与**导入侧同一条规则**：重叠时**后一条的起点不动**，裁的是前一条；
@@ -2518,9 +2531,10 @@ mod tests {
         // 末事件延拓到谱尾之后（常量事件直接拉长是**无损**的；斜坡才会另加一段）
         assert!(sp.last().unwrap().end.to_f64() > 64.0, "末事件要覆盖到谱面结束之后");
         // 语义（值函数）不变：4 拍之前 10、之后 30
-        assert_eq!(crate::perf::eval_events(sp, 2.0), Some(10.0));
-        assert_eq!(crate::perf::eval_events(sp, 5.0), Some(30.0));
-        assert_eq!(crate::perf::eval_events(sp, 30.0), Some(30.0), "末尾之后保持末事件的终值");
+        let tmap = crate::perf::TimeMap::from_doc(c.doc());
+        assert_eq!(crate::perf::eval_events(sp, 2.0, &tmap), Some(10.0));
+        assert_eq!(crate::perf::eval_events(sp, 5.0, &tmap), Some(30.0));
+        assert_eq!(crate::perf::eval_events(sp, 30.0, &tmap), Some(30.0), "末尾之后保持末事件的终值");
     }
 
     /// **空话题的广播 = "什么都可能变了"**，必须送到每个订阅者手里。
@@ -2667,11 +2681,13 @@ mod tests {
             "speed" => &c.doc().judge_lines[0].layers[0].speed,
             other => panic!("未知轨道 {other}"),
         };
-        opm_app_perf_track_value(track, list, beat as f64)
+        opm_app_perf_track_value(c, list, beat as f64)
     }
 
-    fn opm_app_perf_track_value(track: &str, list: &[Event], beat: f64) -> f64 {
-        crate::perf::track_value(track, list, beat).unwrap_or(0.0)
+    /// 求值要按**秒**长把缓动采样成折线 ⇒ 测试里的求值也得带上文档的拍↔秒映射。
+    fn opm_app_perf_track_value(c: &EditCore, list: &[Event], beat: f64) -> f64 {
+        let tmap = crate::perf::TimeMap::from_doc(c.doc());
+        crate::perf::track_value(list, beat, &tmap).unwrap_or(0.0)
     }
 
     /// **块末就位：按位相等**（这条是用户那句"以保证最终 0 误差就位"的可执行定义）。

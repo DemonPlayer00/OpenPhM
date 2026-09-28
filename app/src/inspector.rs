@@ -154,26 +154,9 @@ pub fn inspector_ui(
                 changed |= value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed;
                 changed |= value_field(ui, &mut sv, "值起 ", 0.5, None).changed;
                 changed |= value_field(ui, &mut ev, "值止 ", 0.5, None).changed;
-                // ---- 流速轨：**不给缓动选择**（只按线性求值，见 `perf::speed_value`）----
-                //
-                // 给了也只会骗人：求值那边根本不看 `easing`。导入的 RPE 谱里若带着非线性缓动，
-                // 文档**原样保留**（不偷偷改写别人的文件），这里如实标出来。
-                if v.track == opm_app::state::TrackId::Speed {
-                    ui.horizontal(|ui| {
-                        ui.label("缓动");
-                        if easing == "linear" {
-                            ui.monospace("线性（流速只用线性求值）");
-                        } else {
-                            ui.colored_label(
-                                opm_app::dialog::WARN,
-                                format!("{easing} → 按线性求值"),
-                            )
-                            .on_hover_text(
-                                "流速事件只按线性求值（音符位置是它的积分，缓动会被积掉大半，\n                                 而线性有闭式积分、整条链路更简单）。\n                                 文件里这个缓动名**原样保留**，导出时照旧写回去。",
-                            );
-                        }
-                    });
-                } else if let Some((curve, variant)) = cmd::split_easing(&easing) {
+                // ---- 缓动选择：**五条轨道都一样**（流速也认缓动了 —— 缓动按"折线"实现，
+                // 0.1 秒一段；回弹类还会把回弹点/折点插进节点，见 `perf::event_knots`）----
+                if let Some((curve, variant)) = cmd::split_easing(&easing) {
                     let mut new_curve = curve;
                     egui::ComboBox::from_id_salt("ev_easing_curve")
                         .selected_text(curve.label())
@@ -264,7 +247,7 @@ pub fn inspector_ui(
                          · 块末落在块内 ⇒ 先在此切一刀（切点值 = 当前值，不跳变）再写两侧；\n\
                          · 块末在空位 ⇒ 写前一块的终值（空位的值就是它）；\n\
                          · 已经是这个值的轨道**不动**。\n\
-                         流速轨不在其中（它不是坐标；流速只按 linear 求值）。",
+                         流速轨不在其中（它不是坐标，音符位置是它的积分）。",
                     );
                 // 初值取快照里的**草稿**（不是每帧从文档重取）：用户改完要按按钮，
                 // 值必须活过一帧 —— 见 `view::Inspector::target` 的注释

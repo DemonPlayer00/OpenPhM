@@ -137,11 +137,12 @@ impl TrackId {
 /// 一条事件轨道在视图侧的缓存：**拍域事件** + **秒域采样折线**（时间轴用）
 #[derive(Clone, Default, Debug)]
 pub struct TrackView {
-    /// 事件本体（拍域，直接来自 doc；求值走 `perf::eval_events`，缓动才不会被近似掉）
+    /// 事件本体（拍域，直接来自 doc；求值走 `perf::event_value` —— 缓动按"折线"实现：
+    /// 每 0.1 秒一个节点、回弹类的回弹点必采，见 README「缓动是**折线**」）
     pub events: Vec<Event>,
     /// 与 `events` **一一对应**的文档出处（多层文档里靠它才删得对/改得对）
     pub origins: Vec<crate::doc::EventRef>,
-    /// 采样折线 (秒, 值)，供时间轴画曲线
+    /// 采样折线 (秒, 值)，供时间轴画曲线 —— **就是求值的那条折线**（`perf::sample_track`）
     pub curve: Vec<[f32; 2]>,
     /// 折线值域（画曲线时纵向归一）
     pub min: f32,
@@ -488,7 +489,7 @@ impl Line {
             &self.tracks[3].events,
             &self.tracks[4].events,
         ];
-        crate::perf::perf_of(&ev, tmap.beat(sec))
+        crate::perf::perf_of(&ev, tmap.beat(sec), tmap)
     }
     /// 命中判定：屏幕坐标（RPE）是否落在这条线上（用于点选判定线）
     pub fn hit(&self, tmap: &TimeMap, sec: f64, point: [f32; 2], tol: f32, line_half_w: f32) -> bool {
@@ -560,7 +561,8 @@ impl Line {
     pub fn set_tracks(&mut self, tracks: [TrackView; 5], tmap: &TimeMap) {
         let changed = first_speed_change(&self.tracks[4].events, &tracks[4].events);
         self.min_speed_abs =
-            crate::perf::min_speed_magnitude(&tracks[4].events).unwrap_or(crate::perf::SPEED_DEFAULT);
+            crate::perf::min_speed_magnitude(&tracks[4].events, tmap)
+                .unwrap_or(crate::perf::SPEED_DEFAULT);
         self.tracks = tracks;
         match changed {
             // 前缀积分：`beat` 之前的时刻只由它之前的事件决定 ⇒ 本线只有**它之后**的音符要重算
@@ -682,7 +684,7 @@ pub fn line_shell(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Line> 
     // 流速轨道上的最小量级（采样）；没有事件 ⇒ RPE 的默认 10
     let speed_events = crate::perf::track_events(src, "speed");
     let min_speed_abs =
-        crate::perf::min_speed_magnitude(&speed_events).unwrap_or(crate::perf::SPEED_DEFAULT);
+        crate::perf::min_speed_magnitude(&speed_events, tmap).unwrap_or(crate::perf::SPEED_DEFAULT);
     Some(Line {
         index,
         name: src.name.clone(),
@@ -737,8 +739,8 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
             continue;
         }
         let (origins, events): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
-        // 流速轨只按线性求值 ⇒ 曲线也用线性采（否则面板显示的缓动与音符位置对不上）
-        let curve = sample_track(&events, tmap, 4, *id == TrackId::Speed);
+        // 曲线**就是**求值的那条折线（缓动按 0.1 秒一段采样）⇒ 面板之间不会互相打脸
+        let curve = sample_track(&events, tmap);
         let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
         for p in &curve {
             min = min.min(p[1]);

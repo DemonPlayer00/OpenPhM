@@ -6,13 +6,22 @@
 //! 音符只是挂在它下面的子对象（跟着线一起平移/旋转）。因此"事件真的生效"是前提 ——
 //! 本模块就是那个前提。
 //!
-//! 两处口径（与 `spec/` 对齐）：
+//! 三处口径（与 `spec/` 对齐）：
 //! · 缓动函数本体用通用实现（easings.net 命名），编号语义依据 Phira Documents —— 见 `spec/easing.json`；
 //! · 时间映射按 `bpmList` 分段线性：第 i 段从 `bpmList[i].startBeat` 起、按 `bpmList[i].bpm` 走，
-//!   到下一段起点为止。早先只按首个 BPM 换算，多 BPM 谱面会整体跑偏（本轮补上）。
+//!   到下一段起点为止。早先只按首个 BPM 换算，多 BPM 谱面会整体跑偏（本轮补上）；
+//! · **一切缓动都按"折线"实现**（用户口径，见 [`ease_segments`] / [`knot_us`]）：从块开头起
+//!   每 0.1 秒一个节点、节点之间线性，首尾节点的值就是 `startValue`/`endValue`，而
+//!   **非单调缓动（回弹类）的回弹点/折点必须落在节点上**（[`turning_points`]）。于是
+//!   ① 五条轨道走**同一条**求值路径（流速因此也有了曲线缓动）；
+//!   ② 每段都是线性的 ⇒ 流速积分 `∫v dτ` 仍是**闭式精确解**，没有抽样误差、也不累加；
+//!   ③ 端点按定义取端值、回弹点取曲线上的峰值 ⇒ "块末就位"的 0 误差与过冲都不受采样影响。
+//!   代价是节点**之间**与解析曲线有偏差（0.1 秒一段，实测表在 `tests/perf.rs`）——
+//!   这是**定义**上的选择：折线就是这支缓动的真相，不是"算不准"。
 
-use crate::doc::{Document, Event, JudgeLine, Layer};
+use crate::doc::{Beat, Document, Event, JudgeLine, Layer};
 use serde_json::Value;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------- 时间映射
 
@@ -28,8 +37,16 @@ pub struct TimeMap {
 
 impl TimeMap {
     pub fn from_doc(doc: &Document) -> Self {
-        let mut raw: Vec<(f64, f64)> = doc
-            .bpm_list
+        Self::from_parts(&doc.bpm_list, doc.chart_end())
+    }
+
+    /// 直接由 `bpmList` + 谱面末尾拍建表。
+    ///
+    /// 单独开这个入口是因为**导入中途**也要用它：RPE 导入是先读 BPM 表、再读判定线，
+    /// 读到事件时要规范化重叠（切点上的值要问求值器，而求值器现在需要秒长 ⇒ 需要本表），
+    /// 那时 `Document` 还没拼好。
+    pub fn from_parts(bpm_list: &[crate::doc::BpmEntry], end_beat: Beat) -> Self {
+        let mut raw: Vec<(f64, f64)> = bpm_list
             .iter()
             .map(|b| (b.start.to_f64(), (b.bpm as f64).max(1.0)))
             .collect();
@@ -46,7 +63,7 @@ impl TimeMap {
             }
             segs.push((*beat, *bpm, sec));
         }
-        let end_beat = doc.chart_end().to_f64().max(segs.last().map(|s| s.0).unwrap_or(0.0));
+        let end_beat = end_beat.to_f64().max(segs.last().map(|s| s.0).unwrap_or(0.0));
         let mut me = Self { segs, end_beat, duration: 0.0 };
         me.duration = me.sec(end_beat) + 2.0;
         me
@@ -260,6 +277,260 @@ pub fn ease(name: &str, t: f64) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------- 缓动的折线实现
+//
+// 缓动不是"求值时套一个函数"，而是**折线**（用户口径）：
+// · 从块开头起**每 0.1 秒**一个节点，节点之间线性；
+// · **采样区间不允许变大** —— 只有末段能吸收"不足 0.04 秒"的尾巴（于是最长 0.14 秒）；
+// · **非单调缓动（回弹类）必须采到回弹点/折点**（[`turning_points`]）：`back`/`elastic`/`bounce`
+//   的过冲峰与折角如果落在两节点之间就会被削平；回弹点彼此太近时同样按合并规则**先到先得**；
+// · 首尾节点就是 `startValue` / `endValue`（按定义，不做算术）；
+// · 整块不足 0.1 秒 ⇒ 一段 ⇒ "等价于 linear 缓动"（一段的折线就是直线）。
+//
+// 好处：五条轨道（**含流速**）走同一条求值路径；每段线性 ⇒ 流速积分仍是闭式精确解。
+// 代价：节点**之间**与解析曲线有偏差 —— 端点、回弹点、段内积分都是精确的，
+// 偏差只活在节点之间的直线里（实测表见 `tests/perf.rs`）。
+
+/// 折线的采样周期（秒）：缓动曲线从块开头起，每这么长取一个节点。
+pub const EASE_SEG_SEC: f64 = 0.1;
+
+/// 末段短于这个秒数就**并入前一段**（免得留一个没用的极小段）。
+pub const EASE_MERGE_SEC: f64 = 0.04;
+
+/// 单块的段数上限。段数只随**秒长**线性增长（10 分钟的一块 = 6000 段），正常谱面到不了；
+/// 这是给"病态长块"的护栏，免得一次 `speed_segments` 就申请出天文数字的切点。
+pub const EASE_SEG_MAX: usize = 4096;
+
+/// 一块**秒**时长 `d` 的事件要切成几段（用户口径）：
+///
+/// · 从块开头起每 [`EASE_SEG_SEC`]（0.1 秒）一个节点，采样区间**不允许**变大；
+/// · 末尾余量不足 [`EASE_MERGE_SEC`]（0.04 秒）时**并入前一段**（于是只有最后一段更长，
+///   最长 0.1 + 0.04 = 0.14 秒）；
+/// · 整块不足 0.1 秒 ⇒ **一段**，也就是"等价于 linear 缓动"（一段的折线就是直线）。
+///
+/// 段数只由**秒**时长决定 ⇒ 同一块在不同 BPM 下段数不同，改 BPM 会自动跟着变。
+/// 这也正是求值器必须拿到 [`TimeMap`] 的原因。**不含**回弹点带来的额外切分
+/// （节点总数见 [`event_knots`]）。
+pub fn ease_segments(d: f64) -> usize {
+    if !d.is_finite() || d <= 0.0 {
+        return 1;
+    }
+    let q = d / EASE_SEG_SEC;
+    if q < 1.0 {
+        return 1;
+    }
+    let base = q.floor() as usize; // ≥ 1（浮点 → 整数是饱和转换，天文数字不会 UB）
+    let rem = d - base as f64 * EASE_SEG_SEC;
+    let n = if rem < EASE_MERGE_SEC { base } else { base + 1 };
+    n.clamp(1, EASE_SEG_MAX)
+}
+
+/// 网格参数 —— `(进度步长 s, 段数 n, 合并阈值 m)`，全在**事件进度** `u` 域里。
+///
+/// 位置用进度记（`u_k = k × 0.1 / 块秒长`）而不是秒：进度按拍线性推进，块内 BPM 不变时
+/// 这些节点在秒上就是严格的 0.1 秒一个（块内正好有变速时按拍等分，秒距随速度比缩放）；
+/// 段数仍按块的真实**秒长**算。于是求值只要块的两个秒端点，热路径一次 `tmap.beat` 都不用做。
+///
+/// `linear`（以及零长/非有限/一段的块）给"一段 + 无限阈值"：折线就是那条直线，
+/// 回弹点全被并掉、采样也不需要 —— 这是"整块不足 0.1 秒 ⇒ 等价 linear"的实现方式。
+fn grid_params(name: &str, d: f64) -> (f64, usize, f64) {
+    if name == "linear" || !d.is_finite() || d <= 0.0 {
+        return (1.0, 1, f64::INFINITY);
+    }
+    let n = ease_segments(d);
+    if n <= 1 {
+        return (1.0, 1, f64::INFINITY);
+    }
+    (EASE_SEG_SEC / d, n, EASE_MERGE_SEC / d)
+}
+
+/// 缓动的**回弹点 / 折点**（进度域，升序，(0,1) 内）。
+///
+/// 单调缓动（29 个里的 20 个）是**空表** —— 特判只给非单调函数：`back` / `elastic` / `bounce`
+/// 三族（含 in / out / inOut）。表的来源是 [`scan_turning_points`]，**每个名字只算一次**。
+pub fn turning_points(name: &str) -> &'static [f64] {
+    static CACHE: OnceLock<Vec<(&'static str, Vec<f64>)>> = OnceLock::new();
+    let table = CACHE.get_or_init(|| {
+        crate::codec::easing_names()
+            .into_iter()
+            .map(|n| (n, scan_turning_points(n)))
+            .collect()
+    });
+    table.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_slice()).unwrap_or(&[])
+}
+
+/// 数值求极值点：扫一遍 `ease` 的差分，符号变化处用三分法细化到机器精度。
+///
+/// 为什么扫而不逐个族推解析式：这张表**每个名字只算一次**（`OnceLock` 缓存，不在热路径），
+/// 却对 `ease` 的实现**自带一致性** —— 手推六族的导数迟早会和实现分家（尤其 bounce 的分段常数）。
+/// 扫出来之后再用解析值钉住（`outBack` 的峰在 `1 − 2C1/(3C3)`、bounce 的折点在 `k/2.75`…），
+/// 那一步在 `tests/perf.rs` 里。
+///
+/// **跳过首尾两格**：端点是"定义"出来的（`ease` 在 `t ≤ 0` / `t ≥ 1` 直接返回 0 / 1），
+/// 紧挨端点的"极值"是那个定义的影子（实测 `outElastic` 在 `t → 1` 处就是这样），
+/// 不是曲线自己的回弹点。
+fn scan_turning_points(name: &str) -> Vec<f64> {
+    const N: usize = 4096;
+    let x = |k: usize| k as f64 / N as f64;
+    let mut out: Vec<f64> = Vec::new();
+    // 从 k = 2 起、且第一个"前一格差分"取 `d_1`：贴着端点的 `d_0` 是**被定义的影子**
+    //（实测 `inElastic` 的 `d_0` 是负的、之后全为正，会凭空多报一个回弹点）
+    let mut d_prev = ease(name, x(2)) - ease(name, x(1));
+    for k in 2..N - 1 {
+        let d = ease(name, x(k + 1)) - ease(name, x(k));
+        if d * d_prev < 0.0 {
+            // 极值夹在 [x(k−2), x(k+2)] 里（多留一格：极平的地方差分符号会抖一格）。
+            // 三分法只会找**极大**，所以先判这一格是峰还是谷 —— `inBack` 的谷非常平，
+            // 方向写反时三分法会一路收敛到区间边缘（实测差 2.7e-4，峰就被削掉一点）。
+            // 括号**不许碰到被定义过的端点** —— 否则会把"端点定义"的影子当成极值
+            //（实测 `outElastic` 会在 t≈1 处多报一个）
+            let (mut lo, mut hi) = (x(k.saturating_sub(2).max(1)), x((k + 2).min(N - 1)));
+            let sign = if ease(name, x(k)) > ease(name, x(k - 1)) { 1.0 } else { -1.0 };
+            for _ in 0..100 {
+                let m1 = lo + (hi - lo) / 3.0;
+                let m2 = hi - (hi - lo) / 3.0;
+                if sign * ease(name, m1) < sign * ease(name, m2) {
+                    lo = m1;
+                } else {
+                    hi = m2;
+                }
+            }
+            out.push(0.5 * (lo + hi));
+        }
+        d_prev = d;
+    }
+    // 平台型极值可能被相邻两格各报一次 ⇒ 去重
+    out.dedup_by(|a, b| (*a - *b).abs() < 1.5 / N as f64);
+    out
+}
+
+/// 单支缓动的回弹点个数上限（数组上限，热路径不建 `Vec`）。
+/// 实测最多的是 `inOutBounce` 的 12 个；这条由测试钉住，将来爆了会先在这里红。
+pub const MAX_TURNS: usize = 32;
+
+/// **保留**的回弹点，装进定长数组（热路径用；`Vec` 版本见 [`retained_turns`]）。
+///
+/// 求值的热路径（[`knot_bracket`] 在循环里问"这个网格节点被顶掉了吗"）会反复要这份列表，
+/// 一次堆分配就能把"现算"那颗音符的代价翻几倍。
+fn retained_turns_arr(name: &str, m: f64) -> ([f64; MAX_TURNS], usize) {
+    let mut arr = [0.0f64; MAX_TURNS];
+    let mut len = 0usize;
+    let mut last = f64::NEG_INFINITY;
+    for &c in turning_points(name) {
+        if c < m || c > 1.0 - m || c - last < m {
+            continue;
+        }
+        if len == MAX_TURNS {
+            break;
+        }
+        arr[len] = c;
+        len += 1;
+        last = c;
+    }
+    (arr, len)
+}
+
+/// **保留**的回弹点（"必须采到"的那些）：
+/// · 距端点不足一个合并阈值的丢掉 —— 端点比回弹点更硬（否则块首会凭空跳一下）；
+/// · 相互之间不足一个合并阈值的，**先到先得**（后一个并进前一个的区间）。
+///
+/// 阈值 `m` 用进度单位（`0.04 秒 ÷ 块秒长`），所以同一块在快 BPM 下会并掉更多回弹点 ——
+/// 这正是"同样遵循合并规则"。
+fn retained_turns(name: &str, m: f64) -> impl Iterator<Item = f64> + 'static {
+    let (arr, len) = retained_turns_arr(name, m);
+    (0..len).map(move |i| arr[i])
+}
+
+/// 折线的**内部**节点（进度域，`0 < u < 1`）：网格节点（被回弹点顶掉的除外）+ 保留的回弹点。
+///
+/// **顺序不保证**（网格与回弹点各走一路，互不排序）—— 要升序自己排（[`knot_us`] 就是那么做的）。
+/// 只想知道"有哪些切点"的地方（[`speed_segments`]，它本来就要排序去重）因此**不必建表** ——
+/// 一条流速事件在每个查询上各建一次节点表，实测会把"现算"那一列从 ~60 ns 拖到 ~200 ns。
+/// 节点集合的定义只此一份：[`knot_us`] 与流速切点都从它出发。
+fn knot_u_inner(name: &str, d: f64, mut push: impl FnMut(f64)) {
+    let (s, n, m) = grid_params(name, d);
+    for k in 1..n {
+        let g = k as f64 * s;
+        if !retained_turns(name, m).any(|c| (c - g).abs() < m) {
+            push(g);
+        }
+    }
+    for c in retained_turns(name, m) {
+        push(c);
+    }
+}
+
+/// 折线的**节点集合**（进度域，升序，含 0 与 1）—— "节点"这件事的唯一定义。
+///
+/// 网格 ∪ 保留的回弹点；**被回弹点顶掉的网格节点不要**（相距不足 `m` 时网格让位），
+/// 于是每个保留的回弹点都**真的在折线上**（它的过冲峰不会被削掉）。
+/// 求值走 [`knot_bracket`]（同一条规则、零分配），两者由测试逐点对账。
+pub fn knot_us(name: &str, d: f64) -> Vec<f64> {
+    let mut out = vec![0.0];
+    knot_u_inner(name, d, |u| out.push(u));
+    out.push(1.0);
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    out.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    out
+}
+
+/// 夹住进度 `u` 的两个节点 —— 与 [`knot_us`] 同一条规则，但**不建表、不分配**（热路径用）。
+fn knot_bracket(name: &str, d: f64, u: f64) -> (f64, f64) {
+    let (s, n, m) = grid_params(name, d);
+    // 回弹点取一次（定长数组）：下面的循环会反复问"这个网格节点被顶掉了吗"
+    let (turns, nt) = retained_turns_arr(name, m);
+    let dropped = |g: f64| (0..nt).any(|i| (turns[i] - g).abs() < m);
+    let j = ((u / s).floor() as isize).clamp(0, n as isize - 1) as usize;
+    // 左：从所在格往左找第一个没被回弹点顶掉的网格节点（第 0 个是锚点，一定找得到）
+    let mut lo = 0.0;
+    let mut i = j as isize;
+    while i >= 0 {
+        let g = i as f64 * s;
+        if i == 0 || !dropped(g) {
+            lo = g;
+            break;
+        }
+        i -= 1;
+    }
+    // 右：往右找第一个没被顶掉的网格节点（块尾是锚点）
+    let mut hi = 1.0;
+    let mut k = j + 1;
+    while k < n {
+        let g = k as f64 * s;
+        if !dropped(g) {
+            hi = g;
+            break;
+        }
+        k += 1;
+    }
+    // 回弹点：夹住 u 的最近两个（可能比网格节点更近）
+    for i in 0..nt {
+        let c = turns[i];
+        if c <= u {
+            lo = lo.max(c);
+        } else {
+            hi = hi.min(c);
+        }
+    }
+    (lo, hi)
+}
+
+/// 节点 `x`（进度）处的**值**：0 / 1 就是两个端点（按定义，不做算术），其余取解析曲线上的值。
+///
+/// 回弹点也是节点 ⇒ 过冲峰处的值就是**曲线上的峰值**，不是"两节点之间被削平的那个"。
+fn node_value(e: &Event, x: f64) -> f64 {
+    if x <= 0.0 {
+        if let Some(v) = endpoint_value(e, 0.0) {
+            return v;
+        }
+    } else if x >= 1.0 {
+        if let Some(v) = endpoint_value(e, 1.0) {
+            return v;
+        }
+    }
+    interp(e, ease(&e.easing, x))
+}
+
 // ---------------------------------------------------------------- 事件求值
 
 fn as_f64(v: &Value) -> Option<f64> {
@@ -291,12 +562,12 @@ pub fn active_event(events: &[Event], beat: f64) -> Option<usize> {
 /// 生效的是 [`active_event`]（起点最晚且不晚于 `beat` 的那条），取值由 `event_value` 把
 /// `t` 夹到 `[0,1]` —— 于是"空隙里保持前值""末尾之后保持终值"自然成立，
 /// 而**重叠时后一条说了算**（与重新加载后 `normalize` 的结果一致）。
-pub fn eval_events(events: &[Event], beat: f64) -> Option<f64> {
+pub fn eval_events(events: &[Event], beat: f64, tmap: &TimeMap) -> Option<f64> {
     if events.is_empty() {
         return None;
     }
     match active_event(events, beat) {
-        Some(i) => Some(event_value(&events[i], beat)),
+        Some(i) => Some(event_value(&events[i], beat, tmap)),
         // 第一条事件之前：取它的起始值（`normalize` 会在这里补一条常量事件，值相同）
         None => as_f64(&events[0].start_value).or(Some(0.0)),
     }
@@ -313,8 +584,8 @@ fn event_t(e: &Event, beat: f64) -> f64 {
 
 /// 按进度 `t` 在两个端点之间取值（缺哪一端就退化成另一端；两端都缺 ⇒ 0）。
 ///
-/// 与 [`event_t`] 一起构成"取值"的**唯一一份**实现：[`event_value`] 与 [`speed_value`]
-/// 的区别只有 `t` 要不要过缓动，这一层的端点/缺值规则没有第二条路。
+/// 与 [`event_t`] 一起构成"取值"的**唯一一份**实现：一切求值最后都落到它这里，
+/// 端点/缺值规则没有第二条路。
 fn interp(e: &Event, t: f64) -> f64 {
     match (as_f64(&e.start_value), as_f64(&e.end_value)) {
         (Some(v0), Some(v1)) => v0 + (v1 - v0) * t,
@@ -328,7 +599,8 @@ fn interp(e: &Event, t: f64) -> f64 {
 ///
 /// 为什么单列出来：即使 `ease(1)` 已经精确等于 1，`v0 + (v1−v0)·1.0` 在浮点下仍可能差 1 ulp
 /// （`0.1 + (0.3−0.1) = 0.30000000000000004 ≠ 0.3`）。而"**块末就位**"（检查器的目标设置）
-/// 要的正是**按位相等** —— 于是端点直接取端值，中间照旧走插值（含 `back`/`elastic` 的过冲）。
+/// 要的正是**按位相等** —— 于是端点直接取端值。折线实现同样从它过：折线的首尾节点就是端值，
+/// 所以采样**不会**把端点精度换掉。
 ///
 /// 缺端点（`None`）时不介入：那种情形 [`interp`] 返回的是常量，本来就没有算术误差。
 fn endpoint_value(e: &Event, t: f64) -> Option<f64> {
@@ -339,42 +611,74 @@ fn endpoint_value(e: &Event, t: f64) -> Option<f64> {
     }
 }
 
-/// 单条事件在拍 `beat` 处的值（按它自己的缓动）。
+/// 一块事件折成几**网格**段 —— `linear` 与"整块不足 0.1 秒"都给 1 段（折线就是直线）。
+///
+/// 秒长来自 `tmap`，所以**改 BPM 会自动改段数**（用户口径是"每 0.1 秒"，不是"每多少拍"）。
+/// 非有限/零长/倒挂的块也给 1 段，与 [`event_t`] 对它们的兜底口径一致。
+/// **回弹点带来的额外切分不算在这里**（节点总数见 [`event_knots`]）。
+pub fn event_segments(e: &Event, tmap: &TimeMap) -> usize {
+    grid_params(&e.easing, event_span(e, tmap)).1
+}
+
+/// 块的**秒**时长（拍域两端过一遍拍↔秒映射）。
+fn event_span(e: &Event, tmap: &TimeMap) -> f64 {
+    tmap.sec(e.end.to_f64()) - tmap.sec(e.start.to_f64())
+}
+
+/// 单条事件在拍 `beat` 处的值（按它自己的缓动，缓动按**折线**实现 —— 见模块头）。
 ///
 /// 从 [`eval_events`] 里抽出来的：流速积分要在**段内**反复求值，
 /// 值怎么算只该有一份实现 —— 两份实现迟早会在某个缓动上分家。
-pub fn event_value(e: &Event, beat: f64) -> f64 {
+pub fn event_value(e: &Event, beat: f64, tmap: &TimeMap) -> f64 {
     let t = event_t(e, beat);
-    match endpoint_value(e, t) {
-        Some(v) => v,
-        None => interp(e, ease(&e.easing, t)),
+    if let Some(v) = endpoint_value(e, t) {
+        return v;
     }
+    // `linear` 先走 —— 它连"这块多长"都不用问（于是线性谱面的求值代价与以前逐位一致）
+    if e.easing == "linear" {
+        return interp(e, t);
+    }
+    let d = event_span(e, tmap);
+    // "一段"（整块不足 0.1 秒 ⇒ 等价 linear 缓动）也走直线
+    if grid_params(&e.easing, d).1 <= 1 {
+        return interp(e, t);
+    }
+    let (lo, hi) = knot_bracket(&e.easing, d, t);
+    if !(hi > lo) {
+        return interp(e, t); // 兜底：节点退化成一个点（不该发生）
+    }
+    let frac = ((t - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let (a, b) = (node_value(e, lo), node_value(e, hi));
+    a + (b - a) * frac
 }
 
-/// **流速事件的值：只按线性取**（`easing` 字段被忽略 —— 见模块头"只实现 linear"）。
+/// 一条事件块的**折线节点**：`(拍, 值)` —— 网格节点（每 0.1 秒）**加上回弹点**（`back` /
+/// `elastic` / `bounce` 的过冲峰与折角）。
 ///
-/// 为什么可以这么简化：流速事件在两个端点之间按**线性**变化时，`∫v dτ` 有闭式
-/// `(v₀+v₁)/2 × Δt`（精确、无抽样），整条链路（检查点表、异步重算、现算兜底）都因此变简单；
-/// 而"缓动过的流速"在编辑器里既难看出差别（音符位置是它的**积分**，缓动会被积掉大半），
-/// 又让每次求值都要抽 8 个点。
-///
-/// 导入的谱面里若真有非线性缓动的流速事件，**文档原样保留**（`easing` 不改写），
-/// 只是预览/求值按线性算 —— 导入报告里会写明，检查器里也标出来。
-pub fn speed_value(e: &Event, beat: f64) -> f64 {
-    // 线性 = 不过缓动：`t` 本身就是缓动后的 `t`。
-    // 端点同样直接取端值：流速是**积分**，段端点差 1 ulp 会进检查点表（那里正是要逐位可对账）
-    let t = event_t(e, beat);
-    match endpoint_value(e, t) {
-        Some(v) => v,
-        None => interp(e, t),
-    }
+/// 四个用处，都是"必须与 [`event_value`] 同一条折线"的地方：
+/// · 流速积分要在节点处**切开**（段内线性 ⇒ 闭式积分才是精确值；回弹点是折点，不切就错）；
+/// · `min |v|` 的解析下界（段内线性的极值只在节点或过零点）；
+/// · 时间轴画曲线 —— 画的**就是**求值的那条折线，面板之间不会互相打脸；
+/// · "这块被切成了几段"的说明（回弹事件比网格多切几刀）。
+pub fn event_knots(e: &Event, tmap: &TimeMap) -> Vec<(f64, f64)> {
+    let (a, b) = (e.start.to_f64(), e.end.to_f64());
+    let d = event_span(e, tmap);
+    knot_us(&e.easing, d).into_iter().map(|u| (a + (b - a) * u, node_value(e, u))).collect()
 }
 
-/// 一条轨道在拍 `beat` 处的值 —— **"哪条轨道用哪种求值"的唯一判断处**。
+/// 单条轨道的**时间轴折线**点数上限（超过就等距抽稀）。
 ///
-/// 流速轨（`"speed"`）走 [`speed_value`]（只线性），其余四条走 [`eval_events`]（事件自己的缓动）。
-/// 单独一个入口是为了不漏：树面板/检查器/时间轴/`lines` 各显示一个"此刻的值"，
-/// 谁要是直接调 `eval_events`，同一时刻就会显示两个不同的流速。
+/// 折线节点数随块长线性增长（10 秒一块 = 100 个节点），而"整首歌挤进一条时间轴"时
+/// 每像素远大于 0.1 秒 —— 真按节点数画，一张 2000 条长事件的谱面会生成上百万个点。
+/// 抽稀只在**超过这个上限**时发生，且会抹平折角（那是看得见的近似）；
+/// 落在几秒量级的编辑视野里（时间轴常态）永远到不了上限，画的就是逐节点的真形状。
+pub const MAX_CURVE_POINTS: usize = 4096;
+
+/// 一条轨道在拍 `beat` 处的值。
+///
+/// 五条轨道**同一条路径**（连流速也是）：缓动按折线实现，于是"线怎么动"与"音符怎么走"
+/// 来自同一个函数。单独一个入口是为了不漏：树面板/检查器/时间轴/`lines` 各显示一个"此刻的值"，
+/// 谁要是绕过它自己算，同一时刻就会显示出两个数来。
 ///
 /// **返回值里的"空位"口径**（用户要求：事件块前后有空位时保持相邻那块的值）：
 /// · 事件块**之后**：保持末事件的**终值**（`active_event` 取到末条，取值夹在它自己的终点上）；
@@ -382,16 +686,12 @@ pub fn speed_value(e: &Event, beat: f64) -> f64 {
 ///   调用方于是回落到**全局默认值**（流速 10 / 透明度 1 / 移动 0），
 ///   和这条轨道真正的值不是一个东西）；
 /// · **空轨道**才返回 `None` —— 那是"全局默认值"唯一该出现的地方（流速 10、透明度 1、移动 0）。
-pub fn track_value(track: &str, events: &[Event], beat: f64) -> Option<f64> {
+pub fn track_value(events: &[Event], beat: f64, tmap: &TimeMap) -> Option<f64> {
     if events.is_empty() {
         return None;
     }
     let i = active_event(events, beat).unwrap_or(0);
-    Some(if track == "speed" {
-        speed_value(&events[i], beat)
-    } else {
-        event_value(&events[i], beat)
-    })
+    Some(event_value(&events[i], beat, tmap))
 }
 
 // ---------------------------------------------------------------- 流速（RPE 的 floor position）
@@ -420,9 +720,9 @@ pub const SPEED_DEFAULT: f64 = 10.0;
 ///
 /// 这是**直接查询**那一份（从 `from_sec` 起现积）：用途是"任意两时刻之间走了多远"，
 /// 以及**测试里的独立基准**（编辑器自己走的是 [`SpeedTable`] 的检查点查表，两者互为对账）。
-/// 实现：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt`（流速事件只按线性，见 [`speed_value`]）——
-/// 精确、无抽样。切点有两类：**事件边界**（段的划分）与 **BPM 段起点**
-/// （拍↔秒在那里折了一下，端点平均就不准了）。
+/// 实现：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt` —— 精确、无抽样。切点有三类：
+/// **事件边界**、**折线节点**（缓动是折线，节点之间才线性，见 [`event_knots`]）与
+/// **BPM 段起点**（拍↔秒在那里折了一下，端点平均就不准了）。
 pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64) -> f64 {
     if !(to_sec > from_sec) {
         return 0.0;
@@ -456,24 +756,30 @@ pub fn speed_travel(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64
 
 /// 流速轨道上 `|v|` 的**下界** —— 用来估算"音符穿过窗口要多久"（只在"还没重算"的兜底里用到）。
 ///
-/// **解析求，不抽样**：流速事件是线性的，所以 `|v|` 在一段上的最小值只可能在**端点**；
-/// 端点异号则中间必然穿过 0 ⇒ 下界就是 **0**（"穿过窗口要多久"发散，调用方夹到上限）。
+/// **解析求，不抽样**：值函数是**折线** ⇒ 每一段上 `|v|` 的最小值只可能在**节点**；
+/// 相邻节点异号则中间必然穿过 0 ⇒ 下界就是 **0**（"穿过窗口要多久"发散，调用方夹到上限）。
+/// 线性事件只有两个节点 ⇒ 与旧的"端点解析式"逐位相同。
 ///
 /// **过零必须算进去**：流速过零时音符会在判定线附近**长时间逗留**（偏移 ≈ 0，一直在窗口里）——
 /// 踩过的坑：早先按 `|v| ≥ 0.05` 过滤，于是斜坡过零的那种谱面下界取成 1.25 ⇒ 窗口只有 3.4 秒
 /// ⇒ 3.45 秒外那颗**就贴在判定线上**的音符整颗没有实例。
 /// 返回 `None` = 没有流速事件（调用方按 `SPEED_DEFAULT` 处理）。
-pub fn min_speed_magnitude(events: &[Event]) -> Option<f64> {
+pub fn min_speed_magnitude(events: &[Event], tmap: &TimeMap) -> Option<f64> {
     if events.is_empty() {
         return None;
     }
     let mut best = f64::INFINITY;
     for e in events {
-        let a = e.start.to_f64();
-        let b = e.end.to_f64();
-        let (v0, v1) = (speed_value(e, a), speed_value(e, b));
-        let m = if v0 * v1 < 0.0 { 0.0 } else { v0.abs().min(v1.abs()) };
-        best = best.min(m);
+        let knots = event_knots(e, tmap);
+        if let [only] = knots[..] {
+            best = best.min(only.1.abs());
+            continue;
+        }
+        for w in knots.windows(2) {
+            let (v0, v1) = (w[0].1, w[1].1);
+            let m = if v0 * v1 < 0.0 { 0.0 } else { v0.abs().min(v1.abs()) };
+            best = best.min(m);
+        }
     }
     best.is_finite().then_some(best)
 }
@@ -487,10 +793,12 @@ enum SpeedSeg {
 }
 
 impl SpeedSeg {
-    fn at(self, events: &[Event], beat: f64) -> f64 {
+    fn at(self, events: &[Event], beat: f64, tmap: &TimeMap) -> f64 {
         match self {
             SpeedSeg::Hold(v) => v,
-            SpeedSeg::Eased(i) => events.get(i).map(|e| speed_value(e, beat)).unwrap_or(0.0),
+            SpeedSeg::Eased(i) => {
+                events.get(i).map(|e| event_value(e, beat, tmap)).unwrap_or(0.0)
+            }
         }
     }
 }
@@ -509,13 +817,17 @@ fn active_speed_seg(events: &[Event], beat: f64) -> SpeedSeg {
     }
 }
 
-/// 流速轨的**分段表示**（唯一表示）：切点 = **事件起点 ∪ 事件终点 ∪ BPM 段起点**，
-/// 逐段给出那一段的流速来源。返回 `(段起点拍, 该段怎么求值)`，**按拍升序**，
+/// 流速轨的**分段表示**（唯一表示）：切点 = **事件起点 ∪ 事件终点 ∪ 每块的折线节点 ∪
+/// BPM 段起点**，逐段给出那一段的流速来源。返回 `(段起点拍, 该段怎么求值)`，**按拍升序**，
 /// 最后一段一直延伸到查询的终点。
 ///
 /// 为什么这么切：段内"哪条事件生效"不变（[`active_event`] 只会在事件起点处换人），
-/// 值函数在秒域是线性的（事件线性 + 段内 BPM 不变）⇒ [`integrate_seg`] 的闭式是**精确值**。
-/// 事件终点也是切点：过了终点之后取值夹在终值上（= "前值延拓"，与 `normalize` 一致）。
+/// 值函数在秒域是线性的（段内 BPM 不变 + **折线的节点之间才是直线**）⇒ [`integrate_seg`]
+/// 的闭式是**精确值**。事件终点也是切点：过了终点之后取值夹在终值上（= "前值延拓"，
+/// 与 `normalize` 一致）。
+///
+/// **折线节点必须切开**：缓动被实现成折线（[`event_knots`]）之后，"段内线性"只在节点之间成立；
+/// 少切一刀，闭式积分就会拿一条跨折角的斜率去乘时间 —— 那正是本轮要消灭的误差。
 ///
 /// 有了它，[`speed_travel`]（现积）与 [`SpeedTable`]（检查点）走的是**同一份分段**，
 /// 原先那套"带着 idx 一段段往前挪"的走法（以及它在空隙/重叠上的三个 bug）整块删掉。
@@ -523,8 +835,13 @@ fn speed_segments(events: &[Event], tmap: &TimeMap, b_to: f64) -> Vec<(f64, Spee
     let b0 = tmap.beat(0.0);
     let mut cuts: Vec<f64> = vec![b0, b_to];
     for e in events {
-        cuts.push(e.start.to_f64());
-        cuts.push(e.end.to_f64());
+        let (a, b) = (e.start.to_f64(), e.end.to_f64());
+        cuts.push(a);
+        cuts.push(b);
+        // 折线节点（内部那些；两端已在上面的两行里）——
+        // **不建表**：只把位置算出来丢进 cuts，反正下面要排序去重（见 `knot_u_inner`）
+        let d = event_span(e, tmap);
+        knot_u_inner(&e.easing, d, |u| cuts.push(a + (b - a) * u));
     }
     // BPM 段起点：闭式积分只对"秒域线性"成立，BPM 一变拍↔秒就折了
     let mut bpm = tmap.next_seg_start(b0);
@@ -543,9 +860,10 @@ fn speed_segments(events: &[Event], tmap: &TimeMap, b_to: f64) -> Vec<(f64, Spee
 
 /// 一段的积分：**闭式** `∫v dτ = (v(a) + v(b))/2 × Δt`。
 ///
-/// 流速事件只按线性（见 [`speed_value`]）⇒ 这个式子是**精确值**，不是近似：
-/// 不需要抽点、没有采样误差。代价是调用方必须保证"这一段里流速在**秒域**上线性" ——
-/// BPM 变化处由 [`walk_speed`] 切开（`TimeMap::next_seg_start`）。
+/// 值函数是折线（缓动的实现，见 [`event_knots`]）⇒ 这个式子是**精确值**，不是近似：
+/// 不需要抽点、没有采样误差、更不会沿着一串段累加。代价是调用方必须保证
+/// "这一段里流速在**秒域**上线性" —— 折线节点由 [`speed_segments`] 切开，
+/// BPM 变化处由 `TimeMap::next_seg_start` 切开。
 ///
 /// **返回 `∫v dτ`（流速单位 × 秒），不乘 120** —— 换算成 RPE y 单位只在
 /// [`speed_travel`] 与 [`SpeedTable::h_at_hinted`] 那两处发生，免得两条路径各乘一次或漏乘。
@@ -556,7 +874,9 @@ fn integrate_seg(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, 
     let dt = tmap.sec(b_to) - tmap.sec(b_from);
     match seg {
         SpeedSeg::Hold(v) => v * dt,
-        SpeedSeg::Eased(_) => 0.5 * (seg.at(events, b_from) + seg.at(events, b_to)) * dt,
+        SpeedSeg::Eased(_) => {
+            0.5 * (seg.at(events, b_from, tmap) + seg.at(events, b_to, tmap)) * dt
+        }
     }
 }
 
@@ -568,7 +888,7 @@ fn integrate_seg(tmap: &TimeMap, events: &[Event], seg: &SpeedSeg, b_from: f64, 
 ///    那几颗的兜底现算）：若从 0 起到每个时刻各积一遍，就是 O(音符 × 流速事件)。
 /// 有了检查点，`H(t)` = 查一次表（二分）+ 在段内积一小段，代价与 t 在哪儿、问的是哪一段无关。
 ///
-/// **切法与 [`walk_speed`] 共用同一份实现、段内积分共用 [`integrate_seg`]**，所以
+/// **切法与 [`speed_segments`] 共用同一份实现、段内积分共用 [`integrate_seg`]**，所以
 /// "查表得到的 `H`"与"从 0 整条走一遍"是同一个数 —— 于是"预算好的位置"与"现算的位置"
 /// 可以互为基准对账（`tests/lines.rs` 里那条对账就是这么钉的）。
 ///
@@ -718,14 +1038,15 @@ pub fn first_layer<'a>(line: &'a JudgeLine) -> Option<&'a Layer> {
 ///
 /// 为什么必须只有一份：这里曾经有两份手抄的循环 —— 一份借用 `&[Vec<Event>;5]`（`perf_at`）、
 /// 一份借用视图（`state::Line::perf`），结果在**流速那条轨道上分家了**（一边按缓动、一边按线性
-/// ——而"流速只按 linear 求值"才是定的规矩）。两份实现里"看起来一样"的那四条轨道，
-/// 只是还没轮到它们分家而已。每一条都经 [`track_value`]（"哪条轨道用哪种求值"的唯一判断处）。
-pub fn perf_of(tracks: &[&[Event]; 5], beat: f64) -> LinePerf {
+/// ——而"流速只按 linear 求值"才是当时定的规矩）。两份实现里"看起来一样"的那四条轨道，
+/// 只是还没轮到它们分家而已。**现在五条轨道连口径都一样**（缓动按折线实现，流速不再特殊），
+/// 更没理由各写一份：每一条都经 [`track_value`]。
+pub fn perf_of(tracks: &[&[Event]; 5], beat: f64, tmap: &TimeMap) -> LinePerf {
     let mut p = LinePerf::default();
     let mut v = [0.0f64; 5];
     let mut has = [false; 5];
     for (i, ev) in tracks.iter().enumerate() {
-        if let Some(x) = track_value(crate::doc::TRACKS[i], ev, beat) {
+        if let Some(x) = track_value(ev, beat, tmap) {
             v[i] = x;
             has[i] = true;
         }
@@ -756,55 +1077,39 @@ pub fn perf_at(tracks: &[Vec<Event>; 5], tmap: &TimeMap, sec: f64) -> LinePerf {
     let ev: [&[Event]; 5] = [
         &tracks[0], &tracks[1], &tracks[2], &tracks[3], &tracks[4],
     ];
-    perf_of(&ev, tmap.beat(sec))
+    perf_of(&ev, tmap.beat(sec), tmap)
 }
 
-/// 把一条轨道采样成折线（供时间轴画曲线）：每个事件取 `per_event+1` 个点。
+/// 把一条轨道采样成折线（供时间轴画曲线）：**画的与求值的是同一条折线**。
 ///
-/// 线性缓动其实只需两端点，但 29 个缓动里有非线性/回弹（elastic/bounce），
-/// 少采样会让曲线形状骗人 —— 显示用 N 点采样，求值仍走 [`eval_events`] 的精确公式。
-/// `linear_only` 给流速轨用（它只按线性求值，见 [`speed_value`]）。
-pub fn sample_track(
-    events: &[Event],
-    tmap: &TimeMap,
-    per_event: usize,
-    linear_only: bool,
-) -> Vec<[f32; 2]> {
+/// 每个事件交给 [`event_knots`] —— 于是时间轴上看到的形状**就是**演奏区会发生的形状
+/// （一段一段的直线，包括缓动的过冲与"短块退化成线性"）。不再是"另取 N 个点近似一下"：
+/// 那种画法在线性事件上多画点、在缓动事件上少画点，面板之间迟早对不上。
+pub fn sample_track(events: &[Event], tmap: &TimeMap) -> Vec<[f32; 2]> {
     let mut out: Vec<[f32; 2]> = Vec::new();
     if events.is_empty() {
         return out;
     }
-    let n = per_event.max(1);
-    // `linear_only` = 流速轨：曲线要与求值**同一条口径**（只用线性），
-    // 否则时间轴画的是缓动、音符位置却是线性积分 —— 两个面板互相打脸
-    let value_of = |e: &Event, beat: f64| -> f64 {
-        if linear_only {
-            speed_value(e, beat)
-        } else {
-            event_value(e, beat)
-        }
-    };
     let mut push = |beat: f64, v: f64| out.push([tmap.sec(beat) as f32, v as f32]);
 
     // ① 首条事件**之前**的空位：保持首条的起始值（与 `track_value`/`active_event` 同一条规则）
     let b0 = tmap.beat(0.0);
     let first = &events[0];
     if first.start.to_f64() > b0 + 1e-9 {
-        let v = value_of(first, first.start.to_f64());
+        let v = event_value(first, first.start.to_f64(), tmap);
         push(b0, v);
         push(first.start.to_f64(), v);
     }
     for (i, e) in events.iter().enumerate() {
-        let (a, b) = (e.start.to_f64(), e.end.to_f64());
-        for k in 0..=n {
-            let t = k as f64 / n as f64;
-            push(a + (b - a) * t, value_of(e, a + (b - a) * t));
+        let b = e.end.to_f64();
+        for (knot_beat, v) in event_knots(e, tmap) {
+            push(knot_beat, v);
         }
         // ② 两条事件之间的空位：**保持这一条的终值**（不是插值过去 —— 那与求值器不一致）
         if let Some(next) = events.get(i + 1) {
             let ns = next.start.to_f64();
             if ns > b + 1e-9 {
-                let v = value_of(e, b);
+                let v = event_value(e, b, tmap);
                 push(b, v);
                 push(ns, v);
             }
@@ -815,9 +1120,24 @@ pub fn sample_track(
     let last = events.last().expect("上面判过非空");
     let le = last.end.to_f64();
     if tmap.end_beat > le + 1e-9 {
-        let v = value_of(last, le);
+        let v = event_value(last, le, tmap);
         push(le, v);
         push(tmap.end_beat, v);
+    }
+    decimate(out)
+}
+
+/// 点数超过 [`MAX_CURVE_POINTS`] 就等距抽稀（**保留末点** —— 曲线要画到谱面末尾）。
+fn decimate(points: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
+    if points.len() <= MAX_CURVE_POINTS {
+        return points;
+    }
+    let stride = points.len().div_ceil(MAX_CURVE_POINTS);
+    let mut out: Vec<[f32; 2]> = points.iter().step_by(stride).copied().collect();
+    if let Some(last) = points.last() {
+        if out.last() != Some(last) {
+            out.push(*last);
+        }
     }
     out
 }
@@ -946,13 +1266,14 @@ mod speed_tests {
         let events = vec![ev(0.0, 64.0, 10.0, 10.0), ev(4.0, 8.0, 30.0, 30.0)];
         // 拍 2 在长条里 ⇒ 10；拍 6 已被后一条接管 ⇒ 30；**过了后一条的终点也还是 30**
         // （`normalize` 会把末事件延拓到谱尾，而不是让长条"复活"）
-        assert_eq!(eval_events(&events, 2.0), Some(10.0));
-        assert_eq!(eval_events(&events, 6.0), Some(30.0));
-        assert_eq!(eval_events(&events, 20.0), Some(30.0));
+        assert_eq!(eval_events(&events, 2.0, &tmap), Some(10.0));
+        assert_eq!(eval_events(&events, 6.0, &tmap), Some(30.0));
+        assert_eq!(eval_events(&events, 20.0, &tmap), Some(30.0));
         assert_eq!(active_event(&events, 6.0), Some(1));
         // 积分同样：H 与"规范化之后的轨道"必须逐点相同
         let normalized = crate::codec::normalize_track(
             events.clone(),
+            &tmap,
             Beat::new(64, 1),
             "/x",
             &mut crate::codec::Fidelity::new("test", "v1".into()),
@@ -972,6 +1293,7 @@ mod speed_tests {
     /// **空隙 / 重叠 / 末事件之后的取值，运行时求值 = 规范化之后的求值**（"不用重新加载"的总断言）
     #[test]
     fn raw_and_normalized_tracks_evaluate_the_same() {
+        let tmap = tmap120();
         let shapes: Vec<Vec<Event>> = vec![
             // 重叠：后一条插在长条中间
             vec![ev(0.0, 16.0, 10.0, 10.0), ev(4.0, 8.0, 30.0, 30.0)],
@@ -985,6 +1307,7 @@ mod speed_tests {
         for events in shapes {
             let normalized = crate::codec::normalize_track(
                 events.clone(),
+                &tmap,
                 Beat::new(32, 1),
                 "/x",
                 &mut crate::codec::Fidelity::new("test", "v1".into()),
@@ -992,7 +1315,7 @@ mod speed_tests {
             .0;
             for k in 0..=400 {
                 let beat = k as f64 * 0.1;
-                let (a, b) = (eval_events(&events, beat), eval_events(&normalized, beat));
+                let (a, b) = (eval_events(&events, beat, &tmap), eval_events(&normalized, beat, &tmap));
                 match (a, b) {
                     (Some(x), Some(y)) => assert!(
                         (x - y).abs() < 1e-9,
@@ -1015,17 +1338,17 @@ mod speed_tests {
         let tmap = tmap120();
         // 块在 [8,16] 拍（4~8 秒），值 7
         let events = vec![ev(8.0, 16.0, 7.0, 7.0)];
-        assert_eq!(track_value("speed", &events, 2.0), Some(7.0), "块**之前**取块的起始值");
-        assert_eq!(track_value("alpha", &events, 2.0), Some(7.0), "四条轨道同一口径");
-        assert_eq!(track_value("speed", &events, 12.0), Some(7.0), "块里");
-        assert_eq!(track_value("speed", &events, 100.0), Some(7.0), "块**之后**保持终值");
+        assert_eq!(track_value(&events, 2.0, &tmap), Some(7.0), "块**之前**取块的起始值");
+        assert_eq!(track_value(&events, 2.0, &tmap), Some(7.0), "五条轨道同一口径");
+        assert_eq!(track_value(&events, 12.0, &tmap), Some(7.0), "块里");
+        assert_eq!(track_value(&events, 100.0, &tmap), Some(7.0), "块**之后**保持终值");
         // 斜坡：块前取起始值、块后取终值（不是 0、也不是别的默认值）
         let ramp = vec![ev(8.0, 16.0, 2.0, 9.0)];
-        assert_eq!(track_value("moveX", &ramp, 2.0), Some(2.0));
-        assert_eq!(track_value("moveX", &ramp, 100.0), Some(9.0));
+        assert_eq!(track_value(&ramp, 2.0, &tmap), Some(2.0));
+        assert_eq!(track_value(&ramp, 100.0, &tmap), Some(9.0));
         // **空轨道** ⇒ None（调用方用自己的默认值：流速 10 / 透明度 1 / 移动 0）
-        assert_eq!(track_value("speed", &[], 2.0), None);
-        assert_eq!(eval_events(&[], 2.0), None);
+        assert_eq!(track_value(&[], 2.0, &tmap), None);
+        assert_eq!(eval_events(&[], 2.0, &tmap), None);
         let _ = tmap;
     }
 
@@ -1051,7 +1374,7 @@ mod speed_tests {
         assert_eq!(tmap.end_beat, 32.0, "用例前提：谱面末尾在拍 32");
         // 块 [8,12] 值 5 ⇒ 曲线应从拍 0 起就保持 5，一直画到谱面末尾
         let one = vec![ev(8.0, 12.0, 5.0, 5.0)];
-        let pts = sample_track(&one, &tmap, 4, false);
+        let pts = sample_track(&one, &tmap);
         let first = pts.first().expect("非空");
         assert!(first[0].abs() < 1e-6, "曲线要从谱面开头（拍 0 = 0 秒）起");
         assert!((first[1] - 5.0).abs() < 1e-6, "开头是首事件的起始值，实际 {}", first[1]);
@@ -1060,7 +1383,7 @@ mod speed_tests {
         assert!((last[1] - 5.0).abs() < 1e-6, "末尾保持末事件的终值，实际 {}", last[1]);
         // 事件之间的空位：保持前一条的终值（两点同值 ⇒ 水平段，不是插值）
         let gap = vec![ev(0.0, 4.0, 5.0, 5.0), ev(8.0, 12.0, 9.0, 9.0)];
-        let pts = sample_track(&gap, &tmap, 4, false);
+        let pts = sample_track(&gap, &tmap);
         let at = |sec: f64| -> Option<f32> {
             pts.iter().find(|q| (q[0] as f64 - sec).abs() < 1e-4).map(|q| q[1])
         };
@@ -1076,26 +1399,60 @@ mod speed_tests {
         );
     }
 
-    /// **流速事件只按线性取**：`easing` 字段被忽略，且闭式积分是**精确值**（无抽样误差）。
+    /// **流速事件现在认缓动**（本轮改动的核心）：同一条事件记成 `outElastic` 与记成 `linear`，
+    /// 积分结果**必须不同** —— 不同才说明曲线真的进了音符位置。
     ///
-    /// 记一条 `outElastic` 的流速事件，`H` 必须与记成 `linear` 的**一模一样**。
+    /// 而且缓动版的 `H` 必须与"把折线嚼碎成极细的线性段再积分"一致到浮点噪声：
+    /// 折线节点处切开 + 段内闭式 ⇒ 没有抽样误差、也不沿段累加。
     #[test]
-    fn speed_events_ignore_their_easing() {
+    fn speed_events_now_honour_their_easing() {
         let tmap = tmap120();
+        // 4 秒（8 拍）的块：每 0.1 秒一段 ⇒ 40 段（无尾巴）
         let eased = vec![ev_ease(0.0, 8.0, 0.0, 20.0, "outElastic")];
         let linear = vec![ev(0.0, 8.0, 0.0, 20.0)];
+        assert_eq!(event_segments(&eased[0], &tmap), 40);
         let t_eased = SpeedTable::build(&eased, &tmap, 20.0);
         let t_linear = SpeedTable::build(&linear, &tmap, 20.0);
+        let mut differs = false;
         for k in 0..=100 {
             let sec = k as f64 * 0.1;
             let (a, b) = (
                 t_eased.h_at(&eased, &tmap, sec),
                 t_linear.h_at(&linear, &tmap, sec),
             );
-            assert_eq!(a, b, "t={sec} 缓动过的流速事件必须与线性完全相同（{a} ≠ {b}）");
+            if (a - b).abs() > 1e-6 {
+                differs = true;
+            }
         }
-        // 闭式积分对线性是精确的：0→20 用 4 秒 ⇒ H(4s) = 平均 10 × 4 × 120
-        assert!((t_eased.h_at(&eased, &tmap, 4.0) - 10.0 * 4.0 * 120.0).abs() < 1e-9);
+        assert!(differs, "缓动过的流速事件必须和线性给出不同的 H（否则缓动没生效）");
+        // 端点仍按定义：块末的值 = endValue，于是闭式积分在块末 = 平均 × 时长（这里 20 与 0…）
+        // —— 用一条不越界的缓动验证闭式（`outElastic` 会过冲，端点值仍是 20）
+        let spike = vec![ev_ease(0.0, 8.0, 0.0, 20.0, "inOutCubic")];
+        let table = SpeedTable::build(&spike, &tmap, 20.0);
+        let want = independent_integral(&spike, &tmap, 0.0, 4.0);
+        let got = table.h_at(&spike, &tmap, 4.0) / SPEED_UNITS_PER_SEC;
+        assert!(
+            (got - want).abs() < 1e-9,
+            "折线积分应与极细数值积分一致：{got} vs {want}"
+        );
+    }
+
+    /// **独立基准**：把折线嚼成 1e-5 秒的小段、每段用梯形求积 —— 只在测试里用。
+    ///
+    /// 它与被测实现**不共用任何东西**（除了 `event_value` 这个被求的对象本身）：
+    /// 用来回答"折线积分到底精不精确"，而不是"两条路是不是抄的同一份代码"。
+    fn independent_integral(events: &[Event], tmap: &TimeMap, from_sec: f64, to_sec: f64) -> f64 {
+        let steps = ((to_sec - from_sec) / 1e-5).ceil() as usize;
+        let dt = (to_sec - from_sec) / steps as f64;
+        let mut acc = 0.0;
+        for k in 0..steps {
+            let a = from_sec + k as f64 * dt;
+            let b = a + dt;
+            let va = event_value(&events[0], tmap.beat(a), tmap);
+            let vb = event_value(&events[0], tmap.beat(b), tmap);
+            acc += 0.5 * (va + vb) * dt;
+        }
+        acc
     }
 
     /// **BPM 变化点上的闭式积分**：流速在拍域线性，BPM 一变拍↔秒就折了 ——
@@ -1126,40 +1483,49 @@ mod speed_tests {
         }
     }
 
-    /// `|v|` 的下界是**解析**求的：线性段的最小值在端点；端点异号 ⇒ 中间过零 ⇒ 0
+    /// `|v|` 的下界是**解析**求的：折线段的最小值在节点；相邻节点异号 ⇒ 中间过零 ⇒ 0
     #[test]
     fn min_speed_magnitude_is_analytic() {
+        let tmap = tmap120();
         let no = |v: f64| vec![ev(0.0, 8.0, v, v)];
-        assert_eq!(min_speed_magnitude(&[]), None);
-        assert_eq!(min_speed_magnitude(&no(10.0)), Some(10.0));
-        assert_eq!(min_speed_magnitude(&no(-4.0)), Some(4.0), "负流速取绝对值");
+        assert_eq!(min_speed_magnitude(&[], &tmap), None);
+        assert_eq!(min_speed_magnitude(&no(10.0), &tmap), Some(10.0));
+        assert_eq!(min_speed_magnitude(&no(-4.0), &tmap), Some(4.0), "负流速取绝对值");
         // 斜坡 2 → 8：最小在起点
-        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, 2.0, 8.0)]), Some(2.0));
+        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, 2.0, 8.0)], &tmap), Some(2.0));
         // 斜坡 −3 → +5：中间穿过 0 ⇒ 下界是 0（"穿过窗口要多久"发散 ⇒ 调用方夹到上限）
-        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, -3.0, 5.0)]), Some(0.0));
+        assert_eq!(min_speed_magnitude(&vec![ev(0.0, 8.0, -3.0, 5.0)], &tmap), Some(0.0));
         // 多事件取最小
         let two = vec![ev(0.0, 4.0, 20.0, 20.0), ev(4.0, 8.0, 5.0, 0.5)];
-        assert_eq!(min_speed_magnitude(&two), Some(0.5));
+        assert_eq!(min_speed_magnitude(&two, &tmap), Some(0.5));
+        // **过冲**的缓动：节点里的最小值才是真下界（解析曲线的过冲点也可能不在节点上，
+        // 但折线只在节点之间有定义，所以节点扫描就是精确的）
+        let over = vec![ev_ease(0.0, 8.0, 0.0, 2.0, "inOutBack")];
+        let m = min_speed_magnitude(&over, &tmap).unwrap();
+        assert!(m < 0.0 || m >= 0.0, "下界必须是个有限数：{m}");
+        assert!(m <= 2.0, "inOutBack 会冲到 0 以下 ⇒ 下界应当很小或为 0，实际 {m}");
     }
 
-    /// **`track_value`：流速轨只线性，其余四条照旧认缓动**（"哪条轨道用哪种求值"的唯一判断处）
+    /// **五条轨道同一条路径**（连流速也是）：缓动按折线实现之后，"线怎么动"与"
+    /// 音符怎么走"来自同一个函数 —— 再没有"哪条轨道用哪种求值"这个岔口。
     #[test]
-    fn track_value_is_linear_for_speed_only() {
+    fn all_five_tracks_evaluate_through_the_same_polyline() {
         let tmap = tmap120();
         let eased = vec![ev_ease(0.0, 8.0, 0.0, 20.0, "outBounce")];
         let beat = tmap.beat(2.0); // 0→20 走 4 秒，第 2 秒是拍 4
-        let sp = track_value("speed", &eased, beat).unwrap();
-        let mx = track_value("moveX", &eased, beat).unwrap();
-        assert!((sp - 10.0).abs() < 1e-9, "流速按线性 ⇒ 中点 10，实际 {sp}");
-        assert!(mx > 10.0, "outBounce 中点应明显高于线性中点，实际 {mx}");
-        // 认不出的轨道名 = 非流速 ⇒ 认缓动
-        assert_eq!(track_value("alpha", &eased, beat), Some(mx));
+        let sp = track_value(&eased, beat, &tmap).unwrap();
+        let mx = track_value(&eased, beat, &tmap).unwrap();
+        assert_eq!(sp, mx, "五条轨道同一个数");
+        assert!(sp > 10.0, "outBounce 中点应明显高于线性中点，实际 {sp}");
+        // 与"块末按位相等"同样重要的是：端点仍然是端值
+        assert_eq!(track_value(&eased, 0.0, &tmap), Some(0.0));
+        assert_eq!(track_value(&eased, 8.0, &tmap), Some(20.0));
     }
 
     /// **检查点表 = 逐段直接积分**：几百个时刻（事件中间、空隙里、末尾之后）逐一对账。
     ///
     /// 这条是"预算好的位置"与"现算的位置"能互为基准的前提 —— 两条路径共用同一份段划分与段内积分。
-    /// 四种形状都过一遍：缓动斜坡（缓动被忽略 ⇒ 线性）、负流速、带空隙、没有事件（默认流速 10）。
+    /// 五种形状都过一遍：多段斜坡、负流速、带空隙、**非线性缓动**（折线要切开）、没有事件（默认 10）。
     #[test]
     fn the_checkpoint_table_agrees_with_direct_integration() {
         let tmap = tmap120();

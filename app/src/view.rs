@@ -235,7 +235,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         track_value: track
             .events
             .first()
-            .and_then(|_| perf::track_value(st.selected_track.key(), &track.events, st.chart.tmap.beat(st.playhead))),
+            .and_then(|_| perf::track_value(&track.events, st.chart.tmap.beat(st.playhead), &st.chart.tmap)),
         event,
         note,
     })

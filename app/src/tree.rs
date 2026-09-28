@@ -82,8 +82,8 @@ pub fn line_tree_ui(
             let beat = tmap.beat(playhead);
             for id in state::TrackId::ALL {
                 let t = line.track(id);
-                // 流速轨只按线性（`track_value` 是"哪条轨道用哪种求值"的唯一判断处）
-                let cur = opm_app::perf::track_value(id.key(), &t.events, beat);
+                // 五条轨道同一个口径（缓动按折线实现，含回弹点）—— 都在 `perf::track_value` 里
+                let cur = opm_app::perf::track_value(&t.events, beat, tmap);
                 let mark = if id == st.selected_track { "▶" } else { " " };
                 let text = format!(
                     "{mark}{:<6}{:>3}条 t={:<7} [{:.0},{:.0}] {}",

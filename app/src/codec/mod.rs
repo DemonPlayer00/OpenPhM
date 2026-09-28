@@ -373,6 +373,7 @@ pub struct NormalizeStats {
 /// `ptr` 是给报告用的 JSON 指针前缀（例如 `/judgeLineList[0].eventLayers[1].moveXEvents`）。
 pub fn normalize_track(
     mut events: Vec<crate::doc::Event>,
+    tmap: &crate::perf::TimeMap,
     chart_end: Beat,
     ptr: &str,
     fid: &mut Fidelity,
@@ -407,7 +408,7 @@ pub fn normalize_track(
                     // 重叠：前一条止于后一条的起点，**并把终值改成它在该点的值**
                     // （同一条斜坡在更短的跨度上重新插值会把斜率改掉）
                     st.overlaps += 1;
-                    let cut = serde_json::json!(crate::perf::event_value(&prev, ns));
+                    let cut = serde_json::json!(crate::perf::event_value(&prev, ns, tmap));
                     let trimmed = out.last_mut().expect("刚读过 last");
                     trimmed.end = e.start;
                     trimmed.end_value = cut;

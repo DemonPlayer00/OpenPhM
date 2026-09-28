@@ -609,7 +609,7 @@ pub fn track_neutral_value(track: TrackId) -> f64 {
 pub fn new_event_value(st: &EditorState, track: TrackId, beat: f64) -> f64 {
     st.selected()
         .map(|l| l.track(track))
-        .and_then(|t| perf::track_value(track.key(), &t.events, beat))
+        .and_then(|t| perf::track_value(&t.events, beat, &st.chart.tmap))
         .unwrap_or_else(|| track_neutral_value(track))
 }
 

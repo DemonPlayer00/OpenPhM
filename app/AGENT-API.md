@@ -242,14 +242,15 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"add_event","line":0,"track":"moveX","startBeat":[0,1],"endBeat":[4,1],"startValue":0,"endValue":200,"easing":"outQuad"}` | 缓动名见 `spec/easing.json` 的 29 个名字（字符串，不是编号） |
 | `{"op":"set_event","line":0,"track":"alpha","index":0,"set":{"endValue":0.5}}` | |
 | `{"op":"del_event","line":0,"track":"speed","index":0}` | |
-| `{"op":"split_event","line":0,"track":"moveX","index":0,"atBeat":[2,1]}` | 在中点按线性插值切分（有缓动时先近似，随后用 `set_event` 修正） |
+| `{"op":"split_event","line":0,"track":"moveX","index":0,"atBeat":[2,1]}` | 在中点切分：**切点上的值问求值器**（带缓动，五条轨道同一口径），所以"切一刀不改变表演"（两半各自的缓动形状会重新算） |
 | `{"op":"set_target","line":0,"atBeat":[4,1],"target":{"x":250.3,"y":-118.75,"angle":45,"alpha":0.42}}` | **块末就位**：一次给出"线在这一刻该在哪儿"，四轨（moveX/moveY/rotate/alpha）一起写、**一个撤销步**。`target` 至少给一个键；只写**真的变了**的轨道（已是该值的跳过）。要改的那一块按 `perf::active_event` 选（与求值器同一判据，重叠时也对）：块末写终值 / 块首写起值 / 块内先 `split_event` 再写两侧 / 空位写前一块的终值 / 首块之前写首块起值。返回 `{wrote, cmds, plan[], failed[]}`（`wrote` 数轨道、`cmds` 数子命令，块内那种情形一条轨道要 3 条）。**求值器端点是按定义取端值**，所以那一刻求值到的与你写下的数**按位相等** |
 | `{"op":"set_track_constant","line":0,"track":"speed","value":10}` | **一步满足轨道不变量**：清空该轨并铺一条覆盖全谱的恒定事件。**流速的默认/基准值是 10**（RPE 口径：1 单位流速 = 120 RPE y 单位/秒 ⇒ 10 = 1× = 1200 单位/秒 = 0.75 秒划过 900 高的窗口）；**整条轨道没有流速事件时预览也按 10 走** |
 
-⚠️ **流速轨只按 `linear` 求值**（音符位置是流速的积分，线性有闭式解 —— 见 README「下落速度」）。
-给 `speed` 事件写别的 `easing` **不报错、也不改写**（原样保留、导出照旧写回），
-但**预览与音符位置按线性算**；`opm-ctl --file F lines` 的 `valueAt` 与检查器显示的也是线性值。
-所以 agent 想控制音符位置时，直接改 `startValue`/`endValue`/起止拍即可，不必绕缓动。
+⚠️ **缓动是"折线"，五条轨道（含 `speed`）同一口径**：从块开头起每 0.1 秒一个节点、节点之间线性；
+**回弹类（`back`/`elastic`/`bounce`）的回弹点与折点一定落在节点上**；整块不足 0.1 秒 ⇒ 等价线性；
+相邻节点不足 0.04 秒就合并。于是 `speed` 的 `easing` **真的生效**，而 `∫v dτ` 仍是闭式精确解。
+`opm-ctl --file F lines` 的 `valueAt`、检查器、时间轴曲线都是这一条折线的值 —— 想看"这块被切成了几段"，
+用 `event_knots`（源码）/ 时间轴上的折角。
 | `{"op":"normalize"}` | 排序 / 补空隙 / 裁重叠 / 首事件回退到 ≤0 / 末事件延到谱末之后 |
 
 ⚠️ **事件索引是"图层内下标"，而 GUI 的编辑区用的是"合并视图下标"** —— 两者只有在单图层时相同。

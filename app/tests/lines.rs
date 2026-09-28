@@ -454,8 +454,8 @@ fn track_and_curve_are_cached_per_line() {
     for l in &chart.lines {
         let rot = l.track(TrackId::Rotate);
         assert_eq!(rot.events.len(), 1);
-        // 采样折线：1 个事件 ×(4+1) 点
-        assert_eq!(rot.curve.len(), 5);
+        // 采样折线 = **求值的那条折线**：一个线性事件就是两个端点（折线本来就是直线）
+        assert_eq!(rot.curve.len(), 2);
         // L1 是 45° 常量、L0 是 0° 常量 —— 逐线各查各的（别拿 L0 去比 45）
         let want = if l.name == "L1" { 45.0 } else { 0.0 };
         assert!((rot.min - want).abs() < 1e-6, "{} 的 rotate 下界应为 {want}", l.name);
