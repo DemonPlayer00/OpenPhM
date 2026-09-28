@@ -623,6 +623,27 @@ release 体积：**`opm-app.exe` 29.3 MB**（其中内嵌字 8.4 MB，见下）/
 另：Wine 收尾时**偶尔**以 SIGKILL(137) 结束（同一二进制重跑 3 次：0/0/137），stdout 完整、Linux 侧退出码 0
 —— 记一笔，不追（Wine 不是目标平台）。
 
+### Wine 上那行 `create_factory_media failed: 0x80004002` 是什么
+
+**无害，不用管**（查证全过程见《框架选型》§7.47）。一句话版：Wine 的 `dxgi.dll` 没实现
+`IDXGIFactoryMedia`，而 wgpu-hal 建 DX12 实例时会**试探性**取一次这个接口，失败时先
+`log::error!` 再被 `.ok()` 丢掉 —— 所以是"先喊一声，然后当作没有"，进程继续。
+那个接口只用于"往合成表面里画"（`SurfaceTarget::SurfaceHandle`），**我们给的是 winit 的 HWND**，
+走 `CreateSwapChainForHwnd`，压根用不到；真 Windows 8+ 上它存在，这行不会出现。
+
+三条自证：`WGPU_BACKEND=vulkan` 跑一遍 → 这行**0 次**；`WGPU_BACKEND=dx12` → 可读退出
+`dx12 found no adapters`（失败原因是没有适配器，不是这次探测）；Wine 自己的
+`warn: DxgiFactory::QueryInterface: Unknown interface query 41e7d1f2-…` 里那个 GUID
+就是 `IDXGIFactoryMedia` 的 IID。
+
+**没去屏蔽它**：那个 log target 同时也承载真正的 DXGI 失败（`create_factory4`、`CreateSwapChainForHwnd`…），
+按 target 关掉会把真故障一起吞掉。改成**只在 Wine 上**多打一行说明（判据：`C:\windows\system32\wineboot.exe`
+存在，真 Windows 没有这个文件），于是"看着像故障"的那行旁边就有了解释：
+
+```
+  图形环境          : Wine（其 dxgi 未实现 IDXGIFactoryMedia）—— 若下面出现 `create_factory_media failed: 0x80004002`，那是 wgpu 的一次**可选**探测，已被丢弃、不影响渲染
+```
+
 ## 字体：自带 CJK，不依赖系统字体
 
 `egui` 默认字体**不含 CJK 字形**，不装载就是一片豆腐块。以前这里是 `fc-match`/`fc-scan` 去系统里找字体 ——

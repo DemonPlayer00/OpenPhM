@@ -2744,3 +2744,81 @@ $ wine target/x86_64-pc-windows-gnu/release/opm-app.exe --fonts     # 默认 win
 | 平台一致性 | 各平台各找各的 | 两个平台**同一份字体** ⇒ 渲染一致 |
 | `opm-app.exe` release | 20.9 MB | **29.3 MB**（+8.4 MB 字体） |
 | `opm-ctl.exe` release | 8.5 MB | **8.5 MB**（LTO 把没人引用的字体字节剔掉了） |
+
+## 7.47 那行 `create_factory_media failed: 0x80004002` 到底是什么（2026-09-28）
+
+用户报了这么一行：
+
+```
+[2026-09-28T02:34:05Z ERROR wgpu_hal::auxil::dxgi::result] create_factory_media failed: 0x80004002
+```
+
+**结论：无害，是 Wine 的能力缺口被 wgpu 探测到的一次"先说后丢"，不是本程序的问题，真 Windows 上不会出现。**
+下面是查证链（都指到了源码行 / 可复现命令）。
+
+### 这行是谁打的
+
+`wgpu-hal` 30.0.1 建 **DX12 实例**时：
+
+```rust
+// src/dx12/instance.rs:31
+// Create IDXGIFactoryMedia
+let factory_media = lib_dxgi.create_factory_media().ok();   // ← `.ok()`：这是**可选**能力探测
+```
+
+`create_factory_media()`（`src/dx12/mod.rs:389`）做的事是 `CreateDXGIFactory1(IID_IDXGIFactoryMedia)`；
+失败时走 `into_device_result("create_factory_media")`，而那个辅助函数**第一件事就是 `log::error!`**
+（`src/auxil/dxgi/result.rs:10`），然后把错误映射成 `DeviceError::Unexpected` —— 紧接着被调用点的
+`.ok()` **丢掉**。所以：**先记一条 ERROR，再用 `.ok()` 咽掉**，进程继续。
+
+`0x80004002` = **`E_NOINTERFACE`**（"没有这个接口"）。
+
+### 为什么在 Wine 上会失败
+
+因为 **Wine 的 `dxgi.dll` 没实现 `IDXGIFactoryMedia`**。同一段日志里 Wine 自己就说了：
+
+```
+warn:  DxgiFactory::QueryInterface: Unknown interface query
+warn:  41e7d1f2-a591-4f7b-a2e5-fa9c843e1c12
+```
+
+而 `41e7d1f2-a591-4f7b-a2e5-fa9c843e1c12` **正是 `IDXGIFactoryMedia` 的 IID**
+（`windows-0.62.2`：`define_interface!(IDXGIFactoryMedia, …, 0x41e7d1f2_a591_4f7b_a2e5_fa9c843e1c12)`）。
+两条日志是同一件事的两面。
+
+### 它影响什么？——只影响一条我们从没走过的呈现路径
+
+`factory_media` 唯一的用处是 `SurfaceTarget::SurfaceHandle` 那条分支
+（`IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle`，`src/dx12/mod.rs:1556`）——
+即"往合成表面里画"（XAML 岛 / media surface handle 那类）。**我们给的是 winit 的 HWND**，
+走 `SurfaceTarget::WndHandle → CreateSwapChainForHwnd`，压根不需要这个接口。
+真 Windows 8+ 上 `IDXGIFactoryMedia` 是存在的 ⇒ **这行在真机上不会出现**。
+
+### 顺便说清：Windows 上为什么连 DX12 后端都要初始化
+
+因为 §7.44.3 定的平台契约就是"**Windows 不碰后端集合**"（保持 egui-wgpu 的默认 `PRIMARY | GL`
+= Vulkan + DX12 + GL）。探测失败只说明这台 Wine 缺接口，不影响后面的选择。
+
+### 实测（默认 wine 前缀 `~/.wine`，同一个 exe）
+
+| 跑法 | `create_factory_media` ERROR | 结果 |
+|---|---|---|
+| 默认（全后端） | **1 次** | 正常出窗；候选里只有 Vulkan×2 + GL×1（**DX12 枚举到 0 个适配器**），实际选 AMD/Vulkan |
+| `WGPU_BACKEND=vulkan` | **0 次** | 正常 —— 证明这行确实来自 DX12 那条路 |
+| `WGPU_BACKEND=dx12` | 1 次 | eframe 可读退出：`dx12 found no adapters`（exit 1）—— **失败原因是没有适配器，不是这次探测** |
+| Linux 原生 | 不适用 | 后端集合只有 Vulkan，不会有这行 |
+
+### 处理：不屏蔽，但先说明
+
+- **没有去屏蔽它**：`wgpu_hal::auxil::dxgi::result` 这个 target 同时承载着真正的 DXGI 失败
+  （`create_factory4`、`CreateSwapChainForHwnd` …），按 target 关掉会把真故障一起吞掉，得不偿失。
+- 加了一行**只在 Wine 上**出现的说明（`main.rs::under_wine()`，判据是
+  `C:\windows\system32\wineboot.exe` 存在 —— 真 Windows 上没有这个文件）：
+
+  ```
+    图形环境          : Wine（其 dxgi 未实现 IDXGIFactoryMedia）—— 若下面出现 `create_factory_media failed: 0x80004002`，那是 wgpu 的一次**可选**探测，已被丢弃、不影响渲染
+  ```
+
+  实测：Wine 下这行紧挨着那条 ERROR 出现；Linux 下 0 次（`grep -c 图形环境` = 0）。
+- 想让这行彻底消失只剩一条路：在 Wine 上只开 Vulkan（不建 DX12 实例）—— **故意不做**：
+  后端集合在 Windows 上归平台管（§7.44.3），而 Wine 不是目标平台。

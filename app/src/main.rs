@@ -60,6 +60,15 @@ fn dir_has_json(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 是不是跑在 Wine 上（**只有 Windows 目标可能为真**）。
+///
+/// 判据是 `C:\windows\system32\wineboot.exe`：每个 Wine 前缀都有它，真 Windows 上不存在这个文件。
+/// 为什么要知道：Wine 的 dxgi 缺 `IDXGIFactoryMedia`，DX12 实例创建时那次**可选**探测会在 stderr
+/// 留一行 `create_factory_media failed: 0x80004002` —— 先说一句，省得每次都被当成故障去排查（§7.47）。
+fn under_wine() -> bool {
+    cfg!(windows) && std::path::Path::new(r"C:\windows\system32\wineboot.exe").exists()
+}
+
 /// wgpu 的 `DeviceType` → `opm_app::gpu::GpuKind`（库里的策略是纯逻辑，不依赖 wgpu 类型）
 fn gpu_kind_of(t: eframe::wgpu::DeviceType) -> opm_app::gpu::GpuKind {
     use eframe::wgpu::DeviceType as T;
@@ -483,6 +492,19 @@ fn main() -> eframe::Result<()> {
     let gpu_linux = opm_app::gpu::manages_gpu(cfg!(target_os = "linux"), &|k| std::env::var(k).ok());
     if !gpu_linux {
         println!("  显卡平台          : 非 Linux：不改 ICD、不改后端集合、不装适配器选择器（用平台默认的显卡选择器）");
+    }
+    // ---- Wine：把"看着像故障"的那行日志先说清楚 ----
+    //
+    // Wine 的 `dxgi.dll` **没实现 `IDXGIFactoryMedia`**（GUID 41e7d1f2-a591-4f7b-a2e5-fa9c843e1c12），
+    // 而 wgpu-hal 建 DX12 实例时会**试探性**取一次这个接口、失败时先 `log::error!` 再被 `.ok()` 丢掉 ——
+    // 于是 stderr 上会出现一行 `create_factory_media failed: 0x80004002`（E_NOINTERFACE）。
+    // **无害**：那个接口只用于"合成表面"（`SurfaceTarget::SurfaceHandle`）那条呈现路径，我们走的是 HWND；
+    // 真 Windows 8+ 上它存在，这行根本不会出现。见《框架选型》§7.47。
+    if under_wine() {
+        println!(
+            "  图形环境          : Wine（其 dxgi 未实现 IDXGIFactoryMedia）—— 若下面出现 \
+             `create_factory_media failed: 0x80004002`，那是 wgpu 的一次**可选**探测，已被丢弃、不影响渲染"
+        );
     }
     // ---- **不打扰独显**：默认把 NVIDIA 的 Vulkan ICD 从枚举里摘掉 ----
     //
