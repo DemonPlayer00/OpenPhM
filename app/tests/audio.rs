@@ -6,10 +6,25 @@ use opm_app::audio::{decode, fill_frames, FillStatus};
 use std::io::Write;
 use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("opm-audio-test-{}-{name}", std::process::id()));
-    p
+/// 写进临时目录的测试文件 —— **用完要自己清掉**：原先只写不删，跑一次 `cargo test` 就在
+/// `/tmp` 落 2 个 wav，累积到实测 162 个（跨几十次运行）。`Drop` 里删，断言 panic 也不会漏。
+struct TmpWav(PathBuf);
+
+impl TmpWav {
+    fn new(name: &str) -> Self {
+        let mut p = std::env::temp_dir();
+        p.push(format!("opm-audio-test-{}-{name}", std::process::id()));
+        Self(p)
+    }
+    fn path(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for TmpWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// 手写一个最小 WAV（绕开"用被测代码造测试数据"的循环）
@@ -49,9 +64,9 @@ fn write_wav(path: &PathBuf, channels: u16, rate: u32, bits: u16, frames: &[Vec<
 #[test]
 fn decodes_wav_int_and_float() {
     let frames: Vec<Vec<f32>> = (0..100).map(|i| vec![(i as f32 / 100.0) * 2.0 - 1.0]).collect();
-    let p16 = tmp("pcm16.wav");
-    write_wav(&p16, 1, 48000, 16, &frames);
-    let w = decode(&p16).unwrap();
+    let p16 = TmpWav::new("pcm16.wav");
+    write_wav(p16.path(), 1, 48000, 16, &frames);
+    let w = decode(p16.path()).unwrap();
     assert_eq!((w.channels, w.rate), (1, 48000));
     assert_eq!(w.samples.len(), 100);
     for (a, b) in w.samples.iter().zip(&frames) {
@@ -59,9 +74,9 @@ fn decodes_wav_int_and_float() {
     }
 
     let stereo: Vec<Vec<f32>> = frames.iter().map(|f| vec![f[0], -f[0]]).collect();
-    let pf = tmp("f32.wav");
-    write_wav(&pf, 2, 44100, 32, &stereo);
-    let wf = decode(&pf).unwrap();
+    let pf = TmpWav::new("f32.wav");
+    write_wav(pf.path(), 2, 44100, 32, &stereo);
+    let wf = decode(pf.path()).unwrap();
     assert_eq!((wf.channels, wf.rate), (2, 44100));
     assert_eq!(wf.samples.len(), 200, "立体声 ⇒ 样本数 = 帧数 × 声道数");
     assert_eq!(wf.samples[0], -wf.samples[1], "交错顺序不能错（左右声道各自保留）");
