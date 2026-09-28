@@ -418,6 +418,31 @@ impl Journal {
         }
     }
 
+    /// 回滚**当前事务里从第 `n` 条起**的改动，返回退掉了几条（命令失败时用）。
+    ///
+    /// 为什么不用 [`Self::abort`]：`abort` 退的是**整个事务**，而事务里可能还有前面几条**成功**的
+    /// 命令 —— 一条命令失败不该把别人做的好事一起抹掉。`pending` 里的改动还没进撤销栈
+    /// （`bytes` 也没计过），所以这里只把文档退回去、把这几条丢掉。
+    pub(crate) fn rollback_since(&mut self, doc: &mut Document, n: usize) -> Result<usize, String> {
+        let mut first_err = None;
+        let mut done = 0usize;
+        while self.pending_len() > n {
+            let Some((_, list)) = self.pending.as_mut() else { break };
+            let Some(change) = list.pop() else { break };
+            if let Err(e) = change.revert(doc) {
+                // 尽力回滚：一条失败不阻止其余条，但把错误带回去（不静默）
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            done += 1;
+        }
+        match first_err {
+            Some(e) => Err(format!("回滚不完整: {e}")),
+            None => Ok(done),
+        }
+    }
+
     /// 结束当前事务；若事务内无改动则不产生撤销步
     pub fn commit(&mut self) -> Option<Change> {
         let (label, changes) = self.pending.take()?;
@@ -524,5 +549,51 @@ impl Journal {
     /// 人类可读的最近 N 条
     pub fn recent(&self, n: usize) -> Vec<String> {
         self.undo.iter().rev().take(n).map(Change::label).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::Document;
+
+    fn meta_named(name: &str) -> Meta {
+        let mut d = Document::default();
+        d.meta.name = name.to_owned();
+        d.meta
+    }
+
+    /// `rollback_since`：**只退"这条命令"写进去的**，同一事务里前面成功的命令留着。
+    ///
+    /// 这正是它与 [`Journal::abort`] 的区别：`abort` 会把整个事务都退掉（那是"用户取消"的语义），
+    /// 而"某一条命令失败"不该连累别人 —— `EditCore` 的失败分支用的就是这个。
+    #[test]
+    fn rollback_since_keeps_earlier_commands_of_the_same_transaction() {
+        let mut doc = Document::default();
+        let mut j = Journal::default();
+        j.begin("事务");
+
+        // 第一条：成功（甲）
+        let m0 = doc.meta.clone();
+        let m1 = meta_named("甲");
+        doc.meta = m1.clone();
+        j.record(Change::SetMeta { before: Box::new(m0), after: Box::new(m1.clone()) });
+
+        // 第二条：写进去了，但这条命令随后失败 ⇒ 只退它
+        let m2 = meta_named("乙");
+        doc.meta = m2.clone();
+        j.record(Change::SetMeta { before: Box::new(m1.clone()), after: Box::new(m2) });
+
+        assert_eq!(j.rollback_since(&mut doc, 1).unwrap(), 1, "退掉 1 条");
+        assert_eq!(doc.meta.name, "甲", "只退第二条，第一条留着");
+        assert_eq!(j.pending_len(), 1, "待提交里只剩第一条");
+
+        // 提交之后，撤销栈里是那条成功的第一步（回滚掉的那条从没进过栈）
+        assert!(j.commit().is_some());
+        assert_eq!(j.undo_depth(), 1);
+        assert_eq!(j.applied, 1, "回滚掉的改动不该计入 applied");
+
+        // 无可退时是 0（不是错误）
+        assert_eq!(j.rollback_since(&mut doc, 0).unwrap(), 0);
     }
 }

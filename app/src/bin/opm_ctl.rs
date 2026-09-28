@@ -428,7 +428,7 @@ fn run() -> i32 {
 /// 输入按**内容**判格式；输出格式默认取反（RPE → opm，opm → RPE）。
 /// 无论成功与否都打印保真度报告 —— "能转"不等于"没丢东西"。
 fn cmd_convert(args: &[String]) -> i32 {
-    use opm_app::codec::{self, rpe::RpeTarget};
+    use opm_app::codec;
     use opm_app::core::SaveFormat;
 
     let mut input: Option<String> = None;
@@ -506,30 +506,23 @@ fn cmd_convert(args: &[String]) -> i32 {
             }
         }
     };
-    // 目标版本档位可切换（规范 §9 要求）：RPE 目标走 rpe::save_file，opm 目标走原生序列化
-    let out_fid = match target {
-        // 单文件 RPE json 已经不再是可选形态：四种形态一律走 core 的保存路径
-        SaveFormat::Auto => match codec::rpe::save_file(
-            &doc,
-            &out_path,
-            RpeTarget { version: rpe_version, ..Default::default() },
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("convert: 写出失败: {e}");
-                return 2;
-            }
-        },
-        other => {
-            let mut core = opm_app::core::EditCore::new();
-            core.replace_doc(doc);
-            match core.save_as(&out_path, other) {
-                Ok((_, f)) => f,
-                Err(e) => {
-                    eprintln!("convert: 写出失败: {e}");
-                    return 2;
-                }
-            }
+    // **所有形态都从 `EditCore` 出去**（保存路径**单一入口**）：以前这里对"单文件 RPE json"直接调
+    // `rpe::save_file`，等于在核心之外又开了一个写盘口子 —— 于是"资源要不要装进包、文档字段要不要
+    // 规范成包内名、脏标记怎么算"这些规矩都会在那一支里被绕过。现在四种形态只有一条路。
+    let mut core = opm_app::core::EditCore::new();
+    core.replace_doc(doc);
+    if !quiet {
+        // 目标 RPE 版档位（规范 §9 要求可切换）：载入侧的默认值在这里覆盖
+        core.set_rpe_target(opm_app::codec::rpe::RpeTarget {
+            version: rpe_version,
+            ..Default::default()
+        });
+    }
+    let out_fid = match core.save_as(&out_path, target) {
+        Ok((_, f)) => f,
+        Err(e) => {
+            eprintln!("convert: 写出失败: {e}");
+            return 2;
         }
     };
     if !quiet {

@@ -320,6 +320,12 @@ impl Default for EditCore {
 }
 
 impl EditCore {
+    /// 一份**空的占位文档**：它是干净的（没有任何"会丢的东西"）。
+    ///
+    /// 为什么与 `{"op":"new"}` 不同：那条命令是**用户明确要建一份谱面**，建完就置脏；
+    /// 而这里只是"还没有文档"的占位（启动页背后那一份）。若把占位也算脏，程序刚起来点一下关窗
+    /// 就会问"要先保存吗" —— 那是在问一份用户从没碰过的空谱面。界面靠"没有保存目标"显示「尚未保存」，
+    /// 不依赖这个标记（见 `statusbar::file_mark`）。
     pub fn new() -> Self {
         Self {
             doc: Document::default(),
@@ -786,11 +792,15 @@ impl EditCore {
 
     /// 用一份现成文档替换（转换工具/测试用）。不广播：这种核心通常还没有订阅者；
     /// GUI 里换谱面请走 [`EditCore::load_into`]（那条会按全量话题广播）。
+    ///
+    /// **置脏**：换进来的文档没有任何文件对得上它（`new` 是同一条口径）——
+    /// 早先这里写的是"saved"，等于对一份从没落过盘的文档说"已保存"。
     pub fn replace_doc(&mut self, doc: Document) {
         self.doc = doc;
         self.journal = Journal::default();
+        self.last_save = None;
         self.revision += 1;
-        self.saved_revision = self.revision;
+        self.saved_revision = self.revision.wrapping_sub(1); // 脏
         self.refresh_overlaps_all(); // 整份文档被换掉，重叠缓存必须跟着换
     }
 
@@ -799,7 +809,18 @@ impl EditCore {
         &self.doc
     }
 
-    /// 有未保存改动吗（保守口径，见 `saved_revision` 注释）
+    /// **"需要保存"的唯一判据**（`revision != saved_revision`）—— 由核心维护，外面不许自己算。
+    ///
+    /// 契约（`tests/lifecycle.rs::core_owns_the_needs_save_state` 钉住）：
+    /// - 任何**成功**的改动命令都 +1 revision（`dispatch` 里那一处，见"改动命令"段），于是天然置脏；
+    /// - 查询命令（`summary`/`dump`/`validate`/`overlaps`/`journal`/`broadcasts`/`ping`…）不动它；
+    /// - 失败的命令回滚、**不**推进版本号，所以"打错一条参数"不会被喊成未保存；
+    /// - `undo`/`redo`/`abort` 也算文档变更（**保守口径**：撤回保存点之后仍算脏 ——
+    ///   宁可多提示一次保存，也不要"看着干净其实和文件不一样"）；
+    /// - `save`/`save_as` 成功后把 `saved_revision` 对齐到当前 revision；`load_into` 载入即干净
+    ///   （盘上就是它）；`{"op":"new"}` 与 `replace_doc` 换来的是**没有文件对应**的文档 ⇒ 脏。
+    ///
+    /// 保守口径（见 `saved_revision` 注释）
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
     }
@@ -853,6 +874,12 @@ impl EditCore {
     /// 来源 RPE 的 `RPEVersion` 档位（导出沿用）。
     pub fn rpe_target(&self) -> &codec::rpe::RpeTarget {
         &self.rpe_target
+    }
+
+    /// 设置 RPE 导出档位（`convert --rpe-version`）。与 `set_verbose`/`set_origin` 同类：
+    /// **调用方的导出偏好**，不是文档数据，所以不进谱面文件、也不置脏。
+    pub fn set_rpe_target(&mut self, target: codec::rpe::RpeTarget) {
+        self.rpe_target = target;
     }
 
     /// 最近一次载入/保存的保真度报告（`None` = 还没发生过 IO）。
@@ -1113,10 +1140,18 @@ impl EditCore {
             }
             "abort" => {
                 let had = self.journal.in_transaction();
+                // 回滚前记下"事务里到底改了几条"：真要撤销了东西才算一次文档变更（+1 revision），
+                // 空事务 abort 不该平白多一个版本号
+                let pending = self.journal.pending_len();
                 if let Err(e) = self.journal.abort(&mut self.doc) {
                     self.log.push(format!("abort 回滚异常: {e}"));
                 }
                 if had {
+                    if pending > 0 {
+                        // 文档内容被回滚**也是一次变更**：不 +1 的话这条广播会带着和上一条相同的
+                        // revision，按 revision 增量拉取的订阅者（`{"op":"broadcasts","since":N}`）会漏掉它
+                        self.revision += 1;
+                    }
                     // 事务里的改动被丢弃：让订阅者按全量话题重取一次，避免界面停在幻影状态
                     let origin = self.origin;
                     // 回滚可能跨多条线 ⇒ 重叠检测全量重算（否则会留下"已经不存在了"的冲突）
@@ -1213,9 +1248,17 @@ impl EditCore {
                 Ok(v)
             }
             Err(e) => {
+                // 命令失败：**只回滚它自己写进去的那几条**（`normalize`/`move_notes` 这类可能边算边写）。
+                // 以前这里是 `if auto { journal.abort(...) }` —— 显式事务里一条命令失败会把半成品
+                // 留在文档上：既没广播、也没置脏，"失败的命令不改变文档"就成了假话。
+                // 回滚是净效果为零的操作，所以**不推进 revision、也不广播**（订阅者从没看见过半成品）。
+                match self.journal.rollback_since(&mut self.doc, pending_before) {
+                    Ok(0) => {}
+                    Ok(k) => self.log.push(format!("{op} 失败，已回滚它自己写下的 {k} 条改动")),
+                    Err(e2) => self.log.push(format!("失败回滚异常: {e2}")),
+                }
                 if auto {
-                    // 命令失败：回滚它已经做了一半的改动（`normalize` 这类会边算边写），
-                    // 保证"失败的命令不改变文档"这句话是真的
+                    // 自动事务（单条命令自成一步）失败后要把它关掉，别让下一条命令 join 进来
                     if let Err(e2) = self.journal.abort(&mut self.doc) {
                         self.log.push(format!("失败回滚异常: {e2}"));
                     }

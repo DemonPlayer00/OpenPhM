@@ -324,3 +324,99 @@ fn auto_refuses_new_json_targets_but_still_writes_back_existing_ones() {
     assert_eq!(SaveFormat::Auto.resolve(&dir.join("某目录"), Format::Rpe).unwrap(), SaveShape::RpeFolder);
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// **范式检查**：脏状态（"需要保存"）只由 `EditCore` 维护，接口也只在它身上。
+///
+/// 规则：**任何让谱面更新的命令都置脏**；查询命令不置；失败的命令不置（回滚）；
+/// 保存清掉它。这条测试把它钉住 —— 以前 `replace_doc`（换进一份从没落过盘的文档）被标成"已保存"，
+/// 就是这条不成立的一个实例。
+#[test]
+fn core_owns_the_needs_save_state() {
+    let dir = tmpdir("dirty-owner");
+    let mut core = EditCore::new();
+    // `EditCore::new()` 是**占位空文档**：干净（没有会丢的东西）—— 与 `{"op":"new"}` 不同，
+    // 后者是"用户明确要建一份谱面"，建完就脏。若占位也算脏，程序刚起来点关窗就会问"要先保存吗"。
+    assert!(!core.is_dirty(), "占位空文档不算脏（见 EditCore::new 的说明）");
+
+    core.exec(&json!({"op": "new", "meta": {"name": "范式"}, "bpm": 174.0}));
+    assert!(core.is_dirty(), "新建之后必须脏（界面上要提示保存）");
+    let target = dir.join("范式.opm");
+    core.save_as(&target, SaveFormat::OpmPacked).unwrap();
+    assert!(!core.is_dirty(), "刚存过 ⇒ 干净");
+
+    // 查询命令**不许**动脏标记（列表要能穷举，这里挑几类：计数/导出/校验/缓存查询/日志）
+    for q in [
+        json!({"op": "ping"}),
+        json!({"op": "summary"}),
+        json!({"op": "dump"}),
+        json!({"op": "validate"}),
+        json!({"op": "overlaps"}),
+        json!({"op": "journal"}),
+        json!({"op": "broadcasts"}),
+    ] {
+        let r = core.exec(&q);
+        assert_eq!(r["ok"], json!(true), "{q} 应当成功：{r}");
+        assert!(!core.is_dirty(), "查询命令 {} 不该把文档弄脏", q["op"]);
+    }
+
+    // 改动命令 ⇒ 脏（每一条都验：置脏之后再存回去，保证下一条测的是"从干净出发"）
+    for m in [
+        json!({"op": "set_meta", "set": {"charter": "我"}}),
+        json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1], "laneX": 0.0}),
+        json!({"op": "add_event", "line": 0, "track": "moveX", "startBeat": [0, 1], "endBeat": [2, 1],
+               "start": -100.0, "end": 100.0, "easing": "linear"}),
+        json!({"op": "set_bpm", "index": 0, "bpm": 180.0}),
+    ] {
+        let r = core.exec(&m);
+        assert_eq!(r["ok"], json!(true), "{m} 应当成功：{r}");
+        assert!(core.is_dirty(), "改动命令 {} 必须置脏", m["op"]);
+        core.save(None).unwrap();
+        assert!(!core.is_dirty(), "存完应当干净（{}）", m["op"]);
+    }
+
+    // 失败的命令：回滚干净，**不许**置脏（否则"手滑打错一条"会让界面喊未保存）
+    let before = core.revision();
+    let bad = core.exec(&json!({"op": "add_note", "line": 99, "kind": "tap", "startBeat": [1, 1]}));
+    assert_eq!(bad["ok"], json!(false), "{bad}");
+    assert_eq!(core.revision(), before, "失败的命令不该推进版本号");
+    assert!(!core.is_dirty(), "失败的命令不该置脏");
+
+    // 撤销/重做**也算改动**（保守口径：撤过保存点之后仍算脏 —— 宁可多提示一次保存）
+    core.exec(&json!({"op": "set_meta", "set": {"composer": "某人"}}));
+    core.save(None).unwrap();
+    assert!(!core.is_dirty());
+    core.exec(&json!({"op": "undo"}));
+    assert!(core.is_dirty(), "撤销也是一次文档变更");
+
+    // `replace_doc`（换进一份现成文档）：没有任何文件对得上它 ⇒ 脏
+    core.save(None).unwrap();
+    assert!(!core.is_dirty());
+    core.replace_doc(opm_app::doc::Document::default());
+    assert!(core.is_dirty(), "换进一份从没落过盘的文档，必须是脏的");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// 事务回滚（`abort`）：**真撤销了东西才算一次文档变更** —— 否则拉取方按 revision 增量取广播会漏。
+#[test]
+fn abort_counts_as_a_change_only_when_it_rolls_something_back() {
+    let mut core = EditCore::new();
+    core.exec(&json!({"op": "new", "meta": {"name": "事务"}, "bpm": 174.0}));
+
+    // 空事务：版本号不动
+    core.exec(&json!({"op": "begin", "label": "空"}));
+    let r0 = core.revision();
+    core.exec(&json!({"op": "abort"}));
+    assert_eq!(core.revision(), r0, "空事务 abort 不该多一个版本号");
+
+    // 有改动的事务：改动本身已 +1，回滚再 +1（内容确实变了两次）
+    core.exec(&json!({"op": "begin", "label": "改一条"}));
+    let r1 = core.revision();
+    core.exec(&json!({"op": "set_meta", "set": {"charter": "甲"}}));
+    assert_eq!(core.revision(), r1 + 1, "事务内的改动也要 +1");
+    core.exec(&json!({"op": "abort"}));
+    assert_eq!(core.revision(), r1 + 2, "回滚撤销了东西 ⇒ 也是一次变更");
+    assert!(core.is_dirty(), "回滚之后仍是脏（保守口径）");
+    // 回滚真的把内容退回去了
+    assert_eq!(core.doc().meta.charter, "");
+}

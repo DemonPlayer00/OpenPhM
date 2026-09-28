@@ -2963,3 +2963,61 @@ if ctx.input(|i| i.viewport().close_requested()) && !self.quit_allowed {
 **没验到**：守卫里「保存」与「不保存」两个**按钮**（往 Wayland 窗口注入点击在本会话是断的）。
 不过「不保存」之后要走的那条路（`start_guarded(Quit)` → `pending_quit` → `quit_now`）与上表第三行同源，
 已经跑通过。
+
+## 7.51 范式审计：保存/检查接口在 EditCore，脏状态由它内部维护（2026-09-28）
+
+用户要求核对："**在 editcore 实现保存/检查接口，内部维护值，如果有任何命令让谱面更新就置为需要保存**"。
+
+### 结论：范式成立，且**结构上**成立（不是靠各处自觉）
+
+| 要求 | 实现 | 位置 |
+|---|---|---|
+| 检查接口在 EditCore | `is_dirty()`（另有 `path()` / `saved_revision` 相关只读口） | `core.rs` |
+| 保存接口在 EditCore | `save(path)` / `save_as(path, fmt)` / `last_fidelity()` —— **库里只有这里会写谱面文件** | `core.rs` |
+| 内部维护"值" | `revision`（文档版本号）+ `saved_revision`（上次保存时的版本号） | `core.rs` 私有字段 |
+| 任何命令更新谱面就置脏 | `dispatch` 里**唯一一处**改动路径：`mutate` 成功 ⇒ `self.revision += 1`（无条件的单点），于是 `revision != saved_revision` 天然为真 | `core.rs` 改动命令段 |
+
+用**单调版本号**而不是布尔旗子，好处是"谁在什么时候把文档改了"可查（广播、`journal`、控制通道的
+`revision` 都用它）；代价是**内容回退**这件事表达不出来（见下面的保守口径）。
+
+**GUI/CLI 没有第二份真相**：`main.rs` 里的 `file_dirty` 只是每帧从 `core.is_dirty()` 取的**显示缓存**
+（`file_badge_of`），`opm-ctl` 直接用 `core.save()`；两处都不自己算脏。
+
+### 逐项核对的清单
+
+| 路径 | 期望 | 实测 |
+|---|---|---|
+| 查询命令（`summary`/`dump`/`validate`/`overlaps`/`journal`/`broadcasts`/`ping`…） | 不动版本号 | ✓（有测试） |
+| **成功**的改动命令（`set_meta`/`add_note`/`add_event`/`set_bpm`…） | +1 revision ⇒ 脏 | ✓（有测试，逐条验） |
+| **失败**的命令 | 回滚，不推进版本号、不置脏 | ✓（有测试） |
+| `save`/`save_as` | `saved_revision = revision` | ✓ |
+| `load_into`（打开文件） | 载入即干净（盘上就是它） | ✓ |
+| `{"op":"new"}` | 脏（用户明确要建谱面，还没落盘） | ✓ |
+| `undo`/`redo`/`abort` | 也算变更 ⇒ 脏（**保守**） | ✓（有测试） |
+| 视图状态（播放头/缩放/选中） | 不碰文档、不碰版本号 | ✓（`tests/boundary.rs`） |
+| 图谱之外的写盘（PNG、recents.json、zip 临时文件） | 不冒充"保存谱面" | ✓（都不是 core 的保存路径） |
+
+### 查出并修掉的三处
+
+1. **`replace_doc` 把"从没落过盘的文档"标成已保存** —— 换进来的文档没有任何文件对得上它，
+   却写着 `saved_revision = revision`。改成置脏（与 `{"op":"new"}` 同口径），并顺手清掉 `last_save`。
+   这条正是这次审计要抓的那种"谁负责置脏"的漏。
+2. **`abort` 回滚了文档却不推进版本号** —— 事务里的改动各自 +1 过，回滚**又**改了一次文档内容，
+   广播却带着旧 revision：按 revision 增量拉取的订阅者（`{"op":"broadcasts","since":N}`）会漏掉它。
+   改成"**真的撤销了东西才 +1**"（空事务 abort 不动版本号，有测试钉住）。
+3. **失败命令在显式事务里不回滚** —— 原来是 `if auto { journal.abort(...) }`，而 `abort` 退的是
+   **整个事务**；于是 `begin` 之后一条命令失败时，它写了一半的改动会留在文档上：没广播、没置脏，
+   "失败的命令不改变文档"是假的。新增 `Journal::rollback_since(doc, n)`：**只退这条命令自己写下的那些**
+   （同事务里前面成功的命令不动），失败分支改用它（有单测）。
+   **老实说**：我翻过的命令（`move_notes`/`add_note`/`normalize`…）都是"先算完再写"，眼下找不到
+   真会半途写坏的命令 —— 这条属于**结构性保险**，不是已发生的故障。
+
+### 两条**故意**的保守口径（写下来免得被当成 bug）
+
+- **撤回保存点之后仍算脏**：`revision != saved_revision` 表达不了"内容退回去了"。宁可多提示一次保存，
+  也不要"看着干净、其实和文件不一样"。
+- **`EditCore::new()` 的空占位文档算干净**：它不是"用户建的谱面"（那是 `{"op":"new"}`，建完就脏），
+  只是"还没有文档"的占位。否则程序刚起来点一下关窗就会问"要先保存吗" —— 问的是一份用户从没碰过的空谱面。
+  界面上"尚未保存"由"**没有保存目标**"表达（`statusbar::file_mark`），不依赖这个标记。
+
+测试 **207 通过 / 0 失败 / 0 警告**（新增 3 条：范式契约、`abort` 的计数、`rollback_since`）；Windows 目标 0 警告。
