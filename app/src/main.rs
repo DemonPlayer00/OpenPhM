@@ -463,6 +463,49 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // ---- **不打扰独显**：默认把 NVIDIA 的 Vulkan ICD 从枚举里摘掉 ----
+    //
+    // 实测（`/sys/.../power/runtime_status`）：光启动一次程序，运行时断电的 NVIDIA 独显就会
+    // 从 `suspended` 变 `active` —— 因为 Vulkan loader 会把目录里**所有** ICD 都加载起来，
+    // 而"唤醒一块独显"本身要几百毫秒。用户根本没打算用它。
+    // 规则见 `gpu::icd_plan`：只在"Linux + 用户没指定 ICD + 没显式要独显 + 本机还有别的 ICD"时才摘。
+    {
+        let env = |k: &str| std::env::var(k).ok();
+        let icd_files: Vec<String> = opm_app::gpu::icd_search_paths(&env)
+            .iter()
+            .filter(|d| d.is_dir())
+            .flat_map(|d| {
+                std::fs::read_dir(d)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let plan = opm_app::gpu::icd_plan(cfg!(target_os = "linux"), &env, &icd_files);
+        match &plan.keep {
+            Some(keep) => {
+                println!(
+                    "  图形 ICD          : {}（保留 {} 个：{}）",
+                    plan.reason,
+                    keep.len(),
+                    keep.iter()
+                        .filter_map(|p| std::path::Path::new(p).file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+                // 只认 `VK_DRIVER_FILES`（loader 的新名字）：这一步必须在建 wgpu 实例**之前**做
+                std::env::set_var("VK_DRIVER_FILES", keep.join(":"));
+            }
+            None => println!("  图形 ICD          : {}（不干预）", plan.reason),
+        }
+    }
+
     // ---- 后端集合：**能确定 Vulkan 可用就只开 Vulkan**（省掉 GL 的初始化，实测 ~150 ms）----
     //
     // 探测本身**不触发初始化**（只看 ICD json 与 loader 库在不在），探测不到就保留全后端 ——

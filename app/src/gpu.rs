@@ -214,6 +214,67 @@ pub fn icd_search_paths(env: &dyn Fn(&str) -> Option<String>) -> Vec<std::path::
     out
 }
 
+/// "别打扰独显"的 ICD 计划。
+///
+/// 背景（实测）：wgpu 枚举适配器时，Vulkan loader 会把**所有** ICD 都加载起来 ——
+/// 包括 `nvidia_icd.json`。而加载 NVIDIA 的 Vulkan ICD 会把**已经在运行时断电（`runtime_status=suspended`）
+/// 的独显唤醒**（实测：启动一次程序，`0000:01:00.0` 从 suspended 变 active），
+/// 而"唤醒一块独显"本身就要几百毫秒 —— 这正是启动变慢的一大块，而且用户根本不打算用它。
+///
+/// 所以：**默认把 NVIDIA 的 ICD 从枚举里摘掉**，只留别的（核显/其它厂商）。
+/// 只在下面这种情况下才摘（任何一个不满足都不动）：
+/// 1. Linux；
+/// 2. 用户**没有**显式指定 ICD（`VK_DRIVER_FILES`/`VK_ICD_FILENAMES`）；
+/// 3. 用户**没有**显式要独显（`OPM_GPU=discrete` / prime-run / `DRI_PRIME≠0`）；
+/// 4. 本机**还有别的 ICD 可用**（否则"只有 NVIDIA"的机器会被摘成没有显卡可用）。
+///
+/// 局限（写清楚，别让后来人以为它能分辨一切）：只能按**文件名**判断厂商，
+/// 分不出"同厂商的核显与独显"；AMD 平台上的 `radeon_icd` 可能是独显，那种机器仍会被枚举到。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcdPlan {
+    /// `Some(paths)` = 只加载这些 ICD；`None` = 不干预
+    pub keep: Option<Vec<String>>,
+    pub reason: &'static str,
+}
+
+/// 算出 ICD 计划（**纯函数**：环境与"目录里有哪些 ICD"都由调用方给）
+pub fn icd_plan(
+    is_linux: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+    icd_files: &[String],
+) -> IcdPlan {
+    let get = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    let no_change = |reason: &'static str| IcdPlan { keep: None, reason };
+    if !is_linux {
+        return no_change("非 Linux：不动 ICD");
+    }
+    if get("VK_DRIVER_FILES").is_some() || get("VK_ICD_FILENAMES").is_some() {
+        return no_change("用户显式指定了 Vulkan ICD");
+    }
+    if policy_from_env(is_linux, env).0 == GpuPolicy::DiscreteFirst {
+        return no_change("已显式要独显（prime-run / OPM_GPU=discrete）");
+    }
+    let is_nvidia = |p: &str| {
+        std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("nvidia"))
+            .unwrap_or(false)
+    };
+    let keep: Vec<String> = icd_files.iter().filter(|p| !is_nvidia(p)).cloned().collect();
+    if keep.is_empty() || keep.len() == icd_files.len() {
+        // 只有 NVIDIA（单独显机器）⇒ 不能摘；没有 NVIDIA ⇒ 无所谓
+        return no_change("没有可替换的非 NVIDIA ICD：不干预");
+    }
+    IcdPlan {
+        keep: Some(keep),
+        reason: "默认不唤醒独显：只加载非 NVIDIA 的 Vulkan ICD",
+    }
+}
+
 /// 判定"Vulkan ICD 可用"（**纯函数**）：
 /// - **显式指定了** ICD 文件（`VK_DRIVER_FILES`/`VK_ICD_FILENAMES`）时**必须全部存在** ——
 ///   指了却找不到说明这套 Vulkan 配置是坏的，此时不该信它（该退回全后端，留着 GL 回退）；
@@ -411,6 +472,47 @@ mod tests {
             backend_plan(true, &env_of(&[("OPM_BACKEND", "all")]), true, true).0,
             BackendPlan::All
         );
+    }
+
+    /// "别打扰独显"：默认摘掉 NVIDIA 的 ICD；但**单独显机器**、**显式指定**、**非 Linux** 都不动
+    #[test]
+    fn nvidia_icd_is_dropped_unless_the_user_asked_for_it() {
+        let mixed = vec![
+            "/usr/share/vulkan/icd.d/radeon_icd.json".to_owned(),
+            "/usr/share/vulkan/icd.d/intel_icd.json".to_owned(),
+            "/usr/share/vulkan/icd.d/nvidia_icd.json".to_owned(),
+        ];
+        let none = env_of(&[]);
+        // ① 默认：摘掉 nvidia，留别的
+        let p = icd_plan(true, &none, &mixed);
+        let keep = p.keep.expect("应当给出白名单");
+        assert_eq!(keep.len(), 2);
+        assert!(keep.iter().all(|k| !k.contains("nvidia")), "{keep:?}");
+        assert!(p.reason.contains("独显"), "{}", p.reason);
+        // ② 只有 NVIDIA（单独显机器）⇒ 不能摘，否则这台机器就没 Vulkan 了
+        let only_nv = vec!["/usr/share/vulkan/icd.d/nvidia_icd.json".to_owned()];
+        assert_eq!(icd_plan(true, &none, &only_nv).keep, None);
+        // ③ 没有 NVIDIA ⇒ 无所谓（也不必改环境）
+        let no_nv = vec!["/usr/share/vulkan/icd.d/radeon_icd.json".to_owned()];
+        assert_eq!(icd_plan(true, &none, &no_nv).keep, None);
+        // ④ 显式要独显 ⇒ 不动（prime-run / OPM_GPU=discrete / DRI_PRIME）
+        for pairs in [
+            vec![("OPM_GPU", "discrete")],
+            vec![("DRI_PRIME", "1")],
+            vec![("__NV_PRIME_RENDER_OFFLOAD", "1")],
+        ] {
+            let p = icd_plan(true, &env_of(&pairs), &mixed);
+            assert_eq!(p.keep, None, "{pairs:?} 应不干预：{}", p.reason);
+        }
+        // ⑤ 显式指定 ICD ⇒ 不动
+        assert_eq!(
+            icd_plan(true, &env_of(&[("VK_DRIVER_FILES", "/a.json")]), &mixed).keep,
+            None
+        );
+        // ⑥ 非 Linux ⇒ 不动
+        assert_eq!(icd_plan(false, &none, &mixed).keep, None);
+        // ⑦ 空目录 ⇒ 不动
+        assert_eq!(icd_plan(true, &none, &[]).keep, None);
     }
 
     /// ICD 可用性：显式指定必须全部存在（指了却找不到 = 别信 Vulkan，退回全后端留 GL 回退）
