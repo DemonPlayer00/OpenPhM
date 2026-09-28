@@ -409,7 +409,9 @@ fn load_into_broadcasts_all_topics() {
         .broadcasts()
         .back()
         .expect("load_into 必须投递一条广播");
-    assert_eq!(b.label, format!("载入 {}", path.display()));
+    // 广播抬头用**谱面名**（不是路径）：同一条装载路也服务"从崩溃缓存继续"，那时"路径"是
+    // `/tmp/opm/<hash>` 这种对用户没意义的东西
+    assert_eq!(b.label, format!("载入 {}", doc.meta.name));
     use opm_app::broadcast::TopicKind;
     for want in [
         TopicKind::Meta,

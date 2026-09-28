@@ -211,6 +211,178 @@ fn file_name_of(name: &str) -> String {
     crate::codec::asset_base_name(name)
 }
 
+// ---------------------------------------------------------------- 读：`.pez` / 无压缩文件夹
+
+/// `info.yml` 里我们**真的用到**的字段（只解析顶层标量；不引 YAML 库）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InfoFields {
+    /// 谱面文件名（Phira 的 `chart`，默认 `chart.json`）
+    pub chart: String,
+    /// 音乐文件名
+    pub music: String,
+    /// 曲绘文件名
+    pub illustration: String,
+}
+
+/// 顶层标量的极简解析：`key: value`（值可带引号）、`#` 注释、空行。
+///
+/// **只认顶层**：缩进行（嵌套映射/数组的元素）一律跳过 —— 我们需要的 `chart`/`music`/
+/// `illustration` 都是 Phira 规定的顶层标量，多余的结构不该在这里被"猜"。
+/// 引号包裹的值按 YAML 双引号规则反转义（[`yaml_scalar`] 的逆）。
+pub fn parse_info_scalars(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        if raw.starts_with(' ') || raw.starts_with('\t') || raw.trim_start().starts_with('#') {
+            continue;
+        }
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let key = k.trim();
+        if key.is_empty() || key.starts_with('-') {
+            continue;
+        }
+        out.push((key.to_owned(), unquote_scalar(v)));
+    }
+    out
+}
+
+/// 去掉 YAML 标量的引号并反转义（裸标量原样返回，只裁掉两侧空白）
+fn unquote_scalar(v: &str) -> String {
+    let v = v.trim();
+    let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return v.to_owned();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut it = inner.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                let hex: String = it.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(c) => out.push(c),
+                    None => out.push_str(&format!("\\u{hex}")),
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 从**已经解开的条目**读 RPE 谱面包（`.pez` zip 与 RPE 无压缩文件夹共用）。
+///
+/// 为什么要它：`.pez` 之前**只写得出来、读不回去**（`chart.json` 被当成 opm 谱面解析 ⇒
+/// `format 必须是 "opm"`）。谱面包是导出形态，导出形态必须能自己读回来 —— 否则"导出一份
+/// 给别人"之后，自己都验不了它。
+pub fn read_entries(
+    entries: Vec<Entry>,
+    fid: &mut Fidelity,
+) -> Result<(Document, Vec<Entry>), String> {
+    let info_at = entries
+        .iter()
+        .position(|e| e.name == INFO_NAME)
+        .ok_or_else(|| format!("不是 RPE 谱面包（找不到 `{INFO_NAME}`）"))?;
+    let info_text = String::from_utf8_lossy(&entries[info_at].data).into_owned();
+    let fields = parse_info_scalars(&info_text);
+    let get = |k: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let info = InfoFields {
+        chart: get("chart"),
+        music: get("music"),
+        illustration: get("illustration"),
+    };
+    // 谱面条目：`info.yml` 指的那个；没写就找 `chart.json`；再不行找唯一的 `*.json`
+    let chart_at = entries
+        .iter()
+        .position(|e| !info.chart.trim().is_empty() && e.name == info.chart)
+        .or_else(|| entries.iter().position(|e| e.name == CHART_NAME))
+        .or_else(|| {
+            let mut it = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| *i != info_at && e.name.ends_with(".json"));
+            match (it.next(), it.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "谱面包里没有谱面（`{INFO_NAME}` 写着 `{}`；实际条目：{}）",
+                info.chart,
+                entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        })?;
+    if !info.chart.trim().is_empty() && entries[chart_at].name != info.chart {
+        fid.warn(format!(
+            "`{INFO_NAME}` 指向 `{}`，包里没有它 —— 已按 `{}` 读取",
+            info.chart, entries[chart_at].name
+        ));
+    }
+    let (mut doc, rpe_fid) = crate::codec::to_document(
+        serde_json::from_slice(&entries[chart_at].data)
+            .map_err(|e| format!("`{}` 不是合法 JSON: {e}", entries[chart_at].name))?,
+    )?;
+    *fid = rpe_fid;
+    fid.note(format!(
+        "RPE 谱面包：`{INFO_NAME}` + `{}` + {} 个资源",
+        entries[chart_at].name,
+        entries.len().saturating_sub(2)
+    ));
+    // `info.yml` 里写着、而谱面本体里没写的资源名：补上（`meta.audio`/`meta.background`
+    // 决定"按哪个文件名去找音乐"，缺了就会"包里有音乐却说不认识"）
+    for (what, field, from_info, cur) in [
+        ("音乐", "audio", info.music.clone(), doc.meta.audio.clone()),
+        ("曲绘/背景", "background", info.illustration.clone(), doc.meta.background.clone()),
+    ] {
+        let from_info = file_name_of(&from_info);
+        if cur.as_deref().map(str::trim).unwrap_or("").is_empty() && !from_info.is_empty() {
+            fid.note(format!("{what}：按 `{INFO_NAME}` 的写法补成 `{from_info}`"));
+            match field {
+                "audio" => doc.meta.audio = Some(from_info),
+                _ => doc.meta.background = Some(from_info),
+            }
+        }
+    }
+    let assets: Vec<Entry> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| *i != info_at && *i != chart_at)
+        .map(|(_, e)| e)
+        .collect();
+    for (what, want) in [("音乐", doc.meta.audio.as_deref()), ("曲绘/背景", doc.meta.background.as_deref())] {
+        if let Some(name) = want.map(str::trim).filter(|n| !n.is_empty()) {
+            match assets.iter().find(|a| a.name == name) {
+                Some(a) => fid.note(format!("{what} `{name}` 在包内（{} KiB）", a.data.len() / 1024)),
+                None => fid.warn(format!("{what} `{name}` **不在包内**（包里没有这个条目）")),
+            }
+        }
+    }
+    fid.finalize();
+    Ok((doc, assets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +464,63 @@ mod tests {
         assert_eq!(file_name_of("bg.png"), "bg.png");
         assert_eq!(file_name_of("  "), "");
         assert_eq!(file_name_of(r"C:\m\a.mp3"), "a.mp3");
+    }
+
+    /// `info.yml` 的极简解析：顶层标量 + 引号反转义；缩进/注释/数组行都不是字段
+    #[test]
+    fn info_scalars_are_parsed_from_the_top_level_only() {
+        let text = "# 注释\n\
+                    name: \"曲名: 带冒号\"\n\
+                    chart: \"chart.json\"\n\
+                    music: song.ogg\n\
+                    nested:\n  chart: \"不该被当成字段\"\n\
+                    tags: []\n\
+                    - 数组项: x\n\
+                    escaped: \"a\\\"b\\\\c\\n\"\n";
+        let f = parse_info_scalars(text);
+        let get = |k: &str| f.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("name").as_deref(), Some("曲名: 带冒号"));
+        assert_eq!(get("chart").as_deref(), Some("chart.json"));
+        assert_eq!(get("music").as_deref(), Some("song.ogg"), "裸标量原样保留");
+        assert_eq!(get("tags").as_deref(), Some("[]"));
+        assert_eq!(get("escaped").as_deref(), Some("a\"b\\c\n"));
+        assert_eq!(get("chart"), Some("chart.json".to_owned()), "缩进行里的 chart 不算");
+    }
+
+    /// **写得出去就要读得回来**：`build_entries` 组出来的谱面包，`read_entries` 能原样认出来
+    /// （`.pez` 曾经只导得出去、读不回来 —— `chart.json` 被当 opm 谱面解析）
+    #[test]
+    fn a_built_package_reads_back() {
+        let doc = Document::fresh(
+            crate::doc::Meta {
+                name: "包内曲名".to_owned(),
+                composer: "某人".to_owned(),
+                charter: "我".to_owned(),
+                illustrator: String::new(),
+                difficulty: "IN".to_owned(),
+                level: String::new(),
+                constant: None,
+                offset_ms: 0,
+                audio: Some("song.ogg".to_owned()),
+                background: Some("bg.png".to_owned()),
+                foreign: Default::default(),
+            },
+            174.0,
+        );
+        let have = vec![
+            Entry { name: "song.ogg".to_owned(), data: b"OggS-x".to_vec() },
+            Entry { name: "bg.png".to_owned(), data: b"\x89PNG-x".to_vec() },
+        ];
+        let mut wfid = Fidelity::new("rpe", "谱面包（zip）".to_owned());
+        let entries = build_entries(&doc, RpeTarget::default(), None, &have, &mut wfid).unwrap();
+        let mut rfid = Fidelity::new("rpe", "谱面包（zip）".to_owned());
+        let (back, assets) = read_entries(entries, &mut rfid).unwrap();
+        assert_eq!(back.meta.name, "包内曲名");
+        assert_eq!(back.meta.charter, "我");
+        assert_eq!(back.meta.audio.as_deref(), Some("song.ogg"), "音乐名从谱面本体带回来");
+        assert_eq!(back.meta.background.as_deref(), Some("bg.png"));
+        let names: Vec<&str> = assets.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["song.ogg", "bg.png"], "谱面与 info.yml 都不算资源");
+        assert!(rfid.report().contains("谱面包"), "{}", rfid.report());
     }
 }

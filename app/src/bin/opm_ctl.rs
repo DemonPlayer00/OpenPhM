@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use opm_app::cmd::{parse_commands, response_line, validate, Severity};
 use opm_app::control;
-use opm_app::core::EditCore;
+use opm_app::core::{CacheClaim, EditCore};
 use opm_app::headless;
 use serde_json::{json, Value};
 
@@ -222,8 +222,17 @@ fn run() -> i32 {
 
     // ---------------- 无头 ----------------
     let mut core = match &cli.file {
-        Some(p) => match EditCore::load(p) {
-            Ok(c) => c,
+        // **一次性读取**（`CacheClaim::ReadOnly`）：别人已经认领的缓存目录一个字节都不碰 ——
+        // `opm-ctl` 只是读一下这个包，不能把 GUI 崩溃留下的未保存快照顺手覆盖掉
+        Some(p) => match EditCore::stage_file_as(p, CacheClaim::ReadOnly) {
+            Ok(staged) => {
+                let mut c = EditCore::new();
+                if let Err(e) = c.load_staged(staged) {
+                    eprintln!("载入 {} 失败: {e}", p.display());
+                    return 2;
+                }
+                c
+            }
             Err(e) => {
                 eprintln!("载入 {} 失败: {e}", p.display());
                 return 2;
@@ -428,7 +437,6 @@ fn run() -> i32 {
 /// 输入按**内容**判格式；输出格式默认取反（RPE → opm，opm → RPE）。
 /// 无论成功与否都打印保真度报告 —— "能转"不等于"没丢东西"。
 fn cmd_convert(args: &[String]) -> i32 {
-    use opm_app::codec;
     use opm_app::core::SaveFormat;
 
     let mut input: Option<String> = None;
@@ -463,13 +471,17 @@ fn cmd_convert(args: &[String]) -> i32 {
         return 2;
     };
     let in_path = std::path::Path::new(&input);
-    let (doc, in_fid) = match codec::load_file(in_path) {
-        Ok(x) => x,
+    // **走核心的"载入文件"这一步**（`EditCore::stage_file`）：各种格式与打包情况（opm 容器 /
+    // RPE 谱面包 `.pez` / 无压缩文件夹 / 裸 JSON）都在那里处理，转换工具不必自己认一遍 ——
+    // 否则就是第二个装载实现，迟早和编辑器那份不一致（`.pez` 曾经就只导得出去、读不回来）。
+    let staged = match opm_app::core::EditCore::stage_file_as(in_path, CacheClaim::ReadOnly) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("convert: 读取 {input} 失败: {e}");
             return 2;
         }
     };
+    let in_fid = staged.fid.clone();
     if !quiet {
         println!("输入 {} —— {}", input, in_fid.report());
     }
@@ -510,7 +522,11 @@ fn cmd_convert(args: &[String]) -> i32 {
     // `rpe::save_file`，等于在核心之外又开了一个写盘口子 —— 于是"资源要不要装进包、文档字段要不要
     // 规范成包内名、脏标记怎么算"这些规矩都会在那一支里被绕过。现在四种形态只有一条路。
     let mut core = opm_app::core::EditCore::new();
-    core.replace_doc(doc);
+    // 装载（同一条"摊开 → 装进会话"的路）：资源与保存目标都跟着进来
+    if let Err(e) = core.load_staged(staged) {
+        eprintln!("convert: 装载 {input} 失败: {e}");
+        return 2;
+    }
     if !quiet {
         // 目标 RPE 版档位（规范 §9 要求可切换）：载入侧的默认值在这里覆盖
         core.set_rpe_target(opm_app::codec::rpe::RpeTarget {

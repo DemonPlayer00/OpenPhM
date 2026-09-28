@@ -115,6 +115,13 @@ const LIST_ROWS_MAX_AGE: u64 = 30;
 /// 没必要每帧排一次序、抢几次锁（见 `App::publish_stats`）。
 const STATS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 编辑期把文档快照写回解压缓存的**最短间隔**（见 `App::maybe_snapshot`）。
+///
+/// 2 秒是个取舍：被强杀时最多只丢两秒的操作，而写的是**谱面 JSON**（几十 KB 级，资源不动），
+/// 落在 `/tmp` 这种内存盘上几乎不花时间。**没做成"每次改动都写"**：那样每个按键都要序列化
+/// 整份文档，而它防的是"崩溃"，不是"断电"。
+const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
 /// 启动阶段：先在**自己的窗口**里解决"选哪份谱面"，选完才进编辑页。
 ///
 /// 关于"为什么不真的是两个并存窗口"：eframe 里只有根视口跑 pass（子视口都在根的 pass 里画），
@@ -159,6 +166,15 @@ enum GuardAction {
     OpenDialog,
     /// 退出程序（关窗）—— **唯一没有撤销机会**的那个动作
     Quit,
+}
+
+/// 「上次没有正常退出」这次要问的是哪一份遗留缓存。
+///
+/// `others` = 更旧的遗留份数（只报个数：本次只处理最新那份，别的留给用户下次决定）。
+#[derive(Clone, Debug)]
+struct ResumeOffer {
+    item: opm_app::session::Leftover,
+    others: usize,
 }
 
 /// 启动耗时探针：把"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。
@@ -253,8 +269,53 @@ fn main() -> eframe::Result<()> {
     }
 
     trace.mark("启动横幅（stdout）");
+    // ---- **单会话**（用户要求：同一时刻最多一个）----
+    //
+    // 抢的是解压缓存根目录上的**独占锁**（`<临时目录>/opm/.session.lock`）。为什么必须独占：
+    // 缓存是"一个进程至多留一份、退出即清、切换即删"的东西，两个会话同时跑会互相删对方正在用的
+    // 那份。锁用 `File::try_lock`（Unix `flock` / Windows `LockFileEx`）：**锁随句柄存在**，
+    // 进程被强杀时由内核释放 —— 不需要 pid 存活检测，也不会留下"假的活锁"。
+    //
+    // 抢不到**不等于**放弃：本实例会开一个窗口，用关不掉的模态说清"已经有一个在跑"，
+    // 而**什么都不碰**（不载入文档、不占控制 socket、退出也不清理任何东西）。
+    let cache_root = opm_app::codec::container::cache_root();
+    let mut session_lock = None;
+    let mut busy_who: Option<opm_app::codec::container::Session> = None;
+    match opm_app::session::acquire(&cache_root) {
+        Ok(lock) => {
+            println!("  会话锁            : {}（同一时刻只允许一个会话）", lock.path().display());
+            session_lock = Some(lock);
+        }
+        Err(opm_app::session::Refused::Busy(who)) => {
+            println!("  会话锁            : 已被占用 —— 本实例什么都不碰（见窗口里的提示）");
+            busy_who = Some(who.unwrap_or_default());
+        }
+        Err(opm_app::session::Refused::Io(e)) => {
+            // 保证不了独占就别动缓存（那比"多开一个"更危险）
+            eprintln!("会话锁获取失败: {e}");
+            eprintln!("按「同一时刻只允许一个会话」的约定，本实例不启动。");
+            std::process::exit(4);
+        }
+    }
+    // 上一轮**没退干净**的遗留缓存：只有 GUI 留下的那份才算（`opm-ctl` 的缓存按设计不清理）。
+    // 判定在库 `session` 里（有单测），这里只把结果交给界面。
+    let mut leftovers = Vec::new();
+    if session_lock.is_some() {
+        let unknown = opm_app::session::unidentified(&cache_root);
+        if !unknown.is_empty() {
+            println!("  遗留缓存          : {} 份出处不明（命令行或旧版本留下的），本次不动它们", unknown.len());
+        }
+        leftovers = opm_app::session::gui_leftovers(&cache_root);
+        if let Some(l) = leftovers.first() {
+            println!(
+                "  遗留缓存          : {} 份上次没退干净的（最新：{}）—— 启动时问用户要不要继续",
+                leftovers.len(),
+                l.headline()
+            );
+        }
+    }
     // 编辑文档：--doc 载入真实 opm 文件，否则按 --notes 生成演示谱面
-    let doc_arg = args.doc.clone();
+    let doc_arg = args.doc.clone().filter(|_| session_lock.is_some() && busy_who.is_none());
     let core0 = match &doc_arg {
         Some(path) => match core::EditCore::load(std::path::Path::new(path)) {
             Ok(s) => {
@@ -297,7 +358,7 @@ fn main() -> eframe::Result<()> {
     };
     trace.mark("7z 探测（起一次 `7z i` 真跑一遍）");
     let mut core0 = core0;
-    if doc_arg.is_none() && args.notes > 0 {
+    if doc_arg.is_none() && args.notes > 0 && busy_who.is_none() {
         // 演示谱面也**走命令**（实现在库里 `opm_app::demo`）：文档只有 EditCore 能写，
         // 客户端（GUI/CLI/测试）一律发命令。这条路径此前是"直接改 doc"的最后一块飞地，
         // 现在没了 —— 由私有字段在编译期兜住。
@@ -446,7 +507,9 @@ fn main() -> eframe::Result<()> {
         );
     }
     let mut ctrl_path: Option<std::path::PathBuf> = None;
-    if let Some(spec) = &args.control {
+    // 已经有会话在跑时不接控制通道：那个 socket 是**已有实例**的（`opm-ctl --attach` 打的就是它），
+    // 这里抢过来会让正在跑的那个失去远程入口
+    if let Some(spec) = args.control.as_ref().filter(|_| session_lock.is_some()) {
         let path = if spec == "auto" {
             control::auto_path()
         } else {
@@ -465,7 +528,10 @@ fn main() -> eframe::Result<()> {
     // 窗口**一开始就是编辑器尺寸**（两页共用），只有标题按启动阶段给：启动页是"选择谱面"，
     // 进了编辑页再换成"曲名（文件）"（见 `enter_editor`）。
     let on_launcher = doc_arg.is_none() && !args.bench_only() && !args.stress;
-    let launch_phase = if on_launcher {
+    let launch_phase = if busy_who.is_some() {
+        // 被"已经有一个会话"挡住：走的是一屏独立提示（`App::busy_page`），阶段无所谓，但别进编辑页
+        LaunchPhase::StartScreen
+    } else if on_launcher {
         LaunchPhase::StartScreen
     } else {
         LaunchPhase::Editor
@@ -473,7 +539,9 @@ fn main() -> eframe::Result<()> {
     let (title, size) = match launch_phase {
         // 缺 7z 时标题直接说明门槛是什么（尺寸仍是启动页那一套：底下那屏照画，只是盖了模态）
         LaunchPhase::StartScreen => (
-            if seven_zip_missing.is_some() {
+            if busy_who.is_some() {
+                "OpenPhM — 已经有一个会话在运行"
+            } else if seven_zip_missing.is_some() {
                 "OpenPhM — 缺少 7-Zip"
             } else {
                 LAUNCH_TITLE
@@ -676,6 +744,7 @@ fn main() -> eframe::Result<()> {
 
     trace.mark("准备完毕，交棒给 eframe::run_native（窗口创建 + wgpu 初始化 + 首帧）");
     let a = args.clone();
+    let cleanup_core = shared.clone();
     let r = eframe::run_native(
         "opm-app",
         options,
@@ -683,7 +752,7 @@ fn main() -> eframe::Result<()> {
             let t_app = std::time::Instant::now();
             let app = App::new(
                 state, shared, stats, sub, ctx_slot, audio, view, meta_name, doc_lines, doc_notes, a,
-                recents, seven_zip_missing, launch_phase,
+                recents, seven_zip_missing, launch_phase, busy_who, leftovers,
             );
             if trace_on {
                 println!(
@@ -698,6 +767,20 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     );
+
+    // ---- **退出时清理**（用户要求）----
+    //
+    // 把这次会话从容器里解压出来的那份删掉：`/tmp/opm/<key>` 在多数机器上是 **tmpfs（内存）**，
+    // 用完就该还回去。（上一次异常退出留下的，由 `prune_cache` 按上限兜底。）
+    //
+    // 与"未保存的数据"无关：那是**文档**的事，已由未保存守卫按既定三选一处理
+    // （保存 / 不保存 / 返回）—— 走到这里说明用户已经选过"不保存"或本来就没有改动。
+    if let Some(dir) = cleanup_core.lock().ok().and_then(|c| c.asset_dir().map(std::path::Path::to_path_buf)) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => println!("  解压缓存已清理    : {}", dir.display()),
+            Err(e) => eprintln!("  解压缓存清理失败  : {}（{e}）", dir.display()),
+        }
+    }
     // 正常退出时收走自己的 socket（异常退出留下的由下次 bind 前清理 + 死进程过滤兜底）
     if let Some(p) = ctrl_path {
         let _ = std::fs::remove_file(p);
@@ -790,6 +873,17 @@ struct App {
     /// `OPM_LAUNCH_AUTO` 的值（**启动时读一次**）：启动页用它替人做选择（截图/CI）。
     /// 放在字段里而不是每帧 `env::var` —— 那是纯粹的启动期钩子，帧里不该有 env 查询。
     launch_auto: Option<String>,
+    /// `OPM_RESUME_AUTO=continue|discard|later`：遗留缓存对话框替人做选择（截图/CI 用）。
+    /// 与 `launch_auto` 同类 —— **只在启动时读一次**。
+    resume_auto: Option<String>,
+    /// 「上次没有正常退出」这份待问的遗留缓存（`None` = 没有 / 已经问过）
+    resume: Option<ResumeOffer>,
+    /// 被"已经有一个会话在运行"挡住时那个持有者的身份（`None` = 没被挡）
+    busy_who: Option<opm_app::codec::container::Session>,
+    /// 上次把文档快照写回解压缓存的时刻（节流用；见 `App::maybe_snapshot`）
+    snapshot_at: Instant,
+    /// 上一次快照失败的原因（**只在变化时报一次**：失败会每两秒重试，不能每两秒刷一行日志）
+    snapshot_err: Option<String>,
     /// `OPM_CLOSE_AUTO=<帧号>`：在那一帧**模拟点右上角的叉**（发一个 Close 请求）——
     /// 验证"未保存就退出"的守卫用（本会话没法往 Wayland 窗口注入点击）。
     close_auto: Option<u64>,
@@ -797,6 +891,9 @@ struct App {
     pending_quit: bool,
     /// 我们自己已经发过 `Close` ⇒ 下一帧的 `close_requested()` 不再过守卫
     quit_allowed: bool,
+    /// **当前装着的是哪一份音频**（`audio::spec` 的标识）。用它判断"要不要重新装载"：
+    /// 每改一个字都会来一条 `meta` 广播，不能每次都真的开设备、解一遍音频。
+    loaded_audio_spec: Option<String>,
 
     recents: recents::Recents,
     /// 启动页列表的**行快照**（显示什么在这里算好；帧里只画字符串）。
@@ -889,10 +986,20 @@ impl App {
         recents: recents::Recents,
         seven_zip_missing: Option<String>,
         launch_phase: LaunchPhase,
+        // 「已经有一个会话在运行」时那个持有者的身份（`None` = 没被挡住）
+        busy_who: Option<opm_app::codec::container::Session>,
+        // 上次没退干净的遗留缓存（新→旧）；启动页上问用户要不要继续
+        leftovers: Vec<opm_app::session::Leftover>,
     ) -> Self {
         let args_ws = args.ws.unwrap_or(Workspace::Compose);
         // 顶栏拖动框的初值来自状态（`--window-offset` 已在这一步之前作用于 state）
         let state_window_offset = state.window_offset_x;
+        // 启动时那份音频是按什么规格装的（避免第一条 meta 广播就白重载一次）。
+        // 必须在结构体字面量**之前**算：`args`/`core` 会被移进结构体。
+        let loaded_audio_spec = {
+            let meta = core.lock().ok().and_then(|c| c.doc().meta.audio.clone());
+            audio::spec(args.audio.as_deref(), meta.as_deref())
+        };
         // `args` 随后被移动进结构体，先把"启动就摊开哪个对话框"取出来
         let dialog_at_start = args.dialog.clone();
         // 初始检查器快照：与广播后的刷新走同一个入口（读一次核心）
@@ -980,11 +1087,26 @@ impl App {
             trace_startup: false,
             // 启动期钩子：**只在这里读一次**（帧里不该有 env 查询）
             launch_auto: std::env::var("OPM_LAUNCH_AUTO").ok(),
+            snapshot_at: Instant::now(),
+            snapshot_err: None,
+            // 启动期钩子：遗留缓存对话框怎么选（`continue|discard|later`）—— 与 `OPM_LAUNCH_AUTO`
+            // 同类，只在启动时读一次，给 agent 一条"把这一步走完"的路（没人能替它点鼠标）
+            resume_auto: std::env::var("OPM_RESUME_AUTO").ok(),
+            resume: {
+                // 新→旧：问最新那份；更旧的那些只报个数（本次不动它们）
+                let mut it = leftovers.into_iter();
+                let first = it.next();
+                let others = it.count();
+                first.map(|item| ResumeOffer { item, others })
+            },
+            busy_who,
             close_auto: std::env::var("OPM_CLOSE_AUTO")
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok()),
             pending_quit: false,
             quit_allowed: false,
+            // 启动时那份音频是按什么规格装的（记下来，避免第一条 meta 广播就白重载一次）
+                loaded_audio_spec,
             guard_for: match dialog_at_start.as_deref() {
                 Some("guard") => Some(GuardAction::NewDoc),
                 _ => None,
@@ -1451,6 +1573,90 @@ impl App {
         }
     }
 
+    /// **按当前文档/命令行装载音乐，并同步"乐曲时长"**（时间轴总长要用它）。
+    ///
+    /// 调用点：打开文件、**新建谱面**、以及 `meta.audio` 真的变了的时候。
+    ///
+    /// 为什么必须收成一个方法：早先"装载音频"与"更新乐曲时长"是两处分开写的代码，
+    /// 新建谱面那条路**只做了前者** ⇒ 用户看到"明明有音乐，时间轴却说无音乐、只有 10 拍留白那么长"。
+    /// （同类教训在时间轴总长上也出现过一次：`set_content_end_beat` 与视图模型分开写就会漏。）
+    fn reload_audio(&mut self, from: &str) {
+        let spec = {
+            let c = self.core.lock().unwrap();
+            audio::spec(self.args.audio.as_deref(), c.doc().meta.audio.as_deref())
+        };
+        // 先只解析**路径**（`--audio` 优先、`meta.audio` 相对谱面目录），装载分两半做
+        let (meta_audio, chart_path) = {
+            let c = self.core.lock().unwrap();
+            (
+                c.doc().meta.audio.clone(),
+                c.path().map(std::path::Path::to_path_buf),
+            )
+        };
+        let asset_dir = asset_dir_of(&self.core);
+        let resolved = audio::resolve_source(
+            self.args.audio.as_deref(),
+            meta_audio.as_deref(),
+            chart_path.as_deref(),
+            asset_dir.as_deref(),
+        );
+        let resolved = match resolved {
+            Ok(v) => v,
+            Err(e) => {
+                self.state.set_music_len(None);
+                self.audio = None;
+                self.loaded_audio_spec = spec;
+                self.console_log.push((false, format!("音乐没能载入（{from}）：{e}")));
+                return;
+            }
+        };
+        let Some((p, src)) = resolved else {
+            self.state.set_music_len(None);
+            self.audio = None;
+            self.loaded_audio_spec = spec;
+            self.console_log
+                .push((true, format!("{from}：这份谱面没有音乐 —— 时间轴按内容 + 10 拍留白")));
+            return;
+        };
+        match audio::decode(&p) {
+            Ok(decoded) => {
+                let sec = decoded.duration_sec();
+                match audio::Audio::from_decoded(decoded) {
+                    Ok(a) => {
+                        self.state.set_music_len(Some(sec));
+                        self.console_log.push((
+                            true,
+                            format!(
+                                "音乐（{from}，来源 {}）→ {}（{sec:.1}s；时间轴总长按它）",
+                                src.label(),
+                                a.path
+                            ),
+                        ));
+                        self.audio = Some(a);
+                    }
+                    Err(e) => {
+                        // 有音乐、有长度，但放不出声：时间轴仍然按它算，如实说清
+                        self.state.set_music_len(Some(sec));
+                        self.console_log.push((
+                            false,
+                            format!("音乐（{from}）已解码（{sec:.1}s，时间轴按它算）但**放不出声**：{e}"),
+                        ));
+                        self.audio = None;
+                    }
+                }
+            }
+            Err(e) => {
+                self.state.set_music_len(None);
+                self.audio = None;
+                self.console_log.push((
+                    false,
+                    format!("音乐解码失败（{from}）：{e} —— 时间轴只有内容 + 10 拍留白"),
+                ));
+            }
+        }
+        self.loaded_audio_spec = spec;
+    }
+
     /// 把当前文件记进"最近打开"（起始界面左半边的内容）
     fn remember_recent(&mut self) {
         let (path, title, fmt) = {
@@ -1541,20 +1747,11 @@ impl App {
             ));
             // 界面跟着新文档走：保存目标清空、曲名=新曲名、音频换掉
             self.sync_file_fields();
-            // 音乐路径是**文档字段**（`meta.audio`，已由 `new` 命令写进文档），
-            // 这里顺带把它换成本次预览的音频（失败只提示，不影响谱面）
-            if !self.new_form.audio.trim().is_empty() {
-                let p = self.new_form.audio.trim().to_owned();
-                match audio::Audio::load(std::path::Path::new(&p)) {
-                    Ok(a) => {
-                        self.audio = Some(a);
-                        self.state.playhead = 0.0;
-                    }
-                    Err(e) => self
-                        .console_log
-                        .push((false, format!("音频未能载入（谱面字段已写入）：{e}"))),
-                }
-            }
+            // 音乐路径是**文档字段**（`meta.audio`，刚由 `new` 命令写进文档）：
+            // 走统一入口装载 —— **它同时把"乐曲时长"交给视图状态**（时间轴总长要用）。
+            // 这里以前只写了 `self.audio`，漏了 `set_music_len` ⇒ "有音乐但时间轴说无音乐"。
+            self.reload_audio("新建谱面");
+            self.state.playhead = 0.0;
         } else {
             // 命令被拒：模态留在原地，原因显示在模态里（也进控制台日志）
             let why = resp
@@ -1716,31 +1913,8 @@ impl App {
             }
             self.sync_file_fields(); // 打开之后：文件夹/名字/格式提示都跟着新文件走
             self.remember_recent();
-            // **音乐跟着谱面走**：打开一份新谱面，它的 `meta.audio`（或 `--audio`）要重新解析 ——
-            // 否则时间轴总长还停在上一次那首歌上（"时间轴按乐曲时长"这条会当场失效）。
-            // 同一条 `resolve_audio`：命令行 `--audio` 优先、`--audio off` 明确不要。
-            match resolve_audio(&self.args, &self.core) {
-                Ok(a) => {
-                    let sec = a.as_ref().map(|a| a.duration());
-                    self.state.set_music_len(sec);
-                    match (&a, sec) {
-                        (Some(a), Some(sec)) => self.console_log.push((
-                            true,
-                            format!("音乐 → {}（{:.1}s；时间轴总长按它）", a.path, sec),
-                        )),
-                        _ => self
-                            .console_log
-                            .push((true, "这份谱面没有音乐：时间轴按谱面自身跨度".to_owned())),
-                    }
-                    self.audio = a;
-                }
-                // 载入失败不该把"打开成功"变成失败：说一句，音乐留空
-                Err(e) => {
-                    self.state.set_music_len(None);
-                    self.audio = None;
-                    self.console_log.push((false, format!("音乐没能载入：{e}")));
-                }
-            }
+            // **音乐跟着谱面走**：走与新建/元数据改动同一条入口（内部会同步时间轴总长）
+            self.reload_audio("打开谱面");
         } else {
             self.console_log.push((
                 false,
@@ -2093,6 +2267,15 @@ impl App {
             self.meta_name = c.doc().meta.name.clone();
             drop(c);
             self.builds_meta += 1;
+            // `meta.audio` **真的变了**才重新装载（每敲一个字都会来一条 meta 广播，
+            // 不能每次都开设备、解一遍音频 —— 比字符串就够了）
+            let spec = {
+                let c = self.core.lock().unwrap();
+                audio::spec(self.args.audio.as_deref(), c.doc().meta.audio.as_deref())
+            };
+            if spec != self.loaded_audio_spec {
+                self.reload_audio("meta.audio 改动");
+            }
         }
 
         if d.structure {
@@ -2442,8 +2625,171 @@ impl App {
     /// 它自带"本帧到此为止"的收尾（截屏 / 统计 / 帧计数 / 心跳）—— 启动页与编辑页是同一个窗口的
     /// 两个页面，启动页这一帧画完就没有别的活了。收尾放在这里而不是调用点，是因为**早退分支
     /// 最容易被漏掉某一步**（这个项目已经踩过两次：漏字体装载 ⇒ 中文豆腐块；漏 `pace` ⇒ 只出几帧就停）。
+    /// **从解压缓存继续**（启动页那个「上次没有正常退出」对话框选「继续」走这里）。
+    ///
+    /// 与 [`App::open_doc`] 是同一套收尾（同步文件字段 / 记最近打开 / 重新装载音乐），
+    /// 区别只在来源：文档来自缓存目录，**保存目标从会话元数据恢复**（继续之后 Ctrl+S 写回
+    /// 原来那个文件，而不是写进 `/tmp`）。
+    fn continue_cached(&mut self, dir: &std::path::Path) -> bool {
+        let r = {
+            let mut c = self.core.lock().unwrap();
+            c.load_session_into(dir)
+        };
+        match r {
+            Ok(info) => {
+                self.console_log.push((
+                    true,
+                    format!(
+                        "已从缓存继续「{}」（{} 个资源{}）",
+                        info.name,
+                        info.assets,
+                        if info.unsaved { "，含未保存的改动" } else { "" }
+                    ),
+                ));
+                if let Some(p) = &info.source {
+                    self.console_log
+                        .push((true, format!("保存目标：{}", p.display())));
+                }
+                self.sync_file_fields();
+                self.remember_recent();
+                self.reload_audio("从缓存继续");
+                // 缓存里那份可能比磁盘上的文件新：先按"未保存"呈现，状态栏的脏标识随之重算
+                self.refresh_file_badge();
+                true
+            }
+            Err(e) => {
+                self.console_log.push((false, format!("从缓存继续失败：{e}")));
+                false
+            }
+        }
+    }
+
+    /// **编辑期把文档快照写回解压缓存**（节流：最多每 [`SNAPSHOT_MIN_INTERVAL`] 一次）。
+    ///
+    /// 为什么要有：进程被强杀时磁盘上的谱面文件停在上一次保存，编辑期的改动本来一个字节都不剩。
+    /// 缓存目录是这次会话的工作副本，顺手把文档写进去 ⇒ 下次启动那句「继续此谱面」才有意义
+    /// （否则它只能重新打开一份旧文件，用户看到的还是"全丢了"）。
+    ///
+    /// 只在**脏**的时候写：干净就意味着文档与文件一致，不必动缓存。
+    fn maybe_snapshot(&mut self, now: Instant) {
+        if now.duration_since(self.snapshot_at) < SNAPSHOT_MIN_INTERVAL {
+            return;
+        }
+        let (dirty, has_dir) = {
+            let c = self.core.lock().unwrap();
+            (c.is_dirty(), c.asset_dir().is_some())
+        };
+        if !dirty || !has_dir {
+            return;
+        }
+        self.snapshot_at = now;
+        let r = {
+            let mut c = self.core.lock().unwrap();
+            c.snapshot_session()
+        };
+        match r {
+            Ok(()) => self.snapshot_err = None,
+            // 失败**只在原因变化时报一次**：这是每两秒重试的兜底，不能每两秒刷一行日志
+            Err(e) => {
+                if self.snapshot_err.as_deref() != Some(e.as_str()) {
+                    self.console_log.push((false, format!("缓存快照失败：{e}")));
+                    self.snapshot_err = Some(e);
+                }
+            }
+        }
+    }
+
+    /// **被"已经有一个会话在运行"挡住的那一屏**。
+    ///
+    /// 这一份实例**什么都不碰**：没抢到锁 ⇒ 不载入文档、不占控制 socket、退出也不清理任何缓存
+    /// （清理会删掉正在跑的那个会话的工作副本）。给用户的出口只有"关闭"。
+    fn busy_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_rgb(20, 22, 30));
+        // 模态底下仍照画一屏（模态会把它压暗）：与启动页同一族配色
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.heading("OpenPhM");
+            opm_app::dialog::hint(ui, "这一份没有启动：同一时刻只允许一个会话");
+        });
+        if opm_app::recents::session_busy_modal(ctx, self.busy_who.as_ref()) {
+            self.quit_now(ctx);
+        }
+        self.finish_launch_frame(ctx);
+    }
+
+    /// 启动页/阻断页每帧的收尾：自截屏 → 统计 → 帧计数 → 心跳。
+    ///
+    /// 抽出来是因为它有三个出口（正常走完、遗留缓存对话框选了"继续"、阻断页），
+    /// 少调一个就会出现"截屏永远超时 / 统计不动 / 页面卡住不再重绘"这类难查的毛病。
+    fn finish_launch_frame(&mut self, ctx: &egui::Context) {
+        self.handle_shot(ctx);
+        self.publish_stats();
+        self.frames += 1;
+        self.pace(ctx);
+    }
+
     fn launch_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.pump_launch_new(ctx);
+        // 这一帧问过遗留缓存吗（问了就不再让别的启动期钩子在同一帧替用户做第二个决定）
+        let mut asked_this_frame = false;
+        // ---- 「上次没有正常退出」：**先问这个** ----
+        //
+        // 它画在列表之上（`egui::Modal` 自带遮罩并吞掉下层输入），而且**先于**列表处理 Esc ——
+        // 于是这个 Esc 归弹窗（`dialog::modal` 内部 `consume_key`），列表的"跳过直接进编辑器"
+        // 看不见它（这条归属规则在 `dialog` 模块的单测里钉着）。
+        if let Some(offer) = self.resume.clone() {
+            asked_this_frame = true;
+            let choice = match self.resume_auto.as_deref().map(str::trim) {
+                // 自动化钩子：没人能替 agent 点这个按钮（与 `OPM_LAUNCH_AUTO` 同类）
+                Some("continue") => Some(opm_app::recents::ResumeChoice::Continue),
+                Some("discard") => Some(opm_app::recents::ResumeChoice::Discard),
+                Some("later") => Some(opm_app::recents::ResumeChoice::Later),
+                Some(other) => {
+                    eprintln!("  ⚠️ OPM_RESUME_AUTO：只认 continue/discard/later，收到 {other:?}");
+                    opm_app::recents::resume_cache_modal(ctx, &offer.item, offer.others)
+                }
+                None => opm_app::recents::resume_cache_modal(ctx, &offer.item, offer.others),
+            };
+            // `None` = 用户还没点：**弹窗继续开着**（帧照画，遮罩会把底下的启动页压暗）
+            if let Some(choice) = choice {
+                self.resume = None;
+                match choice {
+                    opm_app::recents::ResumeChoice::Continue => {
+                        if self.continue_cached(&offer.item.dir) {
+                            self.enter_editor(ctx);
+                        } else {
+                            // 继续失败（缓存被外力删了之类）：留在启动页，原因已经进了控制台日志
+                            self.file_message = Some((
+                                false,
+                                format!("继续「{}」失败——缓存可能已经被清理掉了", offer.item.name()),
+                            ));
+                        }
+                        // 这一帧到此为止（与列表动作那条路一样要收尾：截屏/统计/帧计数/心跳）
+                        self.finish_launch_frame(ctx);
+                        return;
+                    }
+                    opm_app::recents::ResumeChoice::Discard => {
+                        let (n, freed) = opm_app::session::discard(std::slice::from_ref(&offer.item));
+                        self.console_log.push((
+                            true,
+                            format!(
+                                "已丢弃遗留缓存 {n} 份 / {}（谱面文件没动）",
+                                opm_app::session::size_text(freed)
+                            ),
+                        ));
+                        self.file_message =
+                            Some((true, format!("已丢弃「{}」的遗留缓存", offer.item.name())));
+                    }
+                    opm_app::recents::ResumeChoice::Later => {
+                        self.console_log.push((
+                            true,
+                            format!("遗留缓存留在 {}（下次启动再问）", offer.item.dir.display()),
+                        ));
+                    }
+                }
+            }
+        }
         let screen = ui.max_rect();
         let native = filedialog::availability();
         let msg = self.file_message.clone();
@@ -2458,7 +2804,7 @@ impl App {
             &self.list_rows,
             msg.as_ref(),
             native,
-            gated || self.new_form_open,
+            gated || self.new_form_open || asked_this_frame,
         );
         // 「新建谱面」：盖在列表上的模态（`opm_new_chart`）
         if self.new_form_open {
@@ -2489,7 +2835,7 @@ impl App {
         // 自动化钩子（截图/CI 用）：`OPM_LAUNCH_AUTO=skip|new|create:<曲名>|open:<path>|recent:<n>`
         // —— 没人点鼠标时也能把"选完切编辑页"这一步走完。**只在这里生效**，不影响交互路径。
         // 门槛期间不生效：否则 `OPM_LAUNCH_AUTO=skip` 就成了绕过 7z 检查的后门。
-        if action.is_none() && !gated && self.frames >= 2 {
+        if action.is_none() && !gated && !asked_this_frame && self.frames >= 2 {
             // 环境变量在启动时读一次（`App::launch_auto`）：每帧查一次就要分配一个 String，
             // 而这是纯粹的启动期钩子，帧里不该出现 env 查询。
             if let Some(auto) = self.launch_auto.as_deref() {
@@ -2578,10 +2924,7 @@ impl App {
             }
             None => {}
         }
-        self.handle_shot(ctx);
-        self.publish_stats();
-        self.frames += 1;
-        self.pace(ctx);
+        self.finish_launch_frame(ctx);
         if self.frames == 1 {
             if let Some(t0) = self.startup_t0.filter(|_| self.trace_startup) {
                 println!(
@@ -2696,6 +3039,13 @@ impl eframe::App for App {
         // 于是启动页与编辑页共用同一个守卫 —— 关窗不再有"哪一页才有效"的区别。
         self.unsaved_guard(&ctx);
 
+        // ---- 「已经有一个会话在运行」：这一份实例什么都不碰，只说明情况 ----
+        // 放在最前面（除退出处理之外）：它不该进编辑页、不该碰缓存、也不该跑任何启动期动作。
+        if self.busy_who.is_some() {
+            self.busy_page(ui, &ctx);
+            return;
+        }
+
         // ---- 启动页：**一屏**（谱面列表）+ 盖在它上面的模态 ----
         //
         // 「新建谱面」与「缺少 7z」都不是另一屏，而是**模态**（同一个 `dialog` 模块画出来的，
@@ -2791,6 +3141,8 @@ impl eframe::App for App {
         // ---- 唯一的更新入口：抽广播 → 置脏 → 只重建脏掉的那块 ----
         // GUI 不轮询 `revision`、不直接读文档判断"要不要更新"：文档什么时候变了，由 EditCore 说。
         self.pump_broadcasts();
+        // 编辑期把文档快照写回解压缓存（节流；被强杀时"继续此谱面"才有东西可继续）
+        self.maybe_snapshot(Instant::now());
 
         // 播放头：有音频时由音频游标驱动（见 state::advance），否则墙钟
         self.state.advance(self.audio.as_ref());
@@ -3807,18 +4159,25 @@ fn write_png(img: &egui::ColorImage, path: &std::path::Path) -> Result<(), Strin
 /// `--audio off` 表示明确不要音频。
 /// 该放哪段音频：**路径决策在库里**（`audio::resolve_source`，纯函数 + 单测），
 /// 这里只负责"真的去读文件并开设备"。
+/// 当前文档的**容器资源目录**（摊到磁盘的那份）；由 `EditCore::asset_dir()` 给。
+fn asset_dir_of(core: &core::SharedCore) -> Option<std::path::PathBuf> {
+    core.lock().ok().and_then(|c| c.asset_dir().map(std::path::Path::to_path_buf))
+}
+
 fn resolve_audio(args: &Args, core: &core::SharedCore) -> Result<Option<audio::Audio>, String> {
-    let (meta_audio, chart_path) = {
+    let (meta_audio, chart_path, asset_dir) = {
         let c = core.lock().unwrap();
         (
             c.doc().meta.audio.clone(),
             c.path().map(std::path::Path::to_path_buf),
+            c.asset_dir().map(std::path::Path::to_path_buf),
         )
     };
     let Some((path, src)) = audio::resolve_source(
         args.audio.as_deref(),
         meta_audio.as_deref(),
         chart_path.as_deref(),
+        asset_dir.as_deref(),
     )?
     else {
         return Ok(None);

@@ -153,6 +153,269 @@ fn new_chart_packs_audio_and_illustration_into_the_container() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// **「上次没有正常退出」→「继续此谱面」**：连同**未保存的改动**一起恢复（用户选的做法）。
+///
+/// 这条链路的每一步都是"会丢数据"的判断，所以整条走一遍：
+/// 缓存目录（含 `session.json`）→ `session::gui_leftovers` 认出它 → `load_session_into` →
+/// 保存目标指回**原文件**（不是缓存目录）→ 保存后缓存里的快照跟着变成"已保存"。
+#[test]
+fn a_leftover_cache_dir_resumes_with_its_unsaved_edits() {
+    use opm_app::codec::{container, Format};
+
+    let dir = tmpdir("resume");
+    let source = dir.join("崩溃前.opm");
+    // 缓存目录要落在**真的缓存根目录**下（Linux `/tmp/opm`）：只有那里的目录才算"我们摊出来的"
+    // （别处的、带 `session.json` 的目录是用户自己的东西，删不得 —— 见 `stage_folder` 里的 `ours`）。
+    // 用带进程号的名字，和并行的其它用例、以及可能正在跑的 GUI 互不干扰。
+    let cache = container::cache_root().join(format!("test-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cache).unwrap();
+
+    // ---- 造一份"崩溃遗留"：缓存里的谱面**比磁盘上的文件新**（快照里带着未保存的改动）----
+    let mut maker = EditCore::new();
+    maker.exec(&json!({"op": "new", "meta": {"name": "崩溃前的名字", "audio": "song.ogg", "charter": "我"}, "bpm": 174.0}));
+    let chart_json = serde_json::to_vec_pretty(&maker.doc().to_json()).unwrap();
+    // 磁盘上那份是**保存前**的旧名字；缓存里那份是改过名的（这就是"未保存改动"）
+    maker.exec(&json!({"op": "set_meta", "set": {"name": "磁盘上的旧名字"}}));
+    let old = maker.save_as(&source, SaveFormat::OpmPacked).unwrap().0;
+    std::fs::write(cache.join(container::CHART_NAME), &chart_json).unwrap();
+    std::fs::write(cache.join("song.ogg"), b"OggS-payload").unwrap();
+    container::write_session(
+        &cache,
+        &container::Session {
+            pid: 999_999,
+            exe: "opm-app".to_owned(),
+            source: Some(source.display().to_string()),
+            format: Format::OpmZip.as_str().to_owned(),
+            name: "崩溃前的名字".to_owned(),
+            started: container::now_secs().saturating_sub(600),
+            snapshot: container::now_secs().saturating_sub(120),
+            dirty: true,
+        },
+    )
+    .unwrap();
+
+    // ---- 启动时的那一问：这条目录会被认成"GUI 上次没退干净" ----
+    // （扫的是真的缓存根目录，所以按目录过滤出我们这一份 —— 别人的遗留不该影响这条断言）
+    let offered: Vec<_> = opm_app::session::gui_leftovers(&container::cache_root())
+        .into_iter()
+        .filter(|l| l.dir == cache)
+        .collect();
+    assert_eq!(offered.len(), 1, "该认出这份遗留");
+    assert_eq!(offered[0].name(), "崩溃前的名字");
+    assert!(offered[0].has_unsaved(), "会话元数据说还有未保存改动");
+    assert!(
+        offered[0].details().join("\n").contains("未保存的改动"),
+        "对话框正文要说清这一点：{:?}",
+        offered[0].details()
+    );
+
+    // ---- 选「继续」----
+    let mut core = EditCore::new();
+    let r = core.load_session_into(&cache).unwrap();
+    assert_eq!(r.name, "崩溃前的名字", "继续拿到的是**缓存里**那份（不是磁盘上的旧名字）");
+    assert_eq!(r.source.as_deref(), Some(source.as_path()));
+    assert_eq!(r.assets, 1, "资源按目录里的文件收回来");
+    assert!(r.unsaved && core.is_dirty(), "缓存里有未保存改动 ⇒ 继续之后界面就该说未保存");
+    assert_eq!(core.path(), Some(source.as_path()), "保存目标指回原文件，不是缓存目录");
+    assert_eq!(core.source_format(), Format::OpmZip, "来源格式从会话元数据恢复");
+    assert_eq!(core.doc().meta.audio.as_deref(), Some("song.ogg"));
+
+    // ---- 保存：写回**原文件**，且缓存里的快照跟着变成"已保存" ----
+    let saved = core.save(None).unwrap();
+    assert_eq!(saved, old, "写回的是原来那个文件");
+    assert!(!core.is_dirty(), "存过就不脏");
+    let (cont, _) = container::read_file(&saved).unwrap();
+    assert_eq!(cont.doc.meta.name, "崩溃前的名字", "存进去的是继续之后的文档");
+    assert_eq!(cont.assets.len(), 1, "音乐还在包里");
+    let after = container::read_session(&cache).expect("会话元数据还在");
+    assert!(after.snapshot > 0 && !after.dirty, "保存之后缓存里的快照要变成已保存：{after:?}");
+
+    // ---- 编辑期的快照：把文档写回缓存（防"被强杀就全丢"）----
+    core.exec(&json!({"op": "set_meta", "set": {"name": "又改了"}}));
+    core.snapshot_session().unwrap();
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cache.join(container::CHART_NAME)).unwrap()).unwrap();
+    assert_eq!(on_disk["meta"]["name"], json!("又改了"), "快照写的是当前文档");
+    assert!(container::read_session(&cache).unwrap().dirty, "快照要记下'当时是脏的'");
+    // 快照不该在缓存目录里留下垃圾：只剩谱面、资源、会话元数据这三样
+    let mut names: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["opm.json", "session.json", "song.ogg"], "快照不该留下临时文件");
+
+    std::fs::remove_dir_all(&cache).ok();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// **新建谱面不许继承上一份谱面的容器资源与解压缓存**。
+///
+/// 原先 `{"op":"new"}` 只换文档：`assets` 与 `asset_dir` 都留着 ⇒ 新谱面第一次存成 `.opm`
+/// 会把**上一个包的音乐/曲绘**装进去，缓存目录里那份 `opm.json` 也会被当成新谱面的工作副本
+/// （于是下次启动会拿它来问"要不要继续"一个已经不存在的东西）。
+#[test]
+fn creating_a_new_chart_drops_the_previous_container_cache_and_assets() {
+    use opm_app::codec::container;
+
+    let dir = tmpdir("new-clears");
+    let audio = dir.join("song.ogg");
+    std::fs::write(&audio, b"OggS-fake-audio-payload").unwrap();
+    let mut maker = EditCore::new();
+    let mut form = opm_app::recents::NewChartForm::default();
+    form.name = "上一份".to_owned();
+    form.audio = audio.display().to_string();
+    maker.exec(&form.to_new_command());
+    let first = dir.join("上一份.opm");
+    maker.save_as(&first, SaveFormat::OpmPacked).unwrap();
+
+    let mut core = EditCore::load(&first).unwrap();
+    let cache = core.asset_dir().map(std::path::Path::to_path_buf).expect("容器载入要摊出缓存目录");
+    assert!(cache.is_dir(), "{}", cache.display());
+
+    core.exec(&json!({"op": "new", "meta": {"name": "新的"}, "bpm": 174.0}));
+    assert!(core.asset_dir().is_none(), "新建之后不该还挂着上一份的缓存目录");
+    assert!(!cache.exists(), "上一份的缓存目录要删掉（留着会被当成崩溃遗留）");
+
+    let second = dir.join("新的.opm");
+    core.save_as(&second, SaveFormat::OpmPacked).unwrap();
+    let (cont, _) = container::read_file(&second).unwrap();
+    assert!(
+        cont.assets.is_empty(),
+        "新谱面的包里不该有上一个包的音乐：{:?}",
+        cont.assets.iter().map(|a| &a.name).collect::<Vec<_>>()
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// **装卸对称**：四种形态（2 格式 × 打包开关）都要能**读回来**，不只是写出去。
+///
+/// 这条以前不成立：`.pez` 与"无压缩文件夹"两种形态只写得出来 —— 读的时候 `chart.json` 被当成
+/// opm 谱面解析（`format 必须是 "opm"`），于是"导出一份给别人"之后自己都验不了。
+/// 现在四种形态都走同一条"载入文件到临时文件夹"（`EditCore::stage_file`），这条测试把它钉住。
+#[test]
+fn every_save_shape_can_be_loaded_back() {
+    use opm_app::codec::Format;
+
+    let dir = tmpdir("shapes-back");
+    let audio = dir.join("song.ogg");
+    let art = dir.join("bg.png");
+    std::fs::write(&audio, b"OggS-fake-audio-payload").unwrap();
+    std::fs::write(&art, b"\x89PNG-fake-illustration-payload").unwrap();
+
+    let mut form = opm_app::recents::NewChartForm::default();
+    form.name = "四形态往返".to_owned();
+    form.charter = "我".to_owned();
+    form.audio = audio.display().to_string();
+    form.illustration = art.display().to_string();
+    form.bpm = 174.0;
+    form.validate().expect("表单应当通过校验");
+    let mut maker = EditCore::new();
+    maker.exec(&form.to_new_command());
+    let want_notes: usize = maker.doc().judge_lines.iter().map(|l| l.notes.len()).sum();
+
+    // 形态 → （目标路径, 来源格式）
+    let cases = [
+        (SaveFormat::OpmPacked, dir.join("a.opm"), Format::Opm),
+        (SaveFormat::OpmFolder, dir.join("a.opm.d"), Format::Opm),
+        (SaveFormat::RpePacked, dir.join("a.pez"), Format::Rpe),
+        (SaveFormat::RpeFolder, dir.join("a.pez.d"), Format::Rpe),
+    ];
+    for (shape, target, want_fmt) in cases {
+        let mut core = EditCore::new();
+        core.exec(&form.to_new_command());
+        let (written, _fid) =
+            core.save_as(&target, shape).unwrap_or_else(|e| panic!("{shape:?} 写不出去：{e}"));
+        let back = EditCore::load(&written)
+            .unwrap_or_else(|e| panic!("{shape:?} 读不回来（写出的是 {}）：{e}", written.display()));
+        assert_eq!(back.doc().meta.name, "四形态往返", "{shape:?}");
+        assert_eq!(back.doc().meta.charter, "我", "{shape:?}");
+        let notes: usize = back.doc().judge_lines.iter().map(|l| l.notes.len()).sum();
+        assert_eq!(notes, want_notes, "{shape:?} 音符数对不上");
+        assert_eq!(
+            back.doc().meta.audio.as_deref(),
+            Some("song.ogg"),
+            "{shape:?} 音乐名要跟着回来（否则'包里有音乐却找不到'）"
+        );
+        assert_eq!(back.doc().meta.background.as_deref(), Some("bg.png"), "{shape:?}");
+        assert_eq!(back.source_format(), want_fmt, "{shape:?} 来源格式");
+        // 打包形态：摊到临时目录（音频要落成真实文件才装载得了）；文件夹形态：本来就是真实文件
+        match shape {
+            SaveFormat::OpmPacked | SaveFormat::RpePacked => assert!(
+                back.asset_dir().is_some_and(|d| d.join("song.ogg").is_file()),
+                "{shape:?} 该把资源摊到临时目录：{:?}",
+                back.asset_dir()
+            ),
+            _ => assert!(back.asset_dir().is_none(), "{shape:?} 不该摊"),
+        }
+        // 无压缩文件夹形态：保存目标要指向**文件夹里的那个谱面文件**（下一次 Ctrl+S 回到同一形态）
+        if shape.packed() == Some(false) {
+            assert_eq!(back.path(), Some(written.as_path()), "{shape:?}");
+            assert!(written.is_file(), "{shape:?} 目标是目录里的谱面文件");
+            assert!(
+                written.parent().is_some_and(|d| d.join("song.ogg").is_file()),
+                "{shape:?} 资源要摊在同一个目录里"
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// **别人认领的缓存目录，一次性读取不许碰**。
+///
+/// 缓存按**容器内容**分目录，而 `session.json` 与那份 `opm.json` 快照是**会话**状态：
+/// `opm-ctl` 读同一个包时若照常摊一遍，GUI 崩溃留下的元数据与未保存快照就一起没了
+/// （实测：一次 `opm-ctl --file X dump` 就够）。所以 `CacheClaim::ReadOnly` 只读不写。
+#[test]
+fn a_read_only_stage_leaves_another_sessions_cache_alone() {
+    use opm_app::codec::container;
+    use opm_app::core::CacheClaim;
+
+    let dir = tmpdir("readonly");
+    let audio = dir.join("song.ogg");
+    std::fs::write(&audio, b"OggS-fake-audio-payload").unwrap();
+    let mut form = opm_app::recents::NewChartForm::default();
+    form.name = "被占用".to_owned();
+    form.audio = audio.display().to_string();
+    let mut maker = EditCore::new();
+    maker.exec(&form.to_new_command());
+    let target = dir.join("a.opm");
+    maker.save_as(&target, SaveFormat::OpmPacked).unwrap();
+
+    // ① 先在同一个缓存目录里造出"别人的会话"（换个 pid，写完再改回去）
+    let mut owner = EditCore::new();
+    owner.load_into(&target).unwrap();
+    let cache = owner.asset_dir().map(std::path::Path::to_path_buf).expect("容器载入要摊出缓存目录");
+    let mut s = container::read_session(&cache).expect("摊完就有会话元数据");
+    s.pid = s.pid.wrapping_add(1); // 假装是另一个进程（真进程号判断不出来的那部分靠这个）
+    s.name = "别人的未保存名字".to_owned();
+    s.dirty = true;
+    s.snapshot = container::now_secs();
+    container::write_session(&cache, &s).unwrap();
+    std::fs::write(cache.join(container::CHART_NAME), serde_json::to_vec_pretty(&maker.doc().to_json()).unwrap()).unwrap();
+    let before = std::fs::read(cache.join(container::CHART_NAME)).unwrap();
+
+    // ② 一次性读取（opm-ctl 的路径）：文档照常读出来，但缓存目录**一个字节都不许动**
+    let staged = EditCore::stage_file_as(&target, CacheClaim::ReadOnly).unwrap();
+    assert_eq!(staged.doc.meta.name, "被占用", "读出来的仍是**容器里**的文档");
+    let mut reader = EditCore::new();
+    reader.load_staged(staged).unwrap();
+    assert_eq!(container::read_session(&cache).unwrap(), s, "会话元数据不该被改写");
+    assert_eq!(std::fs::read(cache.join(container::CHART_NAME)).unwrap(), before, "快照不该被覆盖");
+
+    // ③ 反之，认领会话的装载（GUI 那条路）会把这一份接管过来
+    let mut gui = EditCore::new();
+    gui.load_into(&target).unwrap();
+    let after = container::read_session(&cache).expect("还算我们的");
+    assert_eq!(after.pid, std::process::id(), "认领会话 ⇒ 元数据归当前进程");
+    assert!(!after.dirty, "刚摊出来的缓存是干净的（还没编辑）");
+
+    std::fs::remove_dir_all(&cache).ok();
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// 新建谱面**第一次保存**建议哪种名字：打包形态给扩展名，文件夹形态给目录名；
 /// **不再给单文件 JSON 当默认**（用户："保存时限定为 opm 或 rpe 包（或对应无压缩文件夹），而不是 json"）
 #[test]

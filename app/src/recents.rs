@@ -598,6 +598,123 @@ pub fn start_screen_ui(
     action
 }
 
+/// 「上次没有正常退出」的模态：缓存里还躺着一份 GUI 留下的谱面 ⇒ 问用户要不要接着编辑。
+///
+/// **判据在库里**（`session::gui_leftovers`）：解压缓存正常退出时会被删掉，留下的那份只能是
+/// 被强杀/崩溃留下的；出处写在目录里的 `session.json`，于是 `opm-ctl` 的缓存不会来打扰用户。
+/// 这里只负责画与收集选择 —— 三个出口都要有：继续（默认）、丢弃、稍后再说（**什么都不删**）。
+///
+/// 返回 `None` = **用户还没决定**（弹窗继续开着）。这一点必须是显式的：
+/// 早先"没点按钮"被当成"稍后再说"，于是弹窗只活了一帧就自己消失了（截图里什么都看不到）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeChoice {
+    /// 接着编辑这份谱面（连缓存里的未保存改动一起）
+    Continue,
+    /// 丢弃这份缓存（磁盘上的谱面文件不动）
+    Discard,
+    /// 先不动它：这次不问第二次，下次启动再问
+    Later,
+}
+
+pub fn resume_cache_modal(
+    ctx: &egui::Context,
+    item: &crate::session::Leftover,
+    others: usize,
+) -> Option<ResumeChoice> {
+    let mut choice: Option<ResumeChoice> = None;
+    let out = dialog::modal(ctx, "opm_resume_cache", dialog::W_FORM, |ui| {
+        dialog::title(ui, "上次没有正常退出");
+        ui.label(format!(
+            "上次运行时（{}）有一份谱面还摊在缓存里：{}。",
+            crate::session::age_text(item.age_secs),
+            item.headline()
+        ));
+        ui.add_space(6.0);
+        dialog::hint(
+            ui,
+            "程序正常退出时会清理自己摊出来的缓存，这里还留着一份 ⇒ 上一个进程多半被强杀或崩溃了。",
+        );
+        ui.add_space(8.0);
+        for line in item.details() {
+            ui.label(line);
+        }
+        if others > 0 {
+            ui.add_space(4.0);
+            dialog::hint(ui, format!("另有 {others} 份更旧的遗留缓存，本次不动它们。"));
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("▶ 继续此谱面")
+                .on_hover_text("按缓存里的内容接着编辑（保存目标指回原来的文件）")
+                .clicked()
+            {
+                choice = Some(ResumeChoice::Continue);
+            }
+            if ui
+                .button("🗑 丢弃缓存")
+                .on_hover_text("删掉这份解压缓存；磁盘上的谱面文件不动")
+                .clicked()
+            {
+                choice = Some(ResumeChoice::Discard);
+            }
+            if ui
+                .button("稍后再说")
+                .on_hover_text("什么都不做：留着它，下次启动再问")
+                .clicked()
+            {
+                choice = Some(ResumeChoice::Later);
+            }
+        });
+    });
+    // Esc / 点遮罩 = 稍后再说：**最保守的那一个** —— 不删东西，也不擅自换掉用户手里的文档
+    if out.dismissed {
+        return Some(ResumeChoice::Later);
+    }
+    choice
+}
+
+/// **单会话**门槛：已经有一个 OpenPhM 在跑（独占锁被占着）。
+///
+/// 为什么必须拦：解压缓存是**进程独占**的（退出即清、切换即删），两个会话同时跑会互相删对方
+/// 正在用的那份。这里给一个关不掉的模态（Esc 与遮罩都吃不掉它），出口只有"关闭"。
+///
+/// 为什么不做成"直接把已有窗口提到前台"：那需要平台相关的窗口管理（X11/Wayland 各一套），
+/// 而这句话本身已经足够让人明白该去看哪个窗口 —— 附上 pid 与启动时间，找不到时能自己查。
+pub fn session_busy_modal(ctx: &egui::Context, who: Option<&crate::codec::container::Session>) -> bool {
+    let mut quit = false;
+    let _ = dialog::sticky_modal(ctx, "opm_session_busy", dialog::W_FORM, |ui| {
+        dialog::title(ui, "已经有一个 OpenPhM 在运行");
+        ui.label(
+            "同一时刻只允许一个 OpenPhM 会话：解压缓存是进程独占的，两个会话会互相删掉对方正在用的那份。",
+        );
+        ui.add_space(6.0);
+        match who {
+            Some(w) => {
+                let age = crate::session::age_text(
+                    crate::codec::container::now_secs().saturating_sub(w.started),
+                );
+                dialog::warn(ui, &format!("正在运行的那个：进程 {}（{} 启动）", w.pid, age));
+            }
+            // 锁文件读不出来（比如刚被清掉）：**照样拦**，只是说不出是谁 —— 判定靠锁，不靠这个文件
+            None => dialog::warn(ui, "正在运行的那个：读不到锁文件里的身份信息"),
+        }
+        ui.add_space(8.0);
+        dialog::hint(ui, "这一份没有碰任何缓存与谱面文件，直接关掉它是安全的。");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("关闭")
+                .on_hover_text("关掉这一份，回到已经在运行的那个窗口")
+                .clicked()
+            {
+                quit = true;
+            }
+        });
+    });
+    quit
+}
+
 /// 缺少 7z 的**黏性模态**：盖在起始界面上，是个门槛，不是提示条。
 ///
 /// 为什么是硬门槛而不是"打一行日志继续跑"：`.opm` 容器（音乐/曲绘装在里面的那个形态）

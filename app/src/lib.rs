@@ -22,6 +22,8 @@
 //! · [`edit`]   编辑意图 → 命令（手势翻译成命令 JSON；纯函数，可单测）
 //! · [`dialog`] 模态对话框的统一外观（颜色/宽度/Esc 归属；新建谱面与编辑页的弹窗共用一套）
 //! · [`recents`] 起始界面（最近打开的谱面 + 新建谱面表单；存在配置目录，不进谱面文件）
+//! · [`session`] **单会话**（同一时刻只允许一个进程；锁随句柄走，被强杀也由内核放掉）与
+//!   "上次没退干净"的判定（解压缓存里还躺着 GUI 留下的目录 = 崩溃遗留）
 //! · [`view`]    视图模型（左侧判定线列表行 / 右侧检查器快照；纯派生，可单测）
 //! · [`zip`]     最小 ZIP 读写（自研；opm 的容器形态需要它，本机取不到 crates）
 //! · [`shot`]    自截屏（`--shot`）的决策逻辑（纯函数；没配置时**永远不动**这条有回归测试）
@@ -47,6 +49,7 @@ pub mod headless;
 pub mod perf;
 pub mod recents;
 pub mod render;
+pub mod session;
 pub mod shot;
 pub mod state;
 pub mod timeline;

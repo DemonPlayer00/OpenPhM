@@ -380,6 +380,8 @@ impl Format {
         match s {
             "opm" => Some(Format::Opm),
             "opmz" | "opm-zip" | "container" => Some(Format::OpmZip),
+            // `as_str()` 写出来的是给人看的中文名 —— 至少要能读回来（缓存里的会话元数据就存它）
+            "opm 容器" => Some(Format::OpmZip),
             "rpe" => Some(Format::Rpe),
             _ => None,
         }
@@ -445,6 +447,10 @@ pub fn to_document(v: Value) -> Result<(Document, Fidelity), String> {
 }
 
 /// 从文件读入（按内容判断格式：ZIP 魔数 ⇒ 容器；否则当 JSON 解析）
+///
+/// **编辑器/转换工具请走 `EditCore::stage_file`** —— 那条会把资源一起带进临时目录、
+/// 并认得 `.pez` 与无压缩文件夹；这里的 `load_file` 只回答"这份 JSON 是什么文档"，
+/// 适合"只要文档本体"的一次性用途。
 pub fn load_file(path: &std::path::Path) -> Result<(Document, Fidelity), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
     load_bytes(&bytes)
@@ -459,17 +465,4 @@ pub fn load_bytes(bytes: &[u8]) -> Result<(Document, Fidelity), String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("既不是 ZIP 也不是 UTF-8 JSON: {e}"))?;
     let v: Value = serde_json::from_str(text).map_err(|e| format!("JSON 解析失败: {e}"))?;
     to_document(v)
-}
-
-/// 读入**连同容器资源**：裸 JSON 时资源为空
-pub fn load_file_with_assets(
-    path: &std::path::Path,
-) -> Result<(Document, Vec<crate::zip::Entry>, Fidelity), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
-    if crate::zip::looks_like_zip(&bytes) {
-        let (c, fid) = container::read(&bytes)?;
-        return Ok((c.doc, c.assets, fid));
-    }
-    let (doc, fid) = load_bytes(&bytes)?;
-    Ok((doc, Vec::new(), fid))
 }

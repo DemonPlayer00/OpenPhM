@@ -29,6 +29,56 @@ use crate::journal::{read_track, Change, Journal, LineProps};
 /// 最近广播的保留条数（调试面板 / `{"op":"broadcasts"}` 用）
 const BROADCAST_RING: usize = 512;
 
+/// **摊缓存时"谁在认领这个目录"**（见 [`EditCore::stage_file_as`]）。
+///
+/// 解压缓存按**容器内容**分目录（同一个包落在同一个目录），但 `session.json` 记的是**会话**状态
+/// （谁的进程、有没有未保存的快照）—— 于是"一次性读一下"的工具不能去写别人的会话元数据，
+/// 就像不能去动别人桌上的草稿。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheClaim {
+    /// **一个会话**：在缓存目录里立 `session.json`（崩溃后它就是"上次没退干净"的证据），
+    /// 换谱面/退出时负责清理。GUI 与"要在缓存里留工作副本"的调用方用这个。
+    Session,
+    /// **一次性读取**（`opm-ctl` 的转换/批处理）：别人已经认领的目录**一个字节都不碰**
+    /// （尤其是那份可能带着未保存改动的 `opm.json` 快照）。
+    ReadOnly,
+}
+
+/// 从解压缓存"继续编辑"之后**实际拿到了什么**（调用方据此报告；不是一个含糊的 bool）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resumed {
+    /// 谱面名
+    pub name: String,
+    /// 恢复出来的保存目标（`None` = 这份谱面当初还没落过盘）
+    pub source: Option<PathBuf>,
+    /// 带回来的资源个数
+    pub assets: usize,
+    /// 继续之后**是不是脏的**（缓存里有未保存改动 ⇒ 是）
+    pub unsaved: bool,
+}
+
+/// **"载入文件到临时文件夹"的结果**（见 [`EditCore::stage_file`]）：与"会话状态"无关的纯数据。
+///
+/// 它只回答"这份输入是什么、摊到哪儿了"，**不碰任何会话字段** —— 于是"打开文件"与
+/// "从崩溃缓存继续"共用同一个装载入口 [`EditCore::load_staged`]，而两者的差别（保存目标、
+/// 脏位）在这一层就已经定下来，装载那一步不需要知道输入是 zip 还是目录。
+#[derive(Clone, Debug)]
+pub struct Staged {
+    /// **我们摊出来的**临时目录（`None` = 这份输入本来就是可编辑的真实文件/文件夹，没什么可摊的）。
+    /// 有值 ⇒ 会话退出时要负责删掉（一个进程至多留一份）。
+    pub dir: Option<PathBuf>,
+    pub doc: Document,
+    /// 资源（名字 → 字节）；裸 JSON / 文件夹形态时是磁盘上那些文件的这份拷贝
+    pub assets: Vec<crate::zip::Entry>,
+    /// 来源格式（保存默认写回同一种）
+    pub format: Format,
+    pub fid: Fidelity,
+    /// 保存目标（**继续编辑时写回哪儿**）：容器/裸文件 = 输入路径；崩溃缓存 = 元数据里记的原文件
+    pub target: Option<PathBuf>,
+    /// 缓存里有**未保存的改动**（只有"从崩溃缓存继续"会为真）
+    pub unsaved: bool,
+}
+
 pub struct EditCore {
     /// **私有**：文档只能由 EditCore 写。
     ///
@@ -76,6 +126,13 @@ pub struct EditCore {
     /// 这样 GUI 与 CLI 都只是**读** [`EditCore::overlaps`]（或问 `{"op":"overlaps"}`），
     /// 而不是各自维护一份、各自决定何时重查 —— 两份实现迟早不一致（这正是它搬家的原因）。
     overlaps: Vec<crate::cmd::Overlap>,
+    /// 容器资源**摊到磁盘**后的目录（`None` = 不是从容器载入的，或容器里没有资源）。
+    ///
+    /// 为什么必须摊出来：容器是**自包含**的，`meta.audio` 里写的是**文件名**（不是宿主机路径）——
+    /// 只有把包里的资源落成真实文件，"按路径装载音频"这条既有链路才找得到它。
+    /// 这条链以前只写了 `container::extract_assets`，**没人调用** ⇒ 从 `.opm` 打开的谱面
+    /// 永远"音乐没装上"（用户报的"音乐应有时长"就是这个：包里有 41MB 的 flac，却解析到谱面旁边去找）。
+    asset_dir: Option<PathBuf>,
     /// 上次保存用的（形态, 目标路径）：同路径再存要回到**同一个形态**。
     /// 文件夹形态下 `path` 是目录里的谱面文件，光看扩展名会把"文件夹"误判成"单文件"。
     last_save: Option<(SaveShape, PathBuf)>,
@@ -346,51 +403,282 @@ impl EditCore {
             // 空文档没有事件 ⇒ 没有重叠（不必扫一遍）
             overlaps: Vec::new(),
             last_save: None,
+            asset_dir: None,
         }
     }
 
-    /// 载入谱面：**按内容判断格式**（opm 原生或 RPE），返回保真度报告。
+    /// ① **载入文件到临时文件夹**（用户要求的一步：与"正式加载编辑"分开的两个调用）。
     ///
-    /// 扩展名不参与判断 —— 两种格式都是 `.json`，`.opm.json` 只是本项目的命名习惯。
-    pub fn load_reporting(path: &Path) -> Result<(Self, codec::Fidelity), String> {
-        // **按字节分流**：ZIP 魔数 ⇒ opm 容器（谱面 + 资源），否则当 JSON（裸 opm / RPE）。
-        // 这里以前直接 `read_to_string` —— 容器一上来就会以"不是 UTF-8"失败。
-        let (doc, assets, fid) = codec::load_file_with_assets(path)?;
-        let fmt = codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm);
-        let rpe_target = if fmt == codec::Format::Rpe {
+    /// **各种格式与打包情况都在这里处理**，出口只有一种东西：一份 [`Staged`]（文档 + 资源 +
+    /// 保真度 + 格式 + 保存目标）。认得的输入形态：
+    ///
+    /// | 输入 | 判据（**按内容，不看扩展名**） | 摊到临时目录？ |
+    /// |---|---|---|
+    /// | opm 容器 `.opm` | ZIP 里是 `opm.json` | 是：`<临时目录>/opm/<key>/` |
+    /// | RPE 谱面包 `.pez` | ZIP 里有 `info.yml` | 是：同上 |
+    /// | opm 无压缩文件夹 | 目录里有 `opm.json` | 否（资源本来就是真实文件） |
+    /// | RPE 无压缩文件夹 | 目录里有 `info.yml` | 否 |
+    /// | 裸 opm / RPE JSON | 既不是 ZIP 也不是目录 | 否 |
+    /// | 上一轮留下的解压缓存 | 目录里多一份 `session.json` | 是（它本来就在临时目录里） |
+    ///
+    /// 为什么要把这一步单独抽出来：**"怎么把输入摊开"与"装进会话"是两件事**。
+    /// 早先它们缠在 `load_reporting`/`load_into` 里各写一遍，于是"启动那条路"漏了摊资源
+    /// （用户报的"包里有音乐却装不上"），而 `.pez` 干脆读不回来（`chart.json` 被当 opm 解析）。
+    /// 现在摊开只有这一份实现，装进会话只有 [`EditCore::load_staged`] 一份实现。
+    pub fn stage_file(path: &Path) -> Result<Staged, String> {
+        Self::stage_file_as(path, CacheClaim::Session)
+    }
+
+    /// 同 [`EditCore::stage_file`]，但显式说明"这次摊缓存算不算认领一个会话"（见 [`CacheClaim`]）。
+    pub fn stage_file_as(path: &Path, claim: CacheClaim) -> Result<Staged, String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            return Self::stage_folder(path);
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+        if !crate::zip::looks_like_zip(&bytes) {
+            // 裸 JSON：按**内容**判 opm / RPE（`codec::load_bytes` 就是那条判据）
+            let (doc, fid) = codec::load_bytes(&bytes)?;
+            return Ok(Staged {
+                dir: None,
+                doc,
+                assets: Vec::new(),
+                format: codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm),
+                fid,
+                target: Some(path.to_path_buf()),
+                unsaved: false,
+            });
+        }
+        let mut fid = codec::Fidelity::new("opm", "容器（zip）".to_owned());
+        let entries = codec::container::unpack(&bytes, &mut fid)?;
+        // **"这是哪一种包"只能等解开、看过条目名才知道**：RPE 谱面包里有 `info.yml`
+        let is_package = entries.iter().any(|e| e.name == codec::package::INFO_NAME);
+        let (doc, assets) = if is_package {
+            codec::package::read_entries(entries, &mut fid)?
+        } else {
+            let c = codec::container::read_entries(entries, &mut fid)?;
+            (c.doc, c.assets)
+        };
+        // 来源格式跟着**内容**走（与旧行为一致）：容器 ⇒ `opm`，RPE 谱面包 ⇒ `rpe`。
+        // 它决定"保存时默认写回哪种格式"（RPE 进就 RPE 出），也是会话元数据里记的那一项。
+        let format = codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm);
+        // 容器/包：**摊到 `<临时目录>/opm/<内容 hash>`**（同一个包反复打开落在同一个目录）。
+        // `meta.audio` 里写的是**包内文件名**，只有摊成真实文件，"按路径装载音频"才找得到它。
+        let key = codec::container::cache_key(&bytes);
+        let dir = Self::stage_into_cache(&doc, &assets, &key, Some(path), format, claim, &mut fid)?;
+        Ok(Staged {
+            dir: Some(dir),
+            doc,
+            assets,
+            format,
+            fid,
+            target: Some(path.to_path_buf()),
+            unsaved: false,
+        })
+    }
+
+    /// 目录形态：opm 无压缩文件夹 / RPE 无压缩文件夹 / **上一轮留下的解压缓存**（三步同一条路）。
+    fn stage_folder(dir: &Path) -> Result<Staged, String> {
+        let mut entries: Vec<crate::zip::Entry> = Vec::new();
+        let mut subdirs: Vec<String> = Vec::new();
+        let rd = std::fs::read_dir(dir).map_err(|e| format!("读目录失败 {}: {e}", dir.display()))?;
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(m) = e.metadata() else { continue };
+            let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if m.is_dir() {
+                subdirs.push(name); // 无压缩形态是**平的**（见 `write_entries_to_dir`）
+                continue;
+            }
+            // 解压缓存里的会话元数据 / 半截临时文件都不是资源
+            if name == codec::container::SESSION_NAME || name.ends_with(".tmp") {
+                continue;
+            }
+            let data = std::fs::read(&p).map_err(|e| format!("读 {name} 失败: {e}"))?;
+            entries.push(crate::zip::Entry { name, data });
+        }
+        let session = codec::container::read_session(dir);
+        let mut fid = codec::Fidelity::new("opm", "无压缩文件夹".to_owned());
+        let is_package = entries.iter().any(|e| e.name == codec::package::INFO_NAME);
+        let (doc, assets) = if is_package {
+            codec::package::read_entries(entries, &mut fid)?
+        } else {
+            let c = codec::container::read_entries(entries, &mut fid)?;
+            (c.doc, c.assets)
+        };
+        // 来源格式：**会话元数据优先**（它记的是"原来那个文件是什么形态"—— 摊开之后目录里只剩
+        // 一份 `opm.json`，光看内容分不出它原来是 `.opm` 容器还是无压缩文件夹，而"继续编辑之后
+        // Ctrl+S 写回哪种形态"要的正是前者）；没有元数据时才按内容判。
+        let format = session
+            .as_ref()
+            .and_then(|s| codec::Format::parse(&s.format))
+            .or_else(|| codec::Format::parse(&fid.source))
+            .unwrap_or(codec::Format::Opm);
+        if !subdirs.is_empty() {
+            fid.warn(format!(
+                "目录里的子目录（{}）没被载入：无压缩形态是平的，资源要放在这一层",
+                subdirs.join("、")
+            ));
+        }
+        // 这一层目录**是我们摊出来的**吗？
+        // · 上一轮崩溃留下的缓存：它就在临时目录里，退出时归我们清理（`target`/`unsaved` 从元数据恢复）
+        // · 用户自己的工程文件夹：不是我们的东西，**一个字节都不许删**
+        let ours = session.is_some() && dir.starts_with(codec::container::cache_root());
+        let target = session
+            .as_ref()
+            .and_then(|s| s.source.clone())
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| (!ours).then(|| dir.join(if is_package { codec::package::CHART_NAME } else { codec::container::CHART_NAME })));
+        let unsaved = session.as_ref().is_some_and(codec::container::Session::has_unsaved);
+        fid.note(format!(
+            "无压缩形态：{} 个文件（资源 {} 个）",
+            assets.len() + 1,
+            assets.len()
+        ));
+        fid.finalize();
+        Ok(Staged {
+            dir: ours.then(|| dir.to_path_buf()),
+            doc,
+            assets,
+            format,
+            fid,
+            target,
+            unsaved,
+        })
+    }
+
+    /// 把容器内容摊到 `<临时目录>/opm/<key>/`：**谱面本体 + 资源 + 会话元数据**，然后按上限修剪。
+    ///
+    /// （这一步以前叫 `materialize_assets`，长在"载入会话"里；现在只属于"载入文件到临时文件夹"。）
+    fn stage_into_cache(
+        doc: &Document,
+        assets: &[crate::zip::Entry],
+        key: &str,
+        source: Option<&Path>,
+        format: codec::Format,
+        claim: CacheClaim,
+        fid: &mut codec::Fidelity,
+    ) -> Result<PathBuf, String> {
+        let dir = codec::container::extract_dir(key);
+        // **别人已经认领的目录，一次性读取者一个字节都不碰**。
+        //
+        // 为什么要有这条：缓存目录按**容器内容**命名，而 `session.json` 与那份 `opm.json`
+        // 快照是**会话**状态。`opm-ctl`（转换/批处理）读同一个包时若照常摊一遍，就会把 GUI
+        // 崩溃留下的元数据与未保存快照一起覆盖掉 —— "上次没退干净"那条提示连同用户一小时
+        // 的改动就这么没了（实测：一次 `opm-ctl --file X dump` 就能抹掉）。
+        let existing = codec::container::read_session(&dir);
+        let claimed_by_other = existing.as_ref().is_some_and(|s| s.pid != std::process::id());
+        if claimed_by_other && claim == CacheClaim::ReadOnly {
+            fid.note(format!(
+                "缓存目录 {} 已被另一个会话占用（pid {}）：本次只读不动它（不覆盖它的快照与会话元数据）",
+                dir.display(),
+                existing.map(|s| s.pid).unwrap_or(0)
+            ));
+        } else {
+            codec::container::extract_container_into(&dir, doc, assets)?;
+            // 记下"这份缓存是谁、什么时候、为哪个谱面摊出来的"（见 `codec::container::Session`）：
+            // 正常退出会删掉它，于是**下次启动时还躺着的 GUI 目录 = 上个进程被强杀或崩溃**，
+            // 靠这份元数据说清"是哪份谱面、有没有未保存改动"
+            let _ = codec::container::write_session(
+                &dir,
+                &codec::container::Session {
+                    pid: std::process::id(),
+                    exe: codec::container::exe_name(),
+                    source: source.map(|p| p.display().to_string()),
+                    format: format.as_str().to_owned(),
+                    name: doc.meta.name.clone(),
+                    started: codec::container::now_secs(),
+                    snapshot: 0,
+                    dirty: false,
+                },
+            );
+        }
+        // 摊完就按上限修剪（`/tmp` 常是 tmpfs）：本目录刚写过 ⇒ mtime 最新，不会被删
+        let (n, freed) = codec::container::prune_cache(
+            &codec::container::cache_root(),
+            codec::container::CACHE_CAP_BYTES,
+        );
+        fid.note(format!(
+            "容器解压到 {}（{} 个文件）{}",
+            dir.display(),
+            assets.len() + 1,
+            if n > 0 {
+                format!("；清理解压缓存 {n} 个旧目录 / {} MB", freed / 1024 / 1024)
+            } else {
+                String::new()
+            }
+        ));
+        fid.finalize();
+        Ok(dir)
+    }
+
+    /// ② **正式加载编辑**：把 [`Staged`] 装进这个会话（**唯一**一个入口）。
+    ///
+    /// 整体替换是数据结构层面的"全量变更"：撤销栈清空、revision +1、按**全量话题**广播，
+    /// 于是 GUI 只会走一次"整表重建"（`structure` 脏位），不需要各面板自己去猜。
+    ///
+    /// **换谱面时上一份解压目录立刻删掉** ⇒ 一个进程至多留一份（缓存是进程独占的）。
+    pub fn load_staged(&mut self, staged: Staged) -> Result<codec::Fidelity, String> {
+        let Staged { dir, doc, assets, fid, format, target, unsaved } = staged;
+        let origin = self.origin;
+        self.doc = doc;
+        self.assets = assets;
+        self.journal = Journal::default(); // 换了谱面，旧的逆操作全部作废
+        self.last_save = None; // 换了文档，上次的保存形态不再适用
+        if let Some(old) = self.asset_dir.take() {
+            if Some(&old) != dir.as_ref() {
+                let _ = std::fs::remove_dir_all(&old);
+            }
+        }
+        self.asset_dir = dir;
+        self.path = target;
+        self.source_format = format;
+        if self.source_format == codec::Format::Rpe {
             // 沿用来源文件的版本档位（`META.RPEVersion` 不可信，但作为"写回哪一档"的依据可用）
-            let v = fid.version.clone();
-            let n = v
+            let n = fid
+                .version
                 .split('=')
                 .nth(1)
                 .and_then(|x| x.split(|c: char| !c.is_ascii_digit()).next())
                 .and_then(|x| x.parse::<i64>().ok())
                 .unwrap_or(160);
-            codec::rpe::RpeTarget { version: if n > 0 { n } else { 160 }, ..Default::default() }
-        } else {
-            codec::rpe::RpeTarget::default()
-        };
-        let core = Self {
-            doc,
-            journal: Journal::default(),
-            path: Some(path.to_path_buf()),
-            revision: 0,
-            log: vec![format!("load({}) 格式={}", path.display(), fmt.as_str())],
-            subscribers: Subscribers::default(),
-            broadcasts: VecDeque::new(),
-            last_delivered: 0,
-            origin: Origin::Local,
-            verbose: false,
-            saved_revision: 0,
-            source_format: fmt,
-            rpe_target,
-            last_fidelity: Some(fid.clone()),
-            assets, // 裸 JSON 时为空；容器时是包里的资源
-            overlaps: Vec::new(),
-            last_save: None, // 下面立刻全量扫一遍（载入是"整表变化"）
-        };
-        let mut core = core;
-        core.refresh_overlaps_all();
+            self.rpe_target =
+                codec::rpe::RpeTarget { version: if n > 0 { n } else { 160 }, ..Default::default() };
+        }
+        self.revision += 1;
+        // 缓存里有未保存改动（只有"从会话目录继续"会这样）⇒ 载入之后就是脏的
+        self.saved_revision =
+            if unsaved { self.revision.wrapping_sub(1) } else { self.revision };
+        self.last_fidelity = Some(fid.clone());
+        self.refresh_overlaps_all(); // 整表换了，全量
+        self.log.push(format!(
+            "load 格式={} 保存目标={} 判定线={} 音符={}",
+            self.source_format.as_str(),
+            self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "无".to_owned()),
+            self.doc.judge_lines.len(),
+            self.doc.judge_lines.iter().map(|l| l.notes.len()).sum::<usize>()
+        ));
+        // 全量话题：线集合、时间映射、所有属性/轨道/音符都可能是新的
+        let topics = Self::all_topics();
+        self.emit(
+            origin,
+            format!("载入 {}", self.doc.meta.name),
+            topics,
+            Vec::new(),
+        );
+        Ok(fid)
+    }
+
+    /// 载入谱面：**按内容判断格式**（opm 原生 / RPE / 两种打包形态 / 无压缩文件夹），返回保真度报告。
+    pub fn load_reporting(path: &Path) -> Result<(Self, codec::Fidelity), String> {
+        // 两步走：① 摊到临时文件夹（各种格式与打包情况）② 装进会话（同一个入口）
+        let staged = Self::stage_file(path)?;
+        let mut core = Self::new();
+        let fid = core.load_staged(staged)?;
         Ok((core, fid))
     }
 
@@ -704,6 +992,9 @@ impl EditCore {
         self.last_save = Some((shape, path.to_path_buf()));
         self.saved_revision = self.revision; // 存过就不算脏
         self.last_fidelity = Some(fid.clone());
+        // 解压缓存里那份快照**跟着保存走**：否则下次启动时"继续此谱面"会把**保存前**的旧内容
+        // 当成最新（用户刚存过盘，缓存却说他还有未保存改动 —— 那就成了骗人）。
+        let _ = self.snapshot_session();
         Ok((target, fid))
     }
 
@@ -752,42 +1043,11 @@ impl EditCore {
 
     /// 把另一个文件**装进当前核心**（GUI「打开」/控制通道 `{"op":"load"}` 走这里）。
     ///
-    /// 整体替换是数据结构层面的"全量变更"：撤销栈清空、revision +1、按**全量话题**广播，
-    /// 于是 GUI 只会走一次"整表重建"（`structure` 脏位），不需要各面板自己去猜。
+    /// 就是"两步走"的合体：[`EditCore::stage_file`] → [`EditCore::load_staged`]。
+    /// 想在中途做点别的（问用户、只摊开不装载、把摊开的目录留着）就分开调那两个。
     pub fn load_into(&mut self, path: &Path) -> Result<Fidelity, String> {
-        let (doc, assets, fid) = codec::load_file_with_assets(path)?;
-        let origin = self.origin;
-        self.doc = doc;
-        self.assets = assets;
-        self.journal = Journal::default(); // 换了谱面，旧的逆操作全部作废
-        self.last_save = None; // 换了文档，上次的保存形态不再适用
-        self.path = Some(path.to_path_buf());
-        self.source_format = codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm);
-        if self.source_format == codec::Format::Rpe {
-            let n = fid
-                .version
-                .split('=')
-                .nth(1)
-                .and_then(|x| x.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|x| x.parse::<i64>().ok())
-                .unwrap_or(160);
-            self.rpe_target = codec::rpe::RpeTarget { version: if n > 0 { n } else { 160 }, ..Default::default() };
-        }
-        self.revision += 1;
-        self.saved_revision = self.revision;
-        self.last_fidelity = Some(fid.clone());
-        self.refresh_overlaps_all(); // 整表换了，全量
-        self.log.push(format!(
-            "load_into({}) 格式={} 判定线={} 音符={}",
-            path.display(),
-            self.source_format.as_str(),
-            self.doc.judge_lines.len(),
-            self.doc.judge_lines.iter().map(|l| l.notes.len()).sum::<usize>()
-        ));
-        // 全量话题：线集合、时间映射、所有属性/轨道/音符都可能是新的
-        let topics = Self::all_topics();
-        self.emit(origin, format!("载入 {}", path.display()), topics, Vec::new());
-        Ok(fid)
+        let staged = Self::stage_file(path)?;
+        self.load_staged(staged)
     }
 
     /// 用一份现成文档替换（转换工具/测试用）。不广播：这种核心通常还没有订阅者；
@@ -830,9 +1090,90 @@ impl EditCore {
         &self.journal
     }
 
+    /// 写/刷新缓存目录里的会话元数据。`snapshot` = 最近一次文档快照的时刻（0 = 从没写过）。
+    ///
+    /// 失败只记日志：这是**元数据**，写不进去不该影响编辑（顶多下次启动少一次提示）。
+    fn write_session(&mut self, snapshot: u64, dirty: bool) -> Result<(), String> {
+        let Some(dir) = self.asset_dir.clone() else {
+            return Err("没有解压缓存目录".to_owned());
+        };
+        let started = codec::container::read_session(&dir).map(|s| s.started).unwrap_or(0);
+        let s = codec::container::Session {
+            pid: std::process::id(),
+            exe: codec::container::exe_name(),
+            source: self.path.as_ref().map(|p| p.display().to_string()),
+            format: self.source_format.as_str().to_owned(),
+            name: self.doc.meta.name.clone(),
+            // 从缓存"继续"过来的：沿用原来那份的出生时间（它确实是那时候摊出来的）
+            started: if started > 0 { started } else { codec::container::now_secs() },
+            snapshot,
+            dirty,
+        };
+        codec::container::write_session(&dir, &s)
+    }
+
+    /// 把当前**文档快照**写回解压缓存（`<缓存目录>/opm.json` + 会话元数据里的时间与脏位）。
+    ///
+    /// 为什么要它：进程被强杀时，磁盘上的谱面文件是**上一次保存**的版本，编辑了一小时的东西
+    /// 按理说一个字节都不剩。缓存目录本来就是"这次会话的工作副本"，顺手把文档写进去，
+    /// 「继续此谱面」就真的能接着编辑而不是"从头打开"。
+    ///
+    /// **与"退出时清理、未保存的数据按计划丢弃"不冲突**：那条说的是正常退出（守卫里用户选了
+    /// 不保存 ⇒ 缓存随目录一起删掉）；这里是**没走到退出**的那条路上的兜底。
+    ///
+    /// 落法是"先写临时文件再改名"：强杀可能正好发生在写的中途，半截 JSON 比旧快照更糟
+    /// （下次启动会拿着半截文件当文档）。同一目录内的改名在 Unix/Windows 上都是原子替换。
+    pub fn snapshot_session(&mut self) -> Result<(), String> {
+        let Some(dir) = self.asset_dir.clone() else {
+            return Err("没有解压缓存目录（不是从容器载入的）".to_owned());
+        };
+        let chart = serde_json::to_vec_pretty(&self.doc.to_json())
+            .map_err(|e| format!("序列化失败: {e}"))?;
+        let tmp = dir.join(format!("{}.tmp", codec::container::CHART_NAME));
+        std::fs::write(&tmp, &chart).map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join(codec::container::CHART_NAME))
+            .map_err(|e| format!("替换 {} 失败: {e}", dir.display()))?;
+        self.write_session(codec::container::now_secs(), self.is_dirty())
+    }
+
+    /// **从解压缓存继续**（启动时那个"上次没有正常退出"的对话框选「继续」走这里）。
+    ///
+    /// 就是"两步走"在**目录**这种输入上的用法：[`EditCore::stage_file`] 认得"摊开的目录"，
+    /// 会话元数据（`session.json`）告诉它**保存目标是原来那个文件**、以及**缓存里有没有未保存改动**。
+    /// 于是"继续"与"打开文件"走的是**同一个装载入口**，不存在第二套装载逻辑。
+    pub fn load_session_into(&mut self, dir: &Path) -> Result<Resumed, String> {
+        let session = codec::container::read_session(dir)
+            .ok_or_else(|| format!("{} 里没有会话元数据（不是一份解压缓存）", dir.display()))?;
+        let staged = Self::stage_file(dir)?;
+        let unsaved = staged.unsaved;
+        let source = staged.target.clone();
+        let fid = self.load_staged(staged)?;
+        let _ = fid;
+        // 接着编辑的是**我们**：把会话元数据改成自己的进程（快照时间与脏位沿用缓存里的记录）
+        let _ = self.write_session(session.snapshot, session.dirty);
+        self.log.push(format!(
+            "从缓存继续：{}（资源={}，保存目标={}）",
+            dir.display(),
+            self.assets.len(),
+            self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "无".to_owned())
+        ));
+        Ok(Resumed {
+            name: self.doc.meta.name.clone(),
+            source,
+            assets: self.assets.len(),
+            unsaved,
+        })
+    }
+
     /// 当前保存目标；`None` = 还没落过盘。
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// **容器资源摊到磁盘后的目录**（见 `asset_dir` 字段的说明）。音频装载要在它里面找
+    /// `meta.audio` 写的那个文件名。
+    pub fn asset_dir(&self) -> Option<&Path> {
+        self.asset_dir.as_deref()
     }
 
     /// 文档有没有引用外部资源（音乐 / 曲绘）。
@@ -1020,6 +1361,13 @@ impl EditCore {
                 self.journal = Journal::default();
                 self.path = None;
                 self.source_format = codec::Format::Opm;
+                // **上一份谱面的容器资源与解压缓存必须一起清掉**：留着的话，新建的谱面第一次
+                // 存成 `.opm` 会把**上一个包的音乐/曲绘**装进去（`collect_assets` 从 `self.assets`
+                // 里带过去的），而且解压缓存里那份 `opm.json` 还会被当成"这份新谱面的工作副本"。
+                self.assets = Vec::new();
+                if let Some(old) = self.asset_dir.take() {
+                    let _ = std::fs::remove_dir_all(&old);
+                }
                 self.revision += 1;
                 // 新建之后**是脏的**：还没写进任何文件，界面要提示保存
                 self.saved_revision = self.revision.wrapping_sub(1);

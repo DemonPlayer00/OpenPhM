@@ -129,15 +129,37 @@ GUI 的「打开…/另存为…」走的是**系统文件对话框**（kdialog/
 agent 不要通过 GUI 按钮做文件操作，直接用控制通道的 `{"op":"load"}` / `{"op":"save","path":…}`（不弹窗）。
 `opm-app --file-dialog` 可以让"文件"对话框在启动时摊开，仅供截图/人工检查。
 
-### 三种形态（`.opm` 容器 / `.opm.json` 裸 / `.json` RPE）
+### 载入/保存的形态（**按内容判，不看扩展名**）
 
-读：**按内容**判 —— ZIP 魔数（`PK\x03\x04`）⇒ **opm 容器**（谱面 + 音乐 + 曲绘，一个文件带走）；
-否则当 JSON（`format:"opm"` ⇒ 裸 opm；`judgeLineList`/`BPMList` ⇒ RPE）。`opm-ctl --file X` 三种都吃。
+| 输入 | 判据 | 说明 |
+|---|---|---|
+| opm 容器 `.opm` | ZIP 魔数，里面有 `opm.json` | 谱面 + 音乐 + 曲绘，一个文件带走 |
+| RPE 谱面包 `.pez` | ZIP 魔数，里面有 `info.yml` | Phira 标准：`info.yml` + `chart.json` + 资源 |
+| opm 无压缩文件夹 | 目录里有 `opm.json` | 里面是**平的**（资源放在同一层） |
+| RPE 无压缩文件夹 | 目录里有 `info.yml` | 同上 |
+| 裸 opm / RPE JSON | 既不是 ZIP 也不是目录 | `format:"opm"` / `judgeLineList`·`BPMList` |
 
-写：`format` 取 `auto` / `opm`（**容器**）/ `opm-bare`（裸）/ `rpe`。**容器优先用系统 `7z` 打包**
-（谱面 Deflate、媒体 Copy 直存、字节确定），没有 7z 时用内置实现；有降级时 `convert` 退出码仍为 1。
+**这五种 `opm-ctl --file X` 与 GUI「打开」都吃**（实现只有一份：`EditCore::stage_file`）。
+
+写：`--to opm`（容器）/ `opm-dir`（无压缩文件夹）/ `rpe`（`.pez`）/ `rpe-dir`；四者**装卸对称**
+（写得出就读得回，有测试钉住）。**容器优先用系统 `7z` 打包**（谱面 Deflate、媒体 Copy 直存、字节确定），
+没有 7z 时用内置实现；有降级时 `convert` 退出码仍为 1。单文件 JSON 不再是保存形态（老的仍写得回去）。
 
 agent 建议：**改谱面用裸 `.opm.json`**（可 diff、可读、无二进制），交付时再 `convert` 成 `.opm` 容器。
+
+### 解压缓存与"别踩别人的会话"（`opm-ctl` 必读）
+
+一次载入会把容器内容摊到 `<临时目录>/opm/<内容 hash>/`（Linux `/tmp/opm`、Windows `%TEMP%\opm`），
+因为 `meta.audio` 里写的是**包内文件名**，只有落成真实文件"按路径装载音乐"才找得到它。
+GUI 的每次会话至多留一份、正常退出即清；`opm-ctl` 的目录按设计留着（上限 512 MB，超出按 mtime 修剪）。
+
+**`opm-ctl` 读一个包时走 `CacheClaim::ReadOnly`：别人（例如 GUI 的某个会话）已经认领的缓存目录
+一个字节都不碰** —— 包括那份可能带着未保存改动的 `opm.json` 快照与 `session.json`。
+（不是洁癖：一次 `opm-ctl --file X dump` 就能把 GUI 崩溃留下的快照抹成容器里的旧内容，实测过。）
+
+GUI 侧另有一条硬约束：**同一时刻只允许一个会话**（缓存根目录上一把 `File::try_lock` 独占锁）。
+抢不到的实例不会碰任何文件，只开一个关不掉的模态说明"谁在跑"。所以脚本里要让 GUI 退出，
+别起第二个实例去抢 —— 用控制通道，或让用户关窗（有未保存改动时会问保存/不保存/返回）。
 
 ### RPE 支持范围
 

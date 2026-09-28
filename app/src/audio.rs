@@ -68,14 +68,21 @@ pub struct Audio {
 /// 规则（`--audio` 优先，其次谱面字段）：
 /// - `--audio off|none|""` ⇒ **明确不要音频**（`Ok(None)`）；
 /// - `--audio FILE` ⇒ 就用它（相对路径按当前工作目录，交给系统解释）；
-/// - 不给 `--audio` ⇒ 用谱面 `meta.audio`：**相对路径按谱面所在目录解析**
-///   （谱面里写的是相对自身的名字：容器把音频装进包里就是 `song.ogg` 这种裸文件名）。
+/// - 不给 `--audio` ⇒ 用谱面 `meta.audio`，**绝对路径直接用**；相对路径按这个顺序找：
+///   ① **容器资源目录**（`asset_dir`：`.opm` 是自包含的，音频装在包里，`meta.audio` 写的是裸文件名，
+///      载入时被摊到缓存目录 —— 不找这里就等于"包里有音频却永远说没有"）；
+///   ② 谱面所在目录（裸 `.opm.json` 与音频并排的常见情形）。
+///
+/// **为什么要有 ①**：用户报的正是这个 —— `~/Desktop/朝色の紙飛行機.opm` 里装着 41 MB 的 flac，
+/// 而 `meta.audio` 只写了文件名，于是按 ② 解析到 `~/Desktop/<名字>.flac`（不存在）⇒
+/// 时间轴报"音乐 无音乐"。两个候选都存在时以**容器里那份**为准（自包含的包才是作者要交付的东西）。
 ///
 /// 返回值第二项是"来源"，只用于错误提示 —— 用户要能分清是 `--audio` 写错了，还是谱面里那个字段有问题。
 pub fn resolve_source(
     spec: Option<&str>,
     meta_audio: Option<&str>,
     chart_path: Option<&Path>,
+    asset_dir: Option<&Path>,
 ) -> Result<Option<(PathBuf, Source)>, String> {
     match spec {
         Some("off") | Some("none") | Some("") => return Ok(None),
@@ -94,7 +101,13 @@ pub fn resolve_source(
     if p.is_absolute() {
         return Ok(Some((p, Source::Meta)));
     }
-    // 相对路径：按谱面所在目录补全；谱面还没保存过（没有路径）时保持原样，交给系统按 CWD 解释
+    // 相对路径：先看容器摊出来的资源目录（自包含的包），再看谱面旁边的同名文件
+    if let Some(dir) = asset_dir {
+        let cand = dir.join(&p);
+        if cand.is_file() {
+            return Ok(Some((cand, Source::Meta)));
+        }
+    }
     let full = match chart_path.and_then(|b| b.parent()) {
         Some(dir) => dir.join(&p),
         None => p,
@@ -123,8 +136,21 @@ impl Source {
 
 impl Audio {
     /// 载入 WAV 并打开输出流。`device` 为 None 时用默认输出设备。
+    /// 解码 → **接输出设备** 两步。想看时长却不需要设备（例如设备打不开时仍要算时间轴），
+    /// 用 [`Self::from_decoded`] 分开做：解码成功就能拿到时长。
     pub fn load(path: &Path) -> Result<Self, String> {
-        let wav = decode(path)?;
+        let mut me = Self::from_decoded(decode(path)?)?;
+        me.path = path.display().to_string();
+        me.name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| me.path.clone());
+        Ok(me)
+    }
+
+    /// 把已经解码好的样本接到默认输出设备上（解码与接设备**分开**，见 [`Self::load`]）。
+    /// 路径类字段这里留空，由 [`Self::load`] 补 —— 于是"只要时长不要设备"也能走这一半。
+    pub fn from_decoded(wav: Decoded) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -174,11 +200,8 @@ impl Audio {
             src_channels: wav.channels,
             codec: wav.codec.clone(),
             offset_ns: AtomicU64::new(0),
-            path: path.display().to_string(),
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
+            path: String::new(),
+            name: String::new(),
         };
         me._stream.play().map_err(|e| format!("启动输出流失败: {e}"))?;
         Ok(me)
@@ -272,6 +295,14 @@ pub struct Decoded {
     pub codec: String,
 }
 
+impl Decoded {
+    /// 时长（秒）—— **不需要输出设备也能算**：时间轴总长要的就是它。
+    pub fn duration_sec(&self) -> f64 {
+        let frames = self.samples.len() / self.channels.max(1) as usize;
+        frames as f64 / self.rate.max(1) as f64
+    }
+}
+
 /// 把 symphonia 的编码 id 变成人看得懂的名字。
 /// symphonia 的 `Display` 给的是十六进制 id（`0x1006`），界面上没法看。
 fn codec_name(id: symphonia::core::codecs::audio::AudioCodecId) -> String {
@@ -299,6 +330,19 @@ fn codec_name(id: symphonia::core::codecs::audio::AudioCodecId) -> String {
 }
 
 /// 只解码并报告规格（`--audio-probe` / agent 用）。不解码输出流，因此无需音频设备。
+/// 当前"该装哪份音频"的**标识**（**纯函数**，可单测）：命令行 `--audio` 优先，否则文档的 `meta.audio`。
+///
+/// 用途只有一个但很关键：判断"**要不要重新装载**"。每改一个字（`meta` 广播）都会走到判断，
+/// 所以只能比字符串，不能每次真的去开设备、解一遍音频。
+pub fn spec(cli: Option<&str>, meta: Option<&str>) -> Option<String> {
+    if let Some(a) = cli.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(format!("cli:{a}"));
+    }
+    meta.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("meta:{s}"))
+}
+
 pub fn probe(path: &Path) -> Result<serde_json::Value, String> {
     let d = decode(path)?;
     let frames = d.samples.len() / d.channels.max(1) as usize;
@@ -541,31 +585,59 @@ mod tests {
         // ① `--audio` 明确关掉
         for off in ["off", "none", ""] {
             assert_eq!(
-                resolve_source(Some(off), Some("song.ogg"), Some(chart)).unwrap(),
+                resolve_source(Some(off), Some("song.ogg"), Some(chart), None).unwrap(),
                 None,
                 "--audio {off:?} 表示不要音频"
             );
         }
         // ② `--audio` 显式指定：原样用它（**不**拼谱面目录），来源标成 CLI
-        let (p, src) = resolve_source(Some("/music/a.wav"), Some("song.ogg"), Some(chart))
+        let (p, src) = resolve_source(Some("/music/a.wav"), Some("song.ogg"), Some(chart), None)
             .unwrap()
             .unwrap();
         assert_eq!(p, PathBuf::from("/music/a.wav"));
         assert_eq!(src, Source::Cli);
         assert_eq!(src.label(), "--audio");
         // ③ 没给 `--audio` ⇒ 用谱面字段；**相对路径按谱面目录**（容器里就是 `song.ogg` 这种裸名）
-        let (p, src) = resolve_source(None, Some("song.ogg"), Some(chart)).unwrap().unwrap();
+        let (p, src) = resolve_source(None, Some("song.ogg"), Some(chart), None).unwrap().unwrap();
         assert_eq!(p, PathBuf::from("/charts/song/song.ogg"), "相对谱面自身，不是相对 CWD");
         assert_eq!(src, Source::Meta);
         assert_eq!(src.label(), "谱面 meta.audio");
         // ④ 谱面字段是绝对路径：原样
-        let (p, _) = resolve_source(None, Some("/abs/b.ogg"), Some(chart)).unwrap().unwrap();
+        let (p, _) = resolve_source(None, Some("/abs/b.ogg"), Some(chart), None).unwrap().unwrap();
         assert_eq!(p, PathBuf::from("/abs/b.ogg"));
         // ⑤ 谱面还没保存过（没有路径）：保持原样，交给系统按 CWD 解释
-        let (p, _) = resolve_source(None, Some("c.ogg"), None).unwrap().unwrap();
+        let (p, _) = resolve_source(None, Some("c.ogg"), None, None).unwrap().unwrap();
         assert_eq!(p, PathBuf::from("c.ogg"));
         // ⑥ 谁都没给 / 字段是空白 ⇒ 没有音频（不是错误）
-        assert_eq!(resolve_source(None, None, Some(chart)).unwrap(), None);
-        assert_eq!(resolve_source(None, Some("   "), Some(chart)).unwrap(), None);
+        assert_eq!(resolve_source(None, None, Some(chart), None).unwrap(), None);
+        assert_eq!(resolve_source(None, Some("   "), Some(chart), None).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod spec_and_duration_tests {
+    use super::*;
+
+    /// `spec`：命令行优先于文档字段，空串/空白都算"没有"（**纯函数**，与"要不要重载"直接相关）
+    #[test]
+    fn spec_prefers_the_cli_and_ignores_blanks() {
+        assert_eq!(spec(Some("/a.flac"), Some("/b.ogg")), Some("cli:/a.flac".to_owned()));
+        assert_eq!(spec(Some("  /a.flac  "), None), Some("cli:/a.flac".to_owned()));
+        assert_eq!(spec(None, Some("song.ogg")), Some("meta:song.ogg".to_owned()));
+        assert_eq!(spec(None, Some("   ")), None);
+        assert_eq!(spec(Some("  "), Some("")) , None);
+        assert_eq!(spec(None, None), None);
+        // 同一个值 → 同一个标识（不会因为"每次重新拼字符串"而误判成变化）
+        assert_eq!(spec(None, Some("x.ogg")), spec(None, Some("x.ogg")));
+    }
+
+    /// 时长**不需要输出设备**：解码结果自己就能算（时间轴总长用它）
+    #[test]
+    fn decoded_duration_needs_no_device() {
+        let d = Decoded { samples: vec![0.0; 44100 * 2 * 3], channels: 2, rate: 44100, codec: "test".into() };
+        assert!((d.duration_sec() - 3.0).abs() < 1e-9, "{}", d.duration_sec());
+        // 声道数为 0 这种病态输入不许除零
+        let bad = Decoded { samples: vec![0.0; 100], channels: 0, rate: 0, codec: "x".into() };
+        assert!(bad.duration_sec().is_finite());
     }
 }

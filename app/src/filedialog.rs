@@ -495,7 +495,7 @@ mod tests {
         // 输出里带空白也要能解析（有些程序会多打一个换行）
         let spaced = stub("spaced.sh", "printf '  /tmp/a b.json  \\n'");
         assert_eq!(
-            pick_with(spaced.to_str().unwrap(), Which::Open, None, CHART_FILTER).unwrap(),
+            pick_with_retrying_text_busy(spaced.to_str().unwrap()),
             Some(PathBuf::from("/tmp/a b.json"))
         );
 
@@ -504,6 +504,29 @@ mod tests {
         assert!(err.contains("无法启动"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `pick_with` 的"脚本刚写完就 exec"版本：`ETXTBSY`（Text file busy）时重试。
+    ///
+    /// 这是**测试环境**的竞态，不是被测代码的性质：`cargo test` 把整个 crate 的用例并行跑在
+    /// 一个进程里，而并行的别的用例正在 `Command::spawn`（7z / `sh`）—— fork 出来的子进程在 exec
+    /// 之前持有 fd 表的副本，于是"刚写完的脚本"在这一瞬间可能被判为"正在被写入"而拒绝执行。
+    /// 实测：147 个用例并行跑时大约每二十次复现一次。脚本内容与解析逻辑都没变，
+    /// 所以这里只对**这一个错误码**重试到 1 秒（别的错误照旧当场失败）。
+    #[cfg(test)]
+    fn pick_with_retrying_text_busy(program: &str) -> Option<PathBuf> {
+        let mut last = None;
+        for _ in 0..20 {
+            match pick_with(program, Which::Open, None, CHART_FILTER) {
+                Ok(v) => return v,
+                Err(e) if e.contains("Text file busy") => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("不该失败：{e}"),
+            }
+        }
+        panic!("一直 Text file busy：{last:?}");
     }
 
     /// 谱面名字 → 文件名主干：分隔符与保留字符必须换掉（拿 `meta.name` 当文件名的安全边界）
