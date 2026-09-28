@@ -134,8 +134,6 @@ enum FileAction {
     SaveAsDialog,
     /// 写进**当前指定的保存目标**（空则弹保存窗口）
     SaveToTarget,
-    /// 采用手输的目标路径
-    UseTypedTarget,
     /// 把曲名写进 `meta.name`
     ApplyName,
     /// 新建谱面（有未保存改动时先守卫）
@@ -763,7 +761,9 @@ struct App {
     file_dialog_open: bool,
     /// **保存目标**（合并后的一个路径：文件夹 + 谱面名字 + 扩展名）。
     /// 空串 = 还没指定目标 ⇒ 保存时会弹保存窗口（Krita 的做法）。
-    target_draft: String,
+    /// 保存目标的**只读显示文本**（不再是可编辑输入框：用户要求"保存就按已有目标存，
+    /// 另存为/没有目标才弹选择窗"）。真值只在 `EditCore` 里，这里只是它的显示副本。
+    target_text: String,
     /// 曲名（文档字段 `meta.name`）；新建下一份时的默认文件名也用它
     edit_name: String,
     /// **新建谱面表单**（启动页上的模态；值由这里持有，库只改它）
@@ -955,7 +955,7 @@ impl App {
             // 顶栏的同步逻辑当成"用户把拖动框拉回 0"而抹掉（这个坑当场实测到了）
             window_offset_x_ui: state_window_offset,
             file_dialog_open: dialog_at_start.as_deref() == Some("file"),
-            target_draft: String::new(),
+            target_text: String::new(),
             edit_name: String::new(),
             // 守卫要配合"脏文档"才有意义：启动时直接摆出来仅供截图检查
             space_play: keymap::SpacePlayback::default(),
@@ -1253,8 +1253,8 @@ impl App {
     /// 保存：走**和 CLI 完全相同**的命令（`{"op":"save"}`），不另开一条写文件的路径
     /// 从当前状态刷新对话框字段：**保存目标**（来自 `EditCore::path`）+ 曲名（`meta.name`）
     ///
-    /// 保存目标是**一个**路径 —— 文件夹与谱面名字合起来构成它，而不是两个各自生效的设置。
-    /// 没有目标时留空：界面显示"（未指定）"，保存时就会弹保存窗口（Krita 的语义）。
+    /// 保存目标是**一个**路径，而且只存在于 `EditCore` 里；这里同步的是它的**只读显示副本**
+    /// （界面不再提供第二个输入口径 —— 想改目标只有「另存为…」或"第一次保存时自动弹窗"两条）。
     ///
     /// 顺带刷新状态栏那份文档标识：**这条路径上的每个入口（打开/另存为/新建/切格式）
     /// 都经过这里**，所以"什么时候该重算"只有一个答案。
@@ -1263,7 +1263,10 @@ impl App {
             let c = self.core.lock().unwrap();
             (c.path().map(std::path::Path::to_path_buf), c.doc().meta.name.clone())
         };
-        self.target_draft = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        self.target_text = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "（还没有保存目标）".to_owned());
         self.edit_name = meta_name;
         self.refresh_file_badge();
     }
@@ -1407,35 +1410,17 @@ impl App {
         }
     }
 
-    /// 草稿目标（界面上那行"保存目标"）→ 路径。空串表示"还没指定"。
-    fn target_path(&self) -> Option<std::path::PathBuf> {
-        let t = self.target_draft.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(t))
-        }
-    }
-
-    /// 保存前检查目标：没有就**先弹保存窗口**（这是用户报的"保存新文件无法指定路径"的正解）
+    /// 「保存」的语义（用户要求）：**有目标就写回它；没有目标才弹文件选择窗**。
+    ///
+    /// 以前这里还有一个"可编辑的目标输入框"，于是同一个概念有两种输入方式（框里手打 vs 系统框里选），
+    /// 谁优先、什么时候生效都得解释一遍。现在只有一条：**目标的真值是 `EditCore` 里的 path**，
+    /// 想改它只有一条路 —— 「另存为…」（或第一次保存时的自动弹窗）。
     fn ensure_target_then_save(&mut self) {
-        if self.save_target().is_none() && self.target_path().is_none() {
-            self.file_message = Some((
-                false,
-                "还没有保存目标 —— 请先指定（另存为… 或直接在下面输入目标路径）".to_owned(),
-            ));
-            self.file_dialog_open = true;
-            self.save_as_via_system();
-            return;
-        }
+        // 目标只有一个真值（`EditCore` 的 path）。没有目标时由 `save_doc` 弹系统文件选择窗 ——
+        // **那条逻辑只写一次**，这里只补一句上下文，免得"点保存怎么突然弹窗"没人解释。
         if self.save_target().is_none() {
-            // 界面草稿里有目标：先采用它再保存
-            if let Some(p) = self.target_path() {
-                let p = self.with_extension(p);
-                self.target_draft = p.display().to_string();
-                self.save_doc_as(&p.display().to_string());
-                return;
-            }
+            self.file_message = Some((true, "还没有保存目标：选一个位置写下来".to_owned()));
+            self.file_dialog_open = true;
         }
         self.save_doc();
     }
@@ -1622,7 +1607,7 @@ impl App {
             Ok(Some(p)) => self.open_doc(&p.display().to_string()),
             Ok(None) => self.file_message = Some((true, "已取消".to_owned())),
             Err(e) => {
-                self.file_message = Some((false, format!("{e}（可在下面直接输入路径）")));
+                self.file_message = Some((false, e));
                 self.sync_file_fields();
                 self.file_dialog_open = true;
             }
@@ -1665,12 +1650,14 @@ impl App {
         };
         match (picked, err) {
             (Some(p), _) => {
+                // 系统框里可能没写扩展名：按当前形态补上（文件夹形态不补，见 `with_extension`）
+                let p = self.with_extension(p);
                 self.save_doc_as(&p.display().to_string());
                 self.sync_file_fields();
             }
             (None, None) => self.file_message = Some((true, "已取消".to_owned())),
             (None, Some(e)) => {
-                self.file_message = Some((false, format!("{e}（可在下面直接输入路径）")));
+                self.file_message = Some((false, e));
                 self.sync_file_fields();
                 self.file_dialog_open = true;
             }
@@ -3048,7 +3035,7 @@ impl eframe::App for App {
                 grid_text,
                 file_badge: self.file_badge.as_str(),
                 file_mark: statusbar::file_mark(self.file_dirty, self.file_has_target),
-                file_hover: statusbar::file_hover(self.file_has_target, &self.target_draft),
+                file_hover: statusbar::file_hover(self.file_has_target, &self.target_text),
                 window_offset,
                 overlay_hidden: (!self.overlay_visible)
                     .then(|| statusbar::overlay_hidden_text(self.h_held)),
@@ -3246,27 +3233,13 @@ impl eframe::App for App {
                 });
                 ui.separator();
                 opm_app::dialog::hint(ui, format!("系统文件对话框：{native}"));
-                // 直接指定保存目标（没有系统对话框、或想精确写路径时用）：
-                // 文件夹与文件名在这里是**一串**，不再拆成两个各自生效的设置
-                ui.horizontal(|ui| {
-                    ui.label("目标");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.target_draft)
-                            .desired_width(400.0)
-                            .hint_text("/path/to/charts/曲名.opm.json"),
-                    )
-                    .on_hover_text("保存目标：文件夹 + 谱面名字 + 扩展名，一串就行");
-                    if ui.button("采用此目标").clicked() {
-                        pending = Some(FileAction::UseTypedTarget);
-                    }
-                });
-                ui.add_space(2.0);
+                // **目标不可编辑**（用户要求）：保存写回已有目标，没目标时「保存」自动弹文件选择窗，
+                // 「另存为…」则总是弹。目标只在标题下面那行**显示**（`dialog::path`），不给第二个输入口径。
                 opm_app::dialog::hint(
                     ui,
                     format!(
-                        "提示：目标没有扩展名时会按格式补上 —— opm 包 → {}；裸 opm → {}；RPE → {}",
+                        "在系统框里选的目标若没写扩展名会按格式补上（opm 包 → {}；RPE 包 → {}）",
                         opm_app::codec::Format::OpmZip.extension(),
-                        opm_app::codec::Format::Opm.extension(),
                         opm_app::codec::Format::Rpe.extension(),
                     ),
                 );
@@ -3303,16 +3276,6 @@ impl eframe::App for App {
                 }
                 Some(FileAction::SaveToTarget) => {
                     self.ensure_target_then_save();
-                }
-                Some(FileAction::UseTypedTarget) => {
-                    if let Some(p) = self.target_path() {
-                        let p = self.with_extension(p);
-                        self.target_draft = p.display().to_string();
-                        self.file_message =
-                            Some((true, format!("保存目标 → {}", p.display())));
-                    } else {
-                        self.file_message = Some((false, "目标不能为空".to_owned()));
-                    }
                 }
                 Some(FileAction::ApplyName) => {
                     self.apply_chart_name();
