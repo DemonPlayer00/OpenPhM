@@ -2,8 +2,10 @@
 name = "opm-app"
 version = "0.1.0"
 edition = "2021"
+authors = ["DemonPlayer"]
 license = "GPL-3.0-or-later"
-description = "OpenPhM 制谱器 — UI 骨架（Linux 优先）"
+repository = "https://github.com/DemonPlayer00/OpenPhM"
+description = "OpenPhM 制谱器 —— Phigros 谱面编辑器（Linux 优先；opm 原生格式 + 自研 RPE 编解码）"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [

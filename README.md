@@ -198,7 +198,8 @@ cargo build --target x86_64-pc-windows-gnu --release   # 交叉编译 Windows ex
 （GPL-3.0 标准文本，674 行 / 35147 字节，未作任何修改）；`app/Cargo.toml` 的 `license` 字段同此声明。
 
 ```text
-Copyright (C) 2026 OpenPhM 作者（仓库：https://github.com/DemonPlayer00/OpenPhM）
+Copyright (C) 2026 DemonPlayer
+仓库：https://github.com/DemonPlayer00/OpenPhM
 
 本程序是自由软件：你可以按自由软件基金会发布的 GNU 通用公共许可证条款重新发布和/或修改它，
 条款为第 3 版或（按你的选择）任何更高版本。
