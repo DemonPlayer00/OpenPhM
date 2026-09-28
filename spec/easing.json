@@ -1,0 +1,39 @@
+{
+  "$comment": "opm v0.1 缓动枚举 —— 规范数据。id 与 RPE easingType 编号一一对应；缓动函数本体为通用实现（easings.net 命名），编号语义依据 Phira Documents（teamflos.github.io/phira-docs/chart-standard/chart-format/rpe/extend.html，CC-BY-4.0，署名）。",
+  "easings": [
+    { "id": 1, "name": "linear" },
+    { "id": 2, "name": "outSine" },
+    { "id": 3, "name": "inSine" },
+    { "id": 4, "name": "outQuad" },
+    { "id": 5, "name": "inQuad" },
+    { "id": 6, "name": "inOutSine" },
+    { "id": 7, "name": "inOutQuad" },
+    { "id": 8, "name": "outCubic" },
+    { "id": 9, "name": "inCubic" },
+    { "id": 10, "name": "outQuart" },
+    { "id": 11, "name": "inQuart" },
+    { "id": 12, "name": "inOutCubic" },
+    { "id": 13, "name": "inOutQuart" },
+    { "id": 14, "name": "outQuint" },
+    { "id": 15, "name": "inQuint" },
+    { "id": 16, "name": "outExpo" },
+    { "id": 17, "name": "inExpo" },
+    { "id": 18, "name": "outCirc" },
+    { "id": 19, "name": "inCirc" },
+    { "id": 20, "name": "outBack" },
+    { "id": 21, "name": "inBack" },
+    { "id": 22, "name": "inOutCirc" },
+    { "id": 23, "name": "inOutBack" },
+    { "id": 24, "name": "outElastic" },
+    { "id": 25, "name": "inElastic" },
+    { "id": 26, "name": "outBounce" },
+    { "id": 27, "name": "inBounce" },
+    { "id": 28, "name": "inOutBounce" },
+    { "id": 29, "name": "inOutElastic", "note": "速度事件不可用（RPE 1.7.0 起恢复其可用性，语义仍在演进）" }
+  ],
+  "notes": [
+    "RPE 的 easingType 越界时会被钳制到有效范围（<1 → 1，>29 → 29）。",
+    "速度事件的缓动语义在 RPE 版本间变过（1.7.0 回归「缓动速度数值」）；导入需按 behaviorProfile 选择档位。",
+    "bezier 为独立开关，速度事件不支持贝塞尔。"
+  ]
+}

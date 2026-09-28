@@ -1,0 +1,39 @@
+{
+  "$comment": "opm v0.1 音符类型映射表 —— 规范数据。codec 与测试必须以此为单一数据源，禁止在代码里各写一份 switch。来源：Phira Documents（teamflos.github.io/phira-docs，CC-BY-4.0，署名）、Lchzh Docs、PhiCommonChart 文档。",
+  "opm": ["tap", "hold", "drag", "flick"],
+  "trap": "四套枚举互不相同，读错不会报错：Official 的 3(Hold) 在 RPE 里是 Flick；Official 的 2(Drag) 在 RPE 里是 Hold。任何跨格式转换都必须经过本表。",
+  "formats": {
+    "phigros-official": {
+      "tap": 1,
+      "drag": 2,
+      "hold": 3,
+      "flick": 4,
+      "otherValues": "不可见且不可判定",
+      "source": "docs.lchzh.top/learning/phigros"
+    },
+    "rpe": {
+      "tap": 1,
+      "hold": 2,
+      "flick": 3,
+      "drag": 4,
+      "otherValues": "缺失或未知时按 tap 处理（RPE 表记 Default = Tap）",
+      "source": "teamflos.github.io/phira-docs (RPE 音符)"
+    },
+    "pec": {
+      "tap": 1,
+      "hold": 2,
+      "flick": 3,
+      "drag": 4,
+      "otherValues": "未定义",
+      "source": "teamflos.github.io/phira-docs (PE 音符)"
+    },
+    "phi-common-chart": {
+      "tap": 0,
+      "hold": 1,
+      "flick": 2,
+      "drag": 3,
+      "otherValues": "未定义",
+      "source": "docs.nuanr-mxi.com/chart_format/note"
+    }
+  }
+}

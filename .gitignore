@@ -1,0 +1,12 @@
+# Rust 构建产物：本机 7.8G，绝不入库
+/target/
+**/target/
+
+# 会话/编辑器临时文件
+*.swp
+*~
+.vscode/
+.idea/
+
+# 本机运行痕迹（不属于谱面数据，也不属于源码）
+.opm-recents.json

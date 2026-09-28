@@ -1,0 +1,80 @@
+{
+  "format": "opm",
+  "formatVersion": 1,
+  "minClientCapability": 2,
+  "extensions": [],
+  "meta": {
+    "name": "Minimal Example",
+    "composer": "n/a",
+    "charter": "n/a",
+    "illustrator": "n/a",
+    "difficulty": "IN",
+    "level": "IN 12",
+    "constant": 12.6,
+    "offsetMs": 0,
+    "audio": "audio.ogg",
+    "background": "bg.png"
+  },
+  "source": { "format": "rpe", "version": 160, "behaviorProfile": "rpe-1.7" },
+  "bpmList": [
+    { "startBeat": { "n": 0, "d": 1 }, "bpm": 180.0 }
+  ],
+  "judgeLines": [
+    {
+      "name": "L0",
+      "group": 0,
+      "bpmFactor": 1.0,
+      "zOrder": 0,
+      "isCover": true,
+      "attachUI": null,
+      "isGif": false,
+      "texture": null,
+      "anchor": [0.5, 0.5],
+      "father": -1,
+      "inheritRotation": false,
+      "layers": [
+        {
+          "moveX": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 4, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" },
+            { "startBeat": { "n": 4, "d": 1 }, "endBeat": { "n": 1000000, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+          ],
+          "moveY": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 1000000, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+          ],
+          "rotate": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 1000000, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+          ],
+          "alpha": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 1000000, "d": 1 },
+              "startValue": 1.0, "endValue": 1.0, "easing": "linear" }
+          ],
+          "speed": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 1000000, "d": 1 },
+              "startValue": 10.0, "endValue": 10.0, "easing": "linear" }
+          ]
+        }
+      ],
+      "extended": {},
+      "controls": {},
+      "notes": [
+        { "kind": "tap", "startBeat": { "n": 0, "d": 1 }, "laneX": 0.0,
+          "side": "above", "isFake": false, "alpha": 255, "speed": 1.0,
+          "widthScale": 1.0, "yOffset": 0.0, "visibleTime": 999999.0,
+          "judgeAreaScale": 1.0, "tint": [255, 255, 255],
+          "hitEffectTint": null, "hitsound": null },
+        { "kind": "hold", "startBeat": { "n": 1, "d": 1 }, "endBeat": { "n": 3, "d": 1 },
+          "laneX": -112.5, "side": "above", "isFake": false, "alpha": 255, "speed": 1.0,
+          "widthScale": 1.0, "yOffset": 0.0, "visibleTime": 999999.0,
+          "judgeAreaScale": 1.0, "tint": [255, 255, 255],
+          "hitEffectTint": null, "hitsound": null },
+        { "kind": "drag", "startBeat": { "n": 2, "d": 1 }, "laneX": 112.5,
+          "side": "below", "isFake": true, "alpha": 128 },
+        { "kind": "flick", "startBeat": { "n": 3, "d": 1 }, "laneX": 0.0 }
+      ]
+    }
+  ]
+}
