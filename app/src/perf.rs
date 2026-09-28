@@ -115,6 +115,20 @@ impl TimeMap {
 /// 名字不认识时退回线性 —— 校验器会先拦下未知名字，这里的退回只为"能用"。
 pub fn ease(name: &str, t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
+    // **端点是定义，不是近似**：任何缓动都恰好始于 0、终于 1。
+    // 浮点实现会差最后一两位（实测 `inSine` 的 `ease(1)` = 1 − 1.1e-16、`inBack` = 1 − 2.2e-16、
+    // `outBack` 的 `ease(0)` = 2.2e-16），而这一两位经 `v0 + (v1−v0)·ease` 放大就成了
+    // "**块末的值 ≠ 你写的 endValue**" —— 于是"把线精确放到目标坐标"没有构造性保证
+    //（见检查器的「就位目标」与 §7.76 的端点分析）。
+    //
+    // 只夹**端点**：中间一律不动 —— `back`/`elastic` 的**过冲**（ease 值 > 1 或 < 0）是它们的本意，
+    // 夹了就等于把这两个缓动删掉。
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
     use std::f64::consts::PI;
     const C1: f64 = 1.701_58;
     const C3: f64 = C1 + 1.0;
@@ -310,12 +324,31 @@ fn interp(e: &Event, t: f64) -> f64 {
     }
 }
 
+/// **两端都在时的端点取值**：`t ≤ 0` ⇒ `startValue`、`t ≥ 1` ⇒ `endValue`，**不做任何算术**。
+///
+/// 为什么单列出来：即使 `ease(1)` 已经精确等于 1，`v0 + (v1−v0)·1.0` 在浮点下仍可能差 1 ulp
+/// （`0.1 + (0.3−0.1) = 0.30000000000000004 ≠ 0.3`）。而"**块末就位**"（检查器的目标设置）
+/// 要的正是**按位相等** —— 于是端点直接取端值，中间照旧走插值（含 `back`/`elastic` 的过冲）。
+///
+/// 缺端点（`None`）时不介入：那种情形 [`interp`] 返回的是常量，本来就没有算术误差。
+fn endpoint_value(e: &Event, t: f64) -> Option<f64> {
+    match (as_f64(&e.start_value), as_f64(&e.end_value)) {
+        (Some(v0), Some(_)) if t <= 0.0 => Some(v0),
+        (Some(_), Some(v1)) if t >= 1.0 => Some(v1),
+        _ => None,
+    }
+}
+
 /// 单条事件在拍 `beat` 处的值（按它自己的缓动）。
 ///
 /// 从 [`eval_events`] 里抽出来的：流速积分要在**段内**反复求值，
 /// 值怎么算只该有一份实现 —— 两份实现迟早会在某个缓动上分家。
 pub fn event_value(e: &Event, beat: f64) -> f64 {
-    interp(e, ease(&e.easing, event_t(e, beat)))
+    let t = event_t(e, beat);
+    match endpoint_value(e, t) {
+        Some(v) => v,
+        None => interp(e, ease(&e.easing, t)),
+    }
 }
 
 /// **流速事件的值：只按线性取**（`easing` 字段被忽略 —— 见模块头"只实现 linear"）。
@@ -328,8 +361,13 @@ pub fn event_value(e: &Event, beat: f64) -> f64 {
 /// 导入的谱面里若真有非线性缓动的流速事件，**文档原样保留**（`easing` 不改写），
 /// 只是预览/求值按线性算 —— 导入报告里会写明，检查器里也标出来。
 pub fn speed_value(e: &Event, beat: f64) -> f64 {
-    // 线性 = 不过缓动：`t` 本身就是缓动后的 `t`
-    interp(e, event_t(e, beat))
+    // 线性 = 不过缓动：`t` 本身就是缓动后的 `t`。
+    // 端点同样直接取端值：流速是**积分**，段端点差 1 ulp 会进检查点表（那里正是要逐位可对账）
+    let t = event_t(e, beat);
+    match endpoint_value(e, t) {
+        Some(v) => v,
+        None => interp(e, t),
+    }
 }
 
 /// 一条轨道在拍 `beat` 处的值 —— **"哪条轨道用哪种求值"的唯一判断处**。

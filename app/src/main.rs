@@ -4022,7 +4022,7 @@ impl eframe::App for App {
             // 面板**只产出命令**（见 `inspector::inspector_ui` 的注释：施加命令的那几行曾经
             // 写在"调试工作区"分支里 ⇒ 其它工作区改什么都不生效）。拖动类控件用事务包住
             //（松手才 commit），所以"拖一次 = 一个撤销步"。
-            pending_edits.extend(inspector::inspector_ui(ui, &self.state, self.insp.as_ref()));
+            pending_edits.extend(inspector::inspector_ui(ui, &self.state, self.insp.as_mut()));
             if self.ws == Workspace::Debug {
             ui.separator();
             ui.label("诊断（调试工作区）");

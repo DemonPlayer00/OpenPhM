@@ -1973,6 +1973,145 @@ impl EditCore {
                 });
                 Ok(json!({"line": line_idx, "index": index, "events": self.track(line_idx, layer_idx, &track)?.len()}))
             }
+            // ---- 「就位目标」：一次给出判定线该在哪儿，四轨一起写（用户要求）----
+            //
+            // 用户口径：「事件块结束点上，给一个单次事件目标设置（x/y 坐标，透明度，角度），
+            // 给一次事件块末尾的值，以保证最终 0 误差就位」。
+            //
+            // 与 `set_event` 的区别：那条改**一条轨道的一个端值**，这条要的是"**线此刻在哪儿**"
+            // —— 一次给四个数（x / y / angle / alpha），工具负责把该拍上的值写成目标，
+            // 并且**保证按位相等**（求值器端点是按定义取端值，见 `perf::endpoint_value`）。
+            //
+            // 四轨各按"该拍处是什么情形"选动作（顺序即优先级）：
+            // · 有事件**正好结束**在该拍 ⇒ 写它的终值（若下一条也正好在该拍**开始**，一并写它的起值，
+            //   否则"这一瞬"求值到的会是下一条的起值 —— 那就不是 0 误差了）；
+            // · 该拍落在某事件**内部** ⇒ 先按 `split_event` 切一刀（切点值 = 求值器的值，不跳变），
+            //   再写左右两半的相邻端值；
+            // · 该拍处于**空位**（前一块已结束）⇒ 写**前一块的终值** —— 空位的值就是它（不是全局默认）；
+            // · 该拍在**首事件之前** ⇒ 写首事件的**起始值**（`track_value` 对"块前"的口径就是它）；
+            // · 轨道**一条事件都没有** ⇒ 不动它（无从下手，报告里说明；铺满可用 `set_track_constant`）。
+            //
+            // 值已经按位等于目标的轨道一律**跳过** —— 于是"只改 X"不会顺手切别人的块。
+            // 整条命令是**一个撤销步**（事务）。
+            //
+            // 流速轨**不在其中**：它不是"坐标"（用户口径：流速只按 linear 求值，且音符位置是它的积分）。
+            "set_target" => {
+                let line_idx = line_arg(c)?;
+                let layer_idx = c.get("layer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let at = beat_arg(c, "atBeat")?;
+                let target = c
+                    .get("target")
+                    .and_then(|v| v.as_object())
+                    .ok_or("缺少 target 对象（x / y / angle / alpha，至少给一个）")?;
+                // 键名是**坐标口径**（x/y/角度/透明度），不是内部轨道名 —— 这是给人/脚本用的接口
+                let mut wanted: Vec<(&'static str, f64)> = Vec::new();
+                for (k, track) in [("x", "moveX"), ("y", "moveY"), ("angle", "rotate"), ("alpha", "alpha")] {
+                    if let Some(v) = target.get(k) {
+                        let v = v.as_f64().ok_or_else(|| format!("target.{k} 需为数字"))?;
+                        if !v.is_finite() {
+                            return Err(format!("target.{k} 需为有限数"));
+                        }
+                        wanted.push((track, v));
+                    }
+                }
+                if wanted.is_empty() {
+                    return Err("target 至少要给一个键：x / y / angle / alpha".into());
+                }
+
+                // ---- 先算计划（只读），再统一施加 ----
+                let mut cmds: Vec<Value> = Vec::new();
+                let mut plan: Vec<Value> = Vec::new();
+                for (track, v) in wanted {
+                    let list = self.track(line_idx, layer_idx, track)?;
+                    let neutral = crate::state::TrackId::from_key(track)
+                        .map(crate::edit::track_neutral_value)
+                        .unwrap_or(0.0);
+                    let current = crate::perf::track_value(track, &list, at.to_f64()).unwrap_or(neutral);
+                    if current.to_bits() == v.to_bits() {
+                        plan.push(json!({"track": track, "action": "skip", "why": "已经是这个值"}));
+                        continue;
+                    }
+                    if list.is_empty() {
+                        plan.push(json!({"track": track, "action": "skip",
+                                         "why": "这条轨道还没有事件（先放一块，或用 set_track_constant 铺满全谱）"}));
+                        continue;
+                    }
+                    let at_json = json!([at.n, at.d]);
+                    let set = |index: usize, key: &str| -> Value {
+                        let mut s = serde_json::Map::new();
+                        s.insert(key.to_owned(), json!(v));
+                        json!({"op": "set_event", "line": line_idx, "layer": layer_idx,
+                               "track": track, "index": index, "set": Value::Object(s)})
+                    };
+                    // **要改的是"此刻生效的那一块"** —— 判据必须是 `perf::active_event`：
+                    // 它正是求值器用的那一条（起点不晚于该拍的最后一条）。早先按"哪一个块结束在这一拍"
+                    // 去找，在**重叠**时就会改到一个根本不被求值的事件上：实测（一条 [0,8] 的斜坡 +
+                    // 一条后加的 [0,500] 常量）就位到 250.3 之后，那一刻求值到的仍是 7.0 ——
+                    // 命令报成功、画面没动。这是"同一个问题两套判据"的又一个实例。
+                    let action;
+                    match crate::perf::active_event(&list, at.to_f64()) {
+                        // 该拍在首事件之前：这条轨道的值取**首事件的起始值**（`track_value` 的口径）
+                        None => {
+                            cmds.push(set(0, "startValue"));
+                            action = "块前（值取首块起始值 ⇒ 写首块的起值）";
+                        }
+                        Some(i) => {
+                            let e = &list[i];
+                            if e.start == at {
+                                cmds.push(set(i, "startValue"));
+                                action = "块首（这一刻正好是它的起点）";
+                            } else if e.end == at {
+                                cmds.push(set(i, "endValue"));
+                                action = "块末（本来就在边界上）";
+                            } else if at < e.end {
+                                cmds.push(json!({"op": "split_event", "line": line_idx, "layer": layer_idx,
+                                                 "track": track, "index": i, "atBeat": at_json}));
+                                cmds.push(set(i, "endValue"));
+                                cmds.push(set(i + 1, "startValue"));
+                                action = "块内（先在此切一刀，再写两侧端值）";
+                            } else {
+                                cmds.push(set(i, "endValue"));
+                                action = "空位（空位的值来自这一块 ⇒ 写它的终值）";
+                            }
+                        }
+                    }
+                    plan.push(json!({"track": track, "action": action, "value": v}));
+                }
+                let tracks_written = plan.iter().filter(|p| p["action"] != "skip").count();
+                if cmds.is_empty() {
+                    return Ok(json!({"line": line_idx, "atBeat": [at.n, at.d], "wrote": 0, "cmds": 0,
+                                     "plan": plan, "note": "四轨都已经在目标上（或无从下手），没有改动"}));
+                }
+
+                // ---- 施加：一个事务 = 一个撤销步 ----
+                //
+                // 已经在事务里（例如 `--atomic` 批次）时**不自己开/关**：`journal.begin` 不嵌套，
+                // 这里 commit 会把外层事务提前收掉。
+                let nested = self.journal.in_transaction();
+                if !nested {
+                    self.journal.begin("set_target");
+                }
+                let mut failed: Vec<Value> = Vec::new();
+                for cmd in &cmds {
+                    let r = self.exec(cmd);
+                    if r.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        failed.push(json!({"cmd": cmd, "error": r.get("error")}));
+                    }
+                }
+                if !nested {
+                    self.journal.commit();
+                }
+                Ok(json!({
+                    "line": line_idx,
+                    "atBeat": [at.n, at.d],
+                    // `wrote` 数**轨道**（调用方关心的"几条轨就位了"）；
+                    // `cmds` 是实际落地的子命令数（块内那种情形一条轨道要 3 条：切一刀 + 写两侧）
+                    "wrote": tracks_written.saturating_sub(failed.len().min(tracks_written)),
+                    "cmds": cmds.len() - failed.len(),
+                    "plan": plan,
+                    "failed": failed,
+                }))
+            }
             "set_track_constant" => {
                 let (line_idx, layer_idx, track) = layer_arg(c)?;
                 let value = c.get("value").cloned().unwrap_or(json!(0.0));
@@ -2496,5 +2635,292 @@ mod tests {
             meta_only.rx.try_recv().is_err(),
             "只订阅 Meta 的订阅者不该被 BPM 改动叫醒"
         );
+    }
+
+    // ---------------------------------------------------------------- 「就位目标」set_target
+
+    /// 四轨各放一条事件（用会过冲/非线性的缓动，端点误差才显形）
+    fn four_tracks_ending_at(end_beat: i64) -> EditCore {
+        let mut c = EditCore::new();
+        for (track, easing) in [
+            ("moveX", "inOutCubic"),
+            ("moveY", "outBack"),
+            ("rotate", "outElastic"),
+            ("alpha", "inBack"),
+        ] {
+            exec_ok(
+                &mut c,
+                serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": track,
+                                   "startBeat": [0, 1], "endBeat": [end_beat, 1],
+                                   "startValue": 0.0, "endValue": 100.0, "easing": easing}),
+            );
+        }
+        c
+    }
+
+    fn value_at(c: &EditCore, track: &str, beat: i64) -> f64 {
+        let list = match track {
+            "moveX" => &c.doc().judge_lines[0].layers[0].move_x,
+            "moveY" => &c.doc().judge_lines[0].layers[0].move_y,
+            "rotate" => &c.doc().judge_lines[0].layers[0].rotate,
+            "alpha" => &c.doc().judge_lines[0].layers[0].alpha,
+            "speed" => &c.doc().judge_lines[0].layers[0].speed,
+            other => panic!("未知轨道 {other}"),
+        };
+        opm_app_perf_track_value(track, list, beat as f64)
+    }
+
+    fn opm_app_perf_track_value(track: &str, list: &[Event], beat: f64) -> f64 {
+        crate::perf::track_value(track, list, beat).unwrap_or(0.0)
+    }
+
+    /// **块末就位：按位相等**（这条是用户那句"以保证最终 0 误差就位"的可执行定义）。
+    ///
+    /// 四个目标值都挑成"浮点插值会掉最后一位"的（0.3 / -1234.567 / 45.5 / 0.7），
+    /// 终点又都在边界上（本来就有块末），所以只该改端值、不该多出事件。
+    #[test]
+    fn a_target_at_the_block_end_lands_bit_exactly() {
+        let mut c = four_tracks_ending_at(4);
+        let before = c.doc().judge_lines[0].clone();
+        let r = exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1],
+                               "target": {"x": 0.3, "y": -1234.567, "angle": 45.5, "alpha": 0.7}}),
+        );
+        assert_eq!(r["result"]["wrote"], serde_json::json!(4), "四条轨道各写了一次：{r}");
+        assert_eq!(r["result"]["cmds"], serde_json::json!(4), "边界上不需要切分：{r}");
+        let wants: [(&str, f64); 4] = [("moveX", 0.3), ("moveY", -1234.567), ("rotate", 45.5), ("alpha", 0.7)];
+        for (track, want) in wants {
+            let got = value_at(&c, track, 4);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{track} 在块末应当是**按位**相等的 {want}，实际 {got}"
+            );
+        }
+        // 都在边界上 ⇒ 一条事件都没多（切分只该发生在"块内"那种情形）
+        let after = c.doc().judge_lines[0].clone();
+        assert_eq!(after.layers[0].move_x.len(), before.layers[0].move_x.len());
+        assert_eq!(after.layers[0].alpha.len(), before.layers[0].alpha.len());
+        // 块末之后（空位）保持的也是这个值，且同样按位
+        assert_eq!(value_at(&c, "moveX", 9).to_bits(), 0.3f64.to_bits());
+        // 写块末的**只该是终值**：起点值、缓动家族都不动 —— 块内的插值当然会跟着新的终值变
+        //（斜坡的中间点由两端决定，改了终点就改了斜坡；这正是"给块末一个值"的含义）
+        for (track, ev_before, ev_after) in [
+            ("moveX", &before.layers[0].move_x[0], &after.layers[0].move_x[0]),
+            ("alpha", &before.layers[0].alpha[0], &after.layers[0].alpha[0]),
+        ] {
+            assert_eq!(ev_after.start_value.to_string(), ev_before.start_value.to_string(), "{track} 起值不该动");
+            assert_eq!(ev_after.easing, ev_before.easing, "{track} 缓动不该动");
+            assert_eq!(ev_after.start, ev_before.start, "{track} 起点拍不该动");
+            assert_eq!(ev_after.end, ev_before.end, "{track} 终点拍不该动");
+            assert_eq!(
+                value_at(&c, track, 0).to_bits(),
+                ev_before.start_value.as_f64().unwrap().to_bits(),
+                "{track} 块首仍应当按位等于它的起值"
+            );
+        }
+    }
+
+    /// 目标落在**块内**：先就地切一刀（切点值 = 求值器的值），再写两侧端值 —— 结果同样按位
+    #[test]
+    fn a_target_inside_a_block_splits_then_lands_bit_exactly() {
+        let mut c = EditCore::new();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                               "startBeat": [0, 1], "endBeat": [8, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "outBounce"}),
+        );
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1], "target": {"x": 250.0}}),
+        );
+        let mx = c.doc().judge_lines[0].layers[0].move_x.clone();
+        assert_eq!(mx.len(), 2, "块内就位要先切一刀");
+        assert_eq!(mx[0].end, Beat::new(4, 1));
+        assert_eq!(mx[1].start, Beat::new(4, 1));
+        assert_eq!(mx[0].end_value.as_f64().unwrap().to_bits(), 250.0f64.to_bits());
+        assert_eq!(mx[1].start_value.as_f64().unwrap().to_bits(), 250.0f64.to_bits());
+        assert_eq!(value_at(&c, "moveX", 4).to_bits(), 250.0f64.to_bits());
+    }
+
+    /// 目标落在**空位**：空位的值来自前一块 ⇒ 写前一块的终值（不是"什么都不做"）
+    #[test]
+    fn a_target_in_a_gap_writes_the_previous_blocks_end_value() {
+        let mut c = EditCore::new();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                               "startBeat": [0, 1], "endBeat": [4, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "linear"}),
+        );
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [6, 1], "target": {"x": -50.0}}),
+        );
+        let mx = &c.doc().judge_lines[0].layers[0].move_x;
+        assert_eq!(mx.len(), 1, "空位不该凭空多一块");
+        assert_eq!(mx[0].end_value.as_f64().unwrap().to_bits(), (-50.0f64).to_bits());
+        assert_eq!(value_at(&c, "moveX", 6).to_bits(), (-50.0f64).to_bits());
+    }
+
+    /// 目标落在**首块之前**：那条轨道的值取首块起始值 ⇒ 写首块的起值
+    #[test]
+    fn a_target_before_the_first_block_writes_the_first_blocks_start_value() {
+        let mut c = EditCore::new();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                               "startBeat": [4, 1], "endBeat": [8, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "linear"}),
+        );
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [1, 1], "target": {"x": 33.0}}),
+        );
+        let mx = &c.doc().judge_lines[0].layers[0].move_x;
+        assert_eq!(mx.len(), 1);
+        assert_eq!(mx[0].start_value.as_f64().unwrap().to_bits(), 33.0f64.to_bits());
+        assert_eq!(value_at(&c, "moveX", 1).to_bits(), 33.0f64.to_bits());
+    }
+
+    /// **重叠时改的必须是"此刻生效的那一块"**（用户口径的 0 误差就位在重叠下也得成立）。
+    ///
+    /// 实测过的坑：一条 [0,8] 的斜坡 + 一条**后加的** [0,500] 常量 —— 就位命令写的是前者，
+    /// 而求值器生效的是后者（起点不晚于该拍的最后一条）⇒ 命令报成功、那一刻的值纹丝不动。
+    #[test]
+    fn a_target_writes_the_event_that_is_actually_in_effect() {
+        let mut c = EditCore::new();
+        for (end, v) in [(8, 100.0), (500, 7.0)] {
+            exec_ok(
+                &mut c,
+                serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                                   "startBeat": [0, 1], "endBeat": [end, 1],
+                                   "startValue": 0.0, "endValue": v, "easing": "linear"}),
+            );
+        }
+        // 此刻生效的是后加的那条常量（7.0），它的**起点**就在这一刻之前 ⇒ 走"块内切分"那条路
+        let r = exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [8, 1], "target": {"x": 250.3}}),
+        );
+        assert_eq!(
+            value_at(&c, "moveX", 8).to_bits(),
+            250.3f64.to_bits(),
+            "就位之后，那一刻**求值到**的必须是目标（不是被写的那条事件自己的端值）：{r}"
+        );
+        // 斜坡那条一个字都不该被动（它此刻不生效）
+        let mx = &c.doc().judge_lines[0].layers[0].move_x;
+        assert!(
+            mx.iter().any(|e| e.end == Beat::new(8, 1) && e.end_value.as_f64() == Some(100.0)),
+            "不被求值的那条事件不该被改：{mx:?}"
+        );
+    }
+
+    /// **已经在目标上的轨道一律不动** —— 否则"只改 X"会顺手把别人的块切开
+    #[test]
+    fn tracks_already_at_the_target_are_left_alone() {
+        let mut c = EditCore::new();
+        for track in ["moveX", "moveY"] {
+            exec_ok(
+                &mut c,
+                serde_json::json!({"op": "add_event", "line": 0, "layer": 0, "track": track,
+                                   "startBeat": [0, 1], "endBeat": [8, 1],
+                                   "startValue": 0.0, "endValue": 100.0, "easing": "linear"}),
+            );
+        }
+        // 第 4 拍 moveX 恰好是 50（线性中点）⇒ 把它当目标就等于"不改它"
+        let r = exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1],
+                               "target": {"x": 50.0, "y": 20.0}}),
+        );
+        assert_eq!(r["result"]["wrote"], serde_json::json!(1), "只有 moveY 真的要写：{r}");
+        assert_eq!(r["result"]["cmds"], serde_json::json!(3), "moveY 要切一刀 + 写两侧：{r}");
+        let line = c.doc().judge_lines[0].clone();
+        assert_eq!(line.layers[0].move_x.len(), 1, "moveX 已在目标上 ⇒ 不该被切开");
+        assert_eq!(line.layers[0].move_y.len(), 2, "moveY 要切一刀才能在第 4 拍就位");
+        assert_eq!(value_at(&c, "moveX", 4).to_bits(), 50.0f64.to_bits());
+        assert_eq!(value_at(&c, "moveY", 4).to_bits(), 20.0f64.to_bits());
+        // 报告里写清了每条轨道做了什么
+        let plan = r["result"]["plan"].to_string();
+        assert!(plan.contains("skip"), "{plan}");
+        assert!(plan.contains("块内"), "{plan}");
+    }
+
+    /// 空轨道：**报告出来**，不静默吞掉；其余轨道照常就位
+    #[test]
+    fn an_empty_track_is_reported_not_silently_swallowed() {
+        let mut c = four_tracks_ending_at(4);
+        // 把 moveY 清空
+        exec_ok(&mut c, serde_json::json!({"op": "del_event", "line": 0, "track": "moveY", "index": 0}));
+        let r = exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1],
+                               "target": {"x": 1.0, "y": 2.0, "alpha": 0.25}}),
+        );
+        assert_eq!(r["result"]["wrote"], serde_json::json!(2), "moveX 与 alpha 就位：{r}");
+        let plan = r["result"]["plan"].to_string();
+        assert!(plan.contains("还没有事件"), "{plan}");
+        assert_eq!(value_at(&c, "moveX", 4).to_bits(), 1.0f64.to_bits());
+        assert_eq!(value_at(&c, "alpha", 4).to_bits(), 0.25f64.to_bits());
+    }
+
+    /// **一次撤销**：四轨一起写（含切分）只算一个撤销步
+    #[test]
+    fn a_target_is_one_undo_step() {
+        let mut c = four_tracks_ending_at(8);
+        let before = c.doc().clone();
+        // 撤销后的基准**从操作前的文档算**，不手写数：四条轨道的缓动各不相同
+        //（inOutCubic / outBack / outElastic / inBack —— `inBack` 在中点是**负**的，
+        // 那正是过冲/欠冲的本意，任何"顺手夹一下"的写法都会把它毁掉）
+        let want: Vec<f64> = ["moveX", "moveY", "rotate", "alpha"].iter().map(|t| value_at(&c, t, 4)).collect();
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1],
+                               "target": {"x": 0.3, "y": -1.5, "angle": 12.5, "alpha": 0.5}}),
+        );
+        assert_eq!(c.doc().judge_lines[0].layers[0].move_x.len(), 2, "切过一刀");
+        exec_ok(&mut c, serde_json::json!({"op": "undo"}));
+        let back = c.doc().judge_lines[0].clone();
+        assert_eq!(back.layers[0].move_x.len(), before.judge_lines[0].layers[0].move_x.len());
+        for (t, w) in ["moveX", "moveY", "rotate", "alpha"].iter().zip(want) {
+            assert_eq!(value_at(&c, t, 4).to_bits(), w.to_bits(), "{t} 应当撤回到操作前的值");
+        }
+    }
+
+    /// 事务里调用 `set_target` **不会替外层提前 commit**（`journal.begin` 不嵌套）
+    #[test]
+    fn a_target_inside_an_outer_transaction_does_not_commit_early() {
+        let mut c = four_tracks_ending_at(4);
+        exec_ok(&mut c, serde_json::json!({"op": "begin", "label": "外层"}));
+        exec_ok(
+            &mut c,
+            serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1], "target": {"x": 7.0}}),
+        );
+        exec_ok(&mut c, serde_json::json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1]}));
+        exec_ok(&mut c, serde_json::json!({"op": "commit"}));
+        assert_eq!(value_at(&c, "moveX", 4).to_bits(), 7.0f64.to_bits());
+        assert_eq!(c.doc().judge_lines[0].notes.len(), 1);
+        // 一次撤销要把**两件事**一起撤掉，说明它们同属外层那一个事务
+        exec_ok(&mut c, serde_json::json!({"op": "undo"}));
+        assert_eq!(value_at(&c, "moveX", 4).to_bits(), 100.0f64.to_bits(), "块末回到原值");
+        assert_eq!(c.doc().judge_lines[0].notes.len(), 0, "音符也一起撤掉");
+    }
+
+    /// 参数校验：target 不能空、不能非数字
+    #[test]
+    fn set_target_validates_its_arguments() {
+        let mut c = four_tracks_ending_at(4);
+        let r = c.exec(&serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1], "target": {}}));
+        assert_eq!(r["ok"], serde_json::json!(false));
+        assert!(r["error"].as_str().unwrap().contains("至少"), "{r}");
+        let r = c.exec(&serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1],
+                                           "target": {"x": "一百"}}));
+        assert_eq!(r["ok"], serde_json::json!(false));
+        assert!(r["error"].as_str().unwrap().contains("x"), "{r}");
+        let r = c.exec(&serde_json::json!({"op": "set_target", "line": 0, "target": {"x": 1.0}}));
+        assert_eq!(r["ok"], serde_json::json!(false), "缺 atBeat 应当报错");
     }
 }

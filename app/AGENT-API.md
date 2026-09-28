@@ -243,6 +243,7 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"set_event","line":0,"track":"alpha","index":0,"set":{"endValue":0.5}}` | |
 | `{"op":"del_event","line":0,"track":"speed","index":0}` | |
 | `{"op":"split_event","line":0,"track":"moveX","index":0,"atBeat":[2,1]}` | 在中点按线性插值切分（有缓动时先近似，随后用 `set_event` 修正） |
+| `{"op":"set_target","line":0,"atBeat":[4,1],"target":{"x":250.3,"y":-118.75,"angle":45,"alpha":0.42}}` | **块末就位**：一次给出"线在这一刻该在哪儿"，四轨（moveX/moveY/rotate/alpha）一起写、**一个撤销步**。`target` 至少给一个键；只写**真的变了**的轨道（已是该值的跳过）。要改的那一块按 `perf::active_event` 选（与求值器同一判据，重叠时也对）：块末写终值 / 块首写起值 / 块内先 `split_event` 再写两侧 / 空位写前一块的终值 / 首块之前写首块起值。返回 `{wrote, cmds, plan[], failed[]}`（`wrote` 数轨道、`cmds` 数子命令，块内那种情形一条轨道要 3 条）。**求值器端点是按定义取端值**，所以那一刻求值到的与你写下的数**按位相等** |
 | `{"op":"set_track_constant","line":0,"track":"speed","value":10}` | **一步满足轨道不变量**：清空该轨并铺一条覆盖全谱的恒定事件。**流速的默认/基准值是 10**（RPE 口径：1 单位流速 = 120 RPE y 单位/秒 ⇒ 10 = 1× = 1200 单位/秒 = 0.75 秒划过 900 高的窗口）；**整条轨道没有流速事件时预览也按 10 走** |
 
 ⚠️ **流速轨只按 `linear` 求值**（音符位置是流速的积分，线性有闭式解 —— 见 README「下落速度」）。

@@ -3,7 +3,7 @@
 //! 表演求值的验收：29 个缓动的端点与已知值、多 BPM 时间映射、事件求值（含非线性缓动）。
 
 use opm_app::doc::{Beat, Document, Event, BpmEntry, JudgeLine};
-use opm_app::perf::{ease, eval_events, perf_at, sample_track, TimeMap};
+use opm_app::perf::{ease, eval_events, event_value, perf_at, sample_track, TimeMap};
 use serde_json::json;
 
 /// 与 cmd::EASINGS 同源的 29 个名字（重列一遍：测试不该依赖被测实现里的表）
@@ -14,14 +14,71 @@ const NAMES: [&str; 29] = [
     "inElastic", "outBounce", "inBounce", "inOutBounce", "inOutElastic",
 ];
 
+/// 端点**按位**精确（不是"误差小于 1e-9"）。
+///
+/// 这条从"容差"收紧成"按位"，是因为检查器的「就位目标」承诺的是"块末**0 误差**就位"：
+/// 端点若只到 1e-16，`v0 + (v1−v0)·ease(1)` 放大之后就是"终点值 ≠ 你写的 endValue"
+/// （实测 `inSine`/`inBack` 的 `ease(1)` 差 1~2 ulp、`outBack` 的 `ease(0)` 差 1 ulp）。
 #[test]
-fn every_easing_hits_both_endpoints() {
+fn every_easing_hits_both_endpoints_exactly() {
     for n in NAMES {
         let a = ease(n, 0.0);
         let b = ease(n, 1.0);
-        assert!(a.abs() < 1e-9, "{n}(0) = {a}，应为 0");
-        assert!((b - 1.0).abs() < 1e-9, "{n}(1) = {b}，应为 1");
+        assert_eq!(a, 0.0, "{n}(0) = {a}，应当是**恰好** 0");
+        assert_eq!(b, 1.0, "{n}(1) = {b}，应当是**恰好** 1");
+        // 越界输入也夹在端点上（t 已经被 clamp，这里确认夹完仍是精确端点）
+        assert_eq!(ease(n, -3.0), 0.0);
+        assert_eq!(ease(n, 7.0), 1.0);
     }
+}
+
+/// **过冲不能被"端点精确"顺手夹掉**：`back`/`elastic` 在中间就该越过 [0,1]。
+///
+/// 这条是防回归：把端点做精确最省事的写法是"夹住 ease 的返回值"，那会把这两个缓动删掉。
+#[test]
+fn overshooting_easings_still_overshoot_in_the_middle() {
+    // 扫一遍取极值，而不是写死某个 t（过冲峰在哪一点取决于具体实现参数）
+    let scan = |n: &str| (0..=100).map(|i| ease(n, i as f64 / 100.0)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    for n in ["outBack", "outElastic", "inOutBack", "inOutElastic"] {
+        let (_, hi) = scan(n);
+        assert!(hi > 1.0, "{n} 应当在中间冲过 1（实测最大 {hi:.6}）");
+    }
+    for n in ["inBack", "inElastic", "inOutBack", "inOutElastic"] {
+        let (lo, _) = scan(n);
+        assert!(lo < 0.0, "{n} 应当在中间冲到 0 以下（实测最小 {lo:.6}）");
+    }
+}
+
+/// **事件在自己端点上的值 == 文档里的端值，按位相等** —— "块末就位"的那条保证。
+///
+/// 取值特意用 `0.1 → 0.3`：即使 `ease(1)` 精确等于 1，`0.1 + (0.3−0.1) = 0.30000000000000004`
+/// 也不等于 `0.3` —— 所以端点必须**直接取端值**，不能靠插值凑。
+#[test]
+fn an_events_endpoint_values_are_bit_exact() {
+    for easing in NAMES {
+        let ev = Event::new(Beat::zero(), Beat::new(4, 1), json!(0.1), json!(0.3), easing);
+        assert_eq!(
+            event_value(&ev, 0.0).to_bits(),
+            0.1f64.to_bits(),
+            "{easing}：起点值应当**按位**等于 startValue"
+        );
+        assert_eq!(
+            event_value(&ev, 4.0).to_bits(),
+            0.3f64.to_bits(),
+            "{easing}：终点值应当**按位**等于 endValue"
+        );
+        // 终点之后（空位保持）同样按位相等
+        assert_eq!(event_value(&ev, 4.0).to_bits(), event_value(&ev, 99.0).to_bits());
+        // 流速轨（只线性）也一样
+        assert_eq!(
+            opm_app::perf::speed_value(&ev, 4.0).to_bits(),
+            0.3f64.to_bits(),
+            "{easing}：流速的终点值也应当按位相等"
+        );
+    }
+    // 缺端点（只有一端）时：端点仍走常量那条路，不引入算术
+    let only_start = Event::new(Beat::zero(), Beat::new(4, 1), json!(0.7), json!(null), "outBack");
+    assert_eq!(event_value(&only_start, 4.0).to_bits(), 0.7f64.to_bits());
 }
 
 #[test]

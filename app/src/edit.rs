@@ -543,6 +543,31 @@ pub fn split_event_command(line: usize, track: &str, index: usize, at_beat: f64)
     })
 }
 
+/// **就位目标** → `set_target`：一次给出"线此刻该在哪儿"（x/y/角度/透明度），四轨一起写。
+///
+/// 用户口径：「事件块结束点上，给一个单次事件目标设置……以保证最终 0 误差就位」。
+/// 命令层负责"怎么写"（边界/块内切分/空位三种情形），这里只管把意图拼成 JSON。
+/// `target` 为空 ⇒ 返回 `None`（检查器据此把按钮置灰，而不是发一条会被拒的命令）。
+pub fn set_target_command(
+    line: usize,
+    at: crate::doc::Beat,
+    target: &[(&'static str, f64)],
+) -> Option<serde_json::Value> {
+    if target.is_empty() {
+        return None;
+    }
+    let mut m = serde_json::Map::new();
+    for (k, v) in target {
+        m.insert((*k).to_owned(), json!(*v));
+    }
+    Some(json!({
+        "op": "set_target",
+        "line": line,
+        "atBeat": [at.n, at.d],
+        "target": serde_json::Value::Object(m),
+    }))
+}
+
 /// 新建一个事件块 → `add_event`（事件区按键放置走这里）。
 ///
 /// 值取**平段**（`startValue == endValue`）：新事件不该带来跳变；要渐变就放好之后在属性编辑器里改。
@@ -662,6 +687,20 @@ mod tests {
     }
 
     /// 拖动 **tap**：只改 laneX 与起点，不带 endBeat（它本来就不是长条）
+    /// 「就位目标」命令：四个键都给/只给一个/一个都不给（后者 ⇒ `None`，按钮据此置灰）
+    #[test]
+    fn set_target_command_shapes_the_json() {
+        let at = crate::doc::Beat::new(4, 1);
+        assert!(set_target_command(0, at, &[]).is_none(), "一个键都不给 ⇒ 不发命令");
+        let one = set_target_command(2, at, &[("x", 250.0)]).unwrap();
+        assert_eq!(one["op"], json!("set_target"));
+        assert_eq!(one["line"], json!(2));
+        assert_eq!(one["atBeat"], json!([4, 1]), "拍必须写成有理数，不能是浮点");
+        assert_eq!(one["target"], json!({"x": 250.0}));
+        let all = set_target_command(0, at, &[("x", 1.0), ("y", -2.0), ("angle", 45.0), ("alpha", 0.5)]).unwrap();
+        assert_eq!(all["target"], json!({"x": 1.0, "y": -2.0, "angle": 45.0, "alpha": 0.5}));
+    }
+
     #[test]
     fn dragging_a_tap_sets_position_only() {
         let (_c, mut st) = sample();

@@ -97,10 +97,10 @@ pub fn text_field(ui: &mut Ui, key: &str, current: &str, width: f32) -> Option<S
 pub fn inspector_ui(
     ui: &mut Ui,
     st: &EditorState,
-    insp: Option<&Inspector>,
+    insp: Option<&mut Inspector>,
 ) -> Vec<serde_json::Value> {
     let mut ec: Vec<serde_json::Value> = Vec::new();
-    match &insp {
+    match insp {
         Some(v) => {
             // ---- 判定线（当前线）：可编辑 ----
             let line_doc = v.line_index;
@@ -234,6 +234,77 @@ pub fn inspector_ui(
                             line_doc, track_key, at, serde_json::Value::Object(set)));
                     }
                 }
+
+                // ---- 就位目标（块末）：一次给全线的坐标，保证 0 误差 ----
+                //
+                // 用户口径：「事件块结束点上，给一个单次事件目标设置（x/y 坐标，透明度，角度），
+                // 给一次事件块末尾的值，以保证最终 0 误差就位」。
+                //
+                // 与上面那四行"值起/值止"的区别：那四行改的是**这条轨道这一个端值**；
+                // 这一组要的是"**块末那一刻，线该在哪儿**"—— 四个数一次给，四条轨道一起写，
+                // 而且求值器在端点是**按定义取端值**（`perf::endpoint_value`），所以块末的值
+                // 与这里写下的数**按位相等**（不是"误差小于 1e-9"）。
+                //
+                // 只把**真的变了**的那些键放进命令：没动的轨道连碰都不碰（核心也会跳过，
+                // 但命令里少一个键就少一次"要不要切它一刀"的犹豫）。
+                let anchor = opm_app::codec::beat_from_f64(e.end_beat);
+                let sec = st.chart.tmap.sec(e.end_beat);
+                // 取**选中那条线**（视图侧），不是 `lines[doc_index]` —— 视图下标与文档下标不是一回事。
+                // 它是"文档此刻的值"，用来判断草稿里哪几个数真的变了
+                let at_end = st
+                    .selected()
+                    .map(|l| l.perf(&st.chart.tmap, sec))
+                    .unwrap_or_default();
+                ui.separator();
+                ui.label(format!("就位目标（块末 {:.3} 拍 / {:.3}s）", e.end_beat, sec))
+                    .on_hover_text(
+                        "在**这块的末尾**把线放到给定坐标：x/y（RPE 单位）、角度（度）、透明度（0–1）。\n\
+                         四条轨道一起写，整条命令是**一个撤销步**。\n\
+                         · 块末本来就在边界上 ⇒ 只改端值，块内曲线跟着新端值走；\n\
+                         · 块末落在块内 ⇒ 先在此切一刀（切点值 = 当前值，不跳变）再写两侧；\n\
+                         · 块末在空位 ⇒ 写前一块的终值（空位的值就是它）；\n\
+                         · 已经是这个值的轨道**不动**。\n\
+                         流速轨不在其中（它不是坐标；流速只按 linear 求值）。",
+                    );
+                // 初值取快照里的**草稿**（不是每帧从文档重取）：用户改完要按按钮，
+                // 值必须活过一帧 —— 见 `view::Inspector::target` 的注释
+                let mut tx = v.target.x;
+                let mut ty = v.target.y;
+                let mut ta = v.target.angle;
+                let mut tp = v.target.alpha;
+                value_field(ui, &mut tx, "目标 x ", 1.0, None);
+                value_field(ui, &mut ty, "目标 y ", 1.0, None);
+                value_field(ui, &mut ta, "目标角度 ", 1.0, None);
+                value_field(ui, &mut tp, "目标透明度 ", 0.02, Some(0.0..=1.0));
+                // "变了没有"按**位**比：同一个数重敲一遍不该发命令（与 set_target 的跳过判据同源）
+                let diff = |now: f64, was: f64| now.to_bits() != was.to_bits();
+                let mut target: Vec<(&'static str, f64)> = Vec::new();
+                if diff(tx, at_end.x as f64) {
+                    target.push(("x", tx));
+                }
+                if diff(ty, at_end.y as f64) {
+                    target.push(("y", ty));
+                }
+                if diff(ta, at_end.rotate_deg as f64) {
+                    target.push(("angle", ta));
+                }
+                if diff(tp, at_end.alpha as f64) {
+                    target.push(("alpha", tp));
+                }
+                let cmd = opm_app::edit::set_target_command(line_doc, anchor, &target);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(cmd.is_some(), egui::Button::new("一次写入（四轨就位）"))
+                        .on_disabled_hover_text("四个数都还是当前值：没有要写的")
+                        .clicked()
+                    {
+                        if let Some(c) = cmd {
+                            ec.push(c);
+                        }
+                    }
+                });
+                // 草稿写回快照（下一帧的初值），这样"改几个数 → 按按钮"才成立
+                v.target = opm_app::view::TargetEdit { x: tx, y: ty, angle: ta, alpha: tp };
             }
 
             // ---- 音符（当前线选中项）：可编辑 ----
@@ -460,7 +531,7 @@ mod tests {
 
     #[test]
     fn inspector_draws_the_line_track_event_and_note() {
-        let (_c, st, insp) = sample();
+        let (_c, st, mut insp) = sample();
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -471,7 +542,7 @@ mod tests {
         };
         let mut cmds = Vec::new();
         let mut out = ctx.run_ui(raw, |ui| {
-            cmds = inspector_ui(ui, &st, Some(&insp));
+            cmds = inspector_ui(ui, &st, Some(&mut insp));
         });
         out.textures_delta.clear();
         let texts = drawn_texts(&out);
@@ -494,6 +565,115 @@ mod tests {
         );
         // **没碰任何控件 ⇒ 一条命令都不发**（面板每帧乱发命令会让撤销栈爆炸）
         assert!(cmds.is_empty(), "没有交互却产出了命令：{cmds:?}");
+    }
+
+    /// 一帧里某个文本的中心点（按文字找控件矩形 —— 按钮/字段的矩形在 `inspector_ui` 内部，
+    /// 测试拿不到，但画出来的字形位置就是它的位置）
+    fn text_center(out: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::epaint::Shape, needle: &str, acc: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    if acc.is_none() && t.galley.text().contains(needle) {
+                        *acc = Some(t.pos + t.galley.size() * 0.5);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, needle, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut acc = None;
+        for cs in &out.shapes {
+            walk(&cs.shape, needle, &mut acc);
+        }
+        acc
+    }
+
+    /// **「就位目标」按钮真的产出 `set_target`**（端到端：点字段 → 改一个数 → 点按钮）。
+    ///
+    /// 这条盯的是"面板只产出命令"这条契约在新控件上没被漏掉：字段改动**本身不发命令**
+    /// （四个数都还是当前值时按钮是灰的），只有按下去才发**一条** `set_target`，
+    /// 且带着块末的**精确有理拍**与只变了的那个键。
+    #[test]
+    fn the_target_button_emits_one_set_target_command() {
+        let mut c = EditCore::new();
+        let r = c.exec(&json!({"op": "add_event", "line": 0, "layer": 0, "track": "moveX",
+                               "startBeat": [0, 1], "endBeat": [4, 1],
+                               "startValue": 0.0, "endValue": 100.0, "easing": "inOutCubic"}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.selected_track = state::TrackId::MoveX;
+        st.select_event(state::TrackId::MoveX, 0);
+        let mut insp = view::inspector_of(&st, c.doc()).expect("有选中的线");
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(360.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut cmds: Vec<serde_json::Value> = Vec::new();
+        let mut frame = |events: Vec<egui::Event>, cmds: &mut Vec<serde_json::Value>| {
+            let mut raw = raw.clone();
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| {
+                cmds.extend(inspector_ui(ui, &st, Some(&mut insp)));
+            });
+            out.textures_delta.clear();
+            out
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // 两帧建立布局（第一帧滚动区还不知道多大）
+        frame(vec![], &mut cmds);
+        let out = frame(vec![], &mut cmds);
+        assert!(cmds.is_empty(), "没交互不该发命令：{cmds:?}");
+
+        // ① 只改「目标 x」字段：点进去 → 输入 250 → 回车
+        let fx = text_center(&out, "目标 x").expect("目标 x 字段画出来了");
+        frame(vec![egui::Event::PointerMoved(fx), click(fx, true)], &mut cmds);
+        frame(vec![click(fx, false)], &mut cmds);
+        for ch in ["2", "5", "0"] {
+            frame(vec![egui::Event::Text(ch.to_owned())], &mut cmds);
+        }
+        frame(
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            &mut cmds,
+        );
+        assert!(
+            cmds.is_empty(),
+            "改字段本身不该发命令（要按「一次写入」才写）：{cmds:?}"
+        );
+
+        // ② 按「一次写入」：该发**一条** set_target，锚在块末 4 拍，只带 x
+        let out = frame(vec![], &mut cmds);
+        let btn = text_center(&out, "一次写入").expect("按钮画出来了");
+        frame(vec![egui::Event::PointerMoved(btn), click(btn, true)], &mut cmds);
+        frame(vec![click(btn, false)], &mut cmds);
+        let target: Vec<&serde_json::Value> =
+            cmds.iter().filter(|c| c["op"] == json!("set_target")).collect();
+        assert_eq!(target.len(), 1, "应当只发一条 set_target：{cmds:?}");
+        assert_eq!(target[0]["line"], json!(0));
+        assert_eq!(target[0]["atBeat"], json!([4, 1]), "锚点是块末的**精确有理拍**");
+        assert_eq!(target[0]["target"]["x"], json!(250.0), "只带变了的那个键");
+        assert!(target[0]["target"].get("y").is_none(), "{:?}", target[0]);
+        assert!(target[0]["target"].get("alpha").is_none(), "{:?}", target[0]);
     }
 
     /// 没有选中判定线时画的是"（没有判定线）"，而不是空白（用户要知道为什么右边是空的）

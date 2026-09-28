@@ -60,6 +60,13 @@ pub struct Inspector {
     /// 可编辑字段：都是**文档数据**，改动一律发命令（见编辑器的 apply 逻辑）
     pub note_edit: Option<NoteEdit>,
     pub event_edit: Option<EventEdit>,
+    /// 「就位目标（块末）」那一组的**草稿**（x/y/角度/透明度）。
+    ///
+    /// 为什么草稿放在快照里、而不是像别的字段那样"当帧算完就发命令"：那一组是**两步**交互
+    /// （改几个数 → 按「一次写入」），输入的值必须活过一帧；而 `DragValue(update_while_editing=false)`
+    /// 只在回车那一下把值写进 `&mut`，下一帧若还从文档重取就丢了。快照在广播时重建 ⇒
+    /// 文档真变了（包括我们自己写成功之后）草稿自动跟到新值上 —— 这正是要的语义。
+    pub target: TargetEdit,
     pub notes: usize,
     pub events: usize,
     pub perf: perf::LinePerf,
@@ -68,6 +75,27 @@ pub struct Inspector {
     pub track_value: Option<f64>,
     pub event: Option<EventView>,
     pub note: Option<NoteView>,
+}
+
+/// 「就位目标」草稿：块末那一刻线该在哪儿（x/y 是 RPE 单位、angle 是度、alpha 0–1）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TargetEdit {
+    pub x: f64,
+    pub y: f64,
+    pub angle: f64,
+    pub alpha: f64,
+}
+
+impl Default for TargetEdit {
+    fn default() -> Self {
+        // 与"空轨道"的默认口径一致（move/rotate 0、alpha 1），只在没选中事件时用得到
+        Self { x: 0.0, y: 0.0, angle: 0.0, alpha: 1.0 }
+    }
+}
+
+/// 选中事件的**块末**拍（「就位目标」的锚点）。没选中事件时 `None`。
+fn event_edit_end_beat(event: &Option<EventView>) -> Option<f64> {
+    event.as_ref().map(|e| e.end_beat)
 }
 
 /// 当前播放时刻的事件快照（只读展示）
@@ -171,6 +199,12 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
             width_scale: d.width_scale,
             y_offset: d.y_offset,
         });
+    // 「就位目标」的草稿初值 = **选中事件块末**那一刻的线状态（不是播放头那一刻：
+    // 那一组说的就是"块末就位"，初值给播放头会让人以为改的是别处）
+    let target = event_edit_end_beat(&event)
+        .map(|b| line.perf(&st.chart.tmap, st.chart.tmap.sec(b)))
+        .map(|p| TargetEdit { x: p.x as f64, y: p.y as f64, angle: p.rotate_deg as f64, alpha: p.alpha as f64 })
+        .unwrap_or_default();
     let event_edit = event.as_ref().and_then(|ev| {
         // 事件值可能是非数值（颜色/字符串轨道）：不可编辑数值时就退化为只读
         let idx = st.selected_event().unwrap_or(0);
@@ -197,6 +231,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         track_events: track.events.len(),
         note_edit,
         event_edit,
+        target,
         track_value: track
             .events
             .first()
