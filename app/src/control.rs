@@ -10,17 +10,26 @@
 //!   被跳过的重建次数暴露出来 —— 这是"无关控件不参与更新"的客观证据；
 //! · `waker`：远端改完之后唤醒 egui 重绘一次，否则空闲心跳下（默认 1 fps）要等一秒才看到变化。
 //!
-//! Linux-first（`std::os::unix::net`）。Windows 侧后续换成命名管道，协议不变。
+//! **平台形态**：Linux/macOS 走 Unix socket（`std::os::unix::net`）；Windows 上这套还没有等价实现
+//! —— 该换命名管道，**协议不变**（行分隔 JSON 与所有视图命令都通用）。所以那里 [`spawn_server`] /
+//! [`attach`] 会**如实返回"未实现"**，不假装启用：GUI 的 `--control` 打一行提示，`opm-ctl attach`
+//! 报同一条。除传输层之外的部分（视图命令队列、`ui_stats`、协议解析、文档命令）平台无关，
+//! Windows 上也编译、也走同一套单测。
 
 use std::collections::VecDeque;
+// `BufRead`/`Write` 只被传输层（Unix socket 那两个函数）用到；Windows 上它们不存在 ⇒ 别引入空警告
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::{json, Value};
+#[cfg(unix)]
+use serde_json::json;
+use serde_json::Value;
 
+#[cfg(unix)]
 use crate::broadcast::Origin;
 use crate::core::SharedCore;
 
@@ -240,6 +249,7 @@ pub fn find_socket() -> Option<PathBuf> {
 }
 
 /// 在后台线程起一个监听器；返回实际绑定的路径。
+#[cfg(unix)]
 pub fn spawn_server(
     core: SharedCore,
     stats: UiStatsHandle,
@@ -277,6 +287,23 @@ pub fn spawn_server(
     Ok(bound)
 }
 
+/// 非 Unix（Windows）：控制通道还没有等价传输层 ⇒ **如实说不支持**。
+///
+/// 为什么不做成"静默成功"：GUI 的 `--control` 会据此打一行提示，使用者一眼知道
+/// "这次没起控制通道"，而不是对着一个连不上的路径猜。要做的是把 Unix socket 换成命名管道
+/// （协议与所有视图命令都不用改），那是另一件事。
+#[cfg(not(unix))]
+pub fn spawn_server(
+    _core: SharedCore,
+    _stats: UiStatsHandle,
+    _view: ViewQueue,
+    _waker: RepaintWaker,
+    _path: &Path,
+) -> Result<PathBuf, String> {
+    Err("Windows 上还没有控制通道：Unix socket 换成命名管道这件事还没做（协议不变，见 control.rs 头部）".into())
+}
+
+#[cfg(unix)]
 fn handle_conn(
     core: SharedCore,
     stats: UiStatsHandle,
@@ -373,6 +400,7 @@ fn handle_conn(
 }
 
 /// 客户端：把一批命令发到已运行的进程，逐条打印响应。返回 (失败条数, 校验错误数)
+#[cfg(unix)]
 pub fn attach(
     path: &Path,
     cmds: &[Value],
@@ -434,6 +462,17 @@ pub fn attach(
         }
     }
     Ok((failed, errors))
+}
+
+/// 非 Unix（Windows）：见 [`spawn_server`] —— 没有传输层就连不上，如实报错
+#[cfg(not(unix))]
+pub fn attach(
+    _path: &Path,
+    _cmds: &[Value],
+    _json_out: bool,
+    _quiet: bool,
+) -> Result<(usize, usize), String> {
+    Err("Windows 上还没有控制通道：Unix socket 换成命名管道这件事还没做（协议不变，见 control.rs 头部）".into())
 }
 
 /// 供 GUI 侧调用：把控制通道状态拼成一行摘要

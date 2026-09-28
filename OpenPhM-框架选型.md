@@ -1694,6 +1694,8 @@ Windows 上给子进程加 `CREATE_NO_WINDOW`（`CommandExt::creation_flags`）�
 - **Windows 分支本机无法编译验证**：`rustup target add x86_64-pc-windows-gnu` 失败
   （static.rust-lang.org TLS 被重置）。`#[cfg(windows)]` 那几处（`cmd /C start`、`CREATE_NO_WINDOW`、
   `.exe` 候选）在 Linux 上不参与编译 —— 逻辑已被平台参数化的单测覆盖，但**编译**要等真在 Windows 上过一遍。
+  > **2026-09-28 补**：目标已装上、交叉编译打通（见 §7.45）—— 上面那几处 `#[cfg(windows)]`
+  > 现在**真的参与编译**了，这条"待验证"降级为"编译已验证、真机运行未验证"。
 
 测试 **98 条**全绿、0 警告。
 
@@ -2594,9 +2596,73 @@ wgpu 枚举适配器时，Vulkan loader 会把 ICD 目录里的**所有**驱动�
 
 `cargo test`：**188 通过 / 0 失败 / 0 警告**（新增 3 条）。
 
-**仍未验证**：Windows 本机编译与运行（`rustup target add x86_64-pc-windows-gnu` 失败，见 §7.29）。
+**仍未验证**：Windows 本机编译与运行（`rustup target add x86_64-pc-windows-gnu` 失败，见 §7.29；
+—— **编译已在 §7.45 打通**，真机运行仍未验证）。
 本轮的"Windows 行为"是在 Linux 上用钩子**执行**平台无关的那几条判定得到的 ——
 `power_preference` 与 wgpu 后端实现层面在 Windows 上的真实表现，仍需目标机。
 另外记一笔现状：egui-wgpu 的默认电源偏好是 `HighPerformance`（`WGPU_POWER_PREF` 未设时），
 我们**没动它** —— 用户要的是"保持默认"，而这就是那套默认；若哪天要改成"让 Windows 图形设置说了算"，
 那是另一处改动（把 `power_preference` 设成 `PowerPreference::None`），不是这一处。
+
+## 7.45 Windows 交叉编译打通：从"编不过"到"exe 能跑、能出图"（2026-09-28）
+
+用户："**已安装好x86_64-pc-windows-gnu，检查是否能够编译exe文件。**"
+
+### 环境
+
+`rustup target add x86_64-pc-windows-gnu` 这次装上了（§7.29 里失败的那一步）；链接器
+`x86_64-w64-mingw32-gcc` 本来就在（`mingw-w64-gcc`）。头一次为该目标构建要把 Windows 侧依赖拉下来
+（`windows`/`windows-sys` 等，网络这次通），耗时主要在下载与编依赖，不在我们的代码。
+
+### 唯一的编译障碍：控制通道是 Unix socket，而模块没有平台门
+
+`src/control.rs` 直接用 `std::os::unix::net::{UnixListener, UnixStream}`，而 `lib.rs` 里
+`pub mod control;` 是**无条件**的 ⇒ Windows 目标编到该模块就断。别的地方（`filedialog.rs` / `zip.rs` 的
+`#[cfg(windows)]`/`#[cfg(unix)]`）本来就是对的。
+
+### 修法：只把**传输层**做成平台缝，其余一概不动
+
+控制通道里平台相关的只有三个东西：`spawn_server`（bind + accept 循环）、`handle_conn`（连接处理）、
+`attach`（客户端 connect）。**协议层与视图层是平台无关的**（行分隔 JSON、`ViewCmd`、`ui_stats`、
+`parse_view_cmd`、文档命令），所以：
+
+- `spawn_server` / `handle_conn` / `attach` 加 `#[cfg(unix)]`；
+- 非 Unix 上给 `spawn_server` / `attach` 一对**如实报错**的桩：返回
+  "Windows 上还没有控制通道：Unix socket 换成命名管道这件事还没做（协议不变）"。
+  **不做成静默成功** —— GUI 的 `--control` 会因此打一行提示，`opm-ctl --attach` 报同一条，
+  使用者一眼知道"这次没起控制通道"，而不是对着一个连不上的路径猜；
+- 三个只被传输层用到的 import（`BufRead`/`BufReader`/`Write`、`json!`、`Origin`）加 `#[cfg(unix)]`
+  —— 否则 Windows 目标会多出 3 条 unused-import 警告。**"两个目标都是 0 警告"** 是这轮定的验收线。
+
+`main.rs` / `bin/opm_ctl.rs` **一行没改**：它们的调用点本来就在处理 `Result`，桩的 Err 走的是既有路径。
+
+### 产物
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu --bins
+# → target/x86_64-pc-windows-gnu/release/{opm-app.exe, opm-ctl.exe}
+```
+
+`file` 判定为 **PE32+ executable for MS Windows 5.02 (console), x86-64**；导入表里只有系统 DLL
+（`kernel32`/`user32`/`gdi32`/`dxgi`/`opengl32`/`mmdevapi`/`ws2_32`/`ole32`/`shell32`… 加 Universal CRT 的
+api-set），**没有 `libgcc_s_*.dll` / `libwinpthread-1.dll`**（Rust 的 windows-gnu 自包含链接）。
+Vulkan / D3D12 是运行时动态加载 ⇒ 实际门槛是 **Windows 10+**（api-set 与 DXGI 都在那之后）。
+
+### 实测（Wine，`WINEPREFIX` 放在 `target/wine-test`，不进仓库）
+
+| 检查 | 结果 |
+|---|---|
+| `opm-ctl.exe help` | 用法正常打印、退出 0（第二次起 ~0.9 s；首次运行是建 prefix） |
+| `opm-app.exe --help` | 同样正常 —— **GUI 那个二进制也起来了**（窗口本身没测：本机只有 Wayland、没 X11） |
+| `opm-ctl.exe new --out smoke.opm --name … --demo-notes 20` | 造出 8643 字节 `.opm`；**本机 Linux 的 `opm-ctl` 直接读得出来** ⇒ 两边文件格式互通 |
+| `--file smoke.opm validate --json` | 正常，按契约报 4 条 ERROR（demo 谱的轨道没铺到谱末） |
+| `--file smoke.opm overlaps` | 退出码 0（无重叠） |
+| `--file smoke.opm render --at 1.0 --width 320 --height 180 --out wine-render.png` | **wgpu 无头渲染成功**：320×180 PNG、26 个实例，图里音符块与判定线都在（Mesa 那几行 `failed to create dri2 screen` 是 Wine 侧的 EGL 噪声，不影响结果） |
+
+### 仍未验证 / 缺口（照旧写明白）
+
+- **真 Windows 机器没跑过**（这台机器只有 Linux + Wine）：驱动层、输入法、文件对话框（`cmd /C start`）、
+  多显示器 DPI 这些只有真机能定；
+- **GUI 窗口**在 Wine 下没测（缺 X11 显示）；
+- **控制通道在 Windows 上不存在**：命名管道待做（协议与全部视图命令可原样复用，只换传输）；
+- 未做 32 位目标（`i686-pc-windows-gnu`）与 MSVC 工具链（`x86_64-pc-windows-msvc`，需要 MSVC 链接器）。

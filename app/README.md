@@ -1,6 +1,7 @@
 # OpenPhM 应用骨架（Linux 优先）
 
-制谱器的第一版 UI 骨架。**当前只保证 Linux（Wayland/KDE）**；Windows 兼容测试按用户要求排在后面。
+制谱器的第一版 UI 骨架。**开发与验证都在 Linux（Wayland/KDE）**；Windows 侧现在**能交叉编译出 exe
+并在 Wine 上跑通**（含无头渲染），见下面「Windows exe（交叉编译）」一节 —— 但**没有在真 Windows 机器上跑过**。
 
 ## 启动到底在等什么（`--trace-startup`）
 
@@ -586,6 +587,33 @@ Windows 跑一遍（认不出的值退回编译期平台）。本机实测（`--
 另有 64 种适配器子集 × 2 种策略的穷举单测（不变量：有硬件绝不选软件、有核显必选核显、
 只有独显必用它、结果确定），以及"策略不看厂商"的结构性测试；再加一条 **128 种环境组合的非 Linux 穷举**
 （不看平台就断言"策略=交给平台、ICD 不干预、后端不动"，唯一的例外是 `OPM_GPU`）与平台钩子的单测。
+
+## Windows exe（交叉编译）：能编、能在 Wine 上跑
+
+```sh
+rustup target add x86_64-pc-windows-gnu          # 一次性
+cargo build --release --target x86_64-pc-windows-gnu --bins
+# → target/x86_64-pc-windows-gnu/release/{opm-app.exe, opm-ctl.exe}
+```
+
+只需要 mingw-w64 链接器（Arch 上是 `mingw-w64-gcc`，给的是 `x86_64-w64-mingw32-gcc`）。
+产物是 **PE32+ x86-64 控制台程序**，导入表里只有系统 DLL（`kernel32`/`user32`/`gdi32`/`dxgi`/`opengl32`/
+`mmdevapi`/`ws2_32` + Universal CRT 的 api-set），**不含 `libgcc`/`libwinpthread`**（自包含）；
+Vulkan 与 D3D12 是运行时动态加载的，所以**要求 Windows 10+**（api-set 与 DXGI 都在那之后）。
+
+实测（本机 Wine，`WINEPREFIX` 放在 `target/wine-test`，构建目录本来就不进仓库）：
+
+| 检查 | 结果 |
+|---|---|
+| `opm-ctl.exe help` / `opm-app.exe --help` | 正常打印用法、退出 0（**GUI 那个二进制也起来了**） |
+| `opm-ctl.exe new --out smoke.opm --demo-notes 20` | 造出 8.6 KB 谱面；**本机 Linux 的 `opm-ctl` 能直接读**（格式互通） |
+| `--file smoke.opm validate --json` / `overlaps` | 正常（校验按契约报出 4 条 ERROR，退出码正确） |
+| `--file smoke.opm render --at 1.0 --out wine-render.png` | **wgpu 无头渲染成功**：320×180 PNG、26 个实例（音符块真的画出来了） |
+
+**已知缺口（如实说）**：控制通道（`opm-app --control` / `opm-ctl --attach`）是 Unix socket，**Windows 上
+还没有等价实现**（该换命名管道，线协议与所有视图命令都不用改）—— 那里 `spawn_server`/`attach` 直接
+返回"未实现"：GUI 的 `--control` 会打一行提示，不假装启用。另外 GUI **窗口**在 Wine 下没测（这台机器
+只有 Wayland、没有 X11 显示），真 Windows 机器上的运行仍待验证。
 
 ## 快速放置音符：Q/W/E/R（hold 跟随鼠标）
 
