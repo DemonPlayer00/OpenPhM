@@ -16,8 +16,41 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 谱面过滤器（opm 与 RPE 都是 `.json`，所以只有一个"谱面"过滤器）
-pub const CHART_FILTER: &str = "谱面 (*.json)";
+/// 文件过滤器：**一个标签 + 一组通配**（系统框里那一行就是"谱面 (*.json)"）。
+///
+/// 为什么要有这个类型：以前只有一个 `CHART_FILTER: &str`，而**通配是写死的 `*.json`**
+/// （`format!("{filter} | *.json")`）—— 于是"选音乐"的系统框也只列 json 文件（用户报的 bug）。
+/// 现在标签与通配绑在一起：选音乐给音频通配、选曲绘给图片通配，各归各位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Filter {
+    pub label: &'static str,
+    /// 空格分隔的多个通配（kdialog 与 zenity 都认这种写法）
+    pub patterns: &'static str,
+}
+
+impl Filter {
+    /// 系统框里那一行：`谱面 (*.json)`
+    pub fn spec(&self) -> String {
+        format!("{} ({})", self.label, self.patterns)
+    }
+    /// 主通配（第一个）—— 需要"建议扩展名"的地方用它
+    pub fn first_pattern(&self) -> &'static str {
+        self.patterns.split_whitespace().next().unwrap_or("*")
+    }
+}
+
+/// 谱面（opm 与 RPE 都是 `.json`，所以只有一个"谱面"过滤器）
+pub const CHART_FILTER: Filter = Filter { label: "谱面", patterns: "*.json" };
+/// 音频：与 `audio.rs` 那边解码器（symphonia）真正支持的容器对齐
+pub const AUDIO_FILTER: Filter = Filter {
+    label: "音频",
+    patterns: "*.ogg *.mp3 *.wav *.flac *.m4a *.aac *.opus *.mp4",
+};
+/// 曲绘/背景：常见位图（Phigros 侧实际就是 png/jpg）
+pub const IMAGE_FILTER: Filter = Filter {
+    label: "曲绘",
+    patterns: "*.png *.jpg *.jpeg *.webp *.bmp",
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Which {
@@ -75,11 +108,12 @@ pub fn availability() -> &'static str {
 /// 构造命令行（**纯函数**：参数怎么拼在这里一眼可查，也有单测钉住）
 ///
 /// `start` 给起始目录或"目录 + 建议文件名"（保存时用后者，系统框会预填名字并做覆盖确认）。
+/// `filter` 决定**中间那一行列出什么** —— 谱面/音频/曲绘各有各的通配（见 [`Filter`]）。
 pub fn args(
     prog: &str,
     which: Which,
     start: Option<&Path>,
-    filter: &str,
+    filter: Filter,
 ) -> Vec<String> {
     let title = format!("OpenPhM · {}", which.verb());
     match prog {
@@ -96,7 +130,8 @@ pub fn args(
                     .unwrap_or_else(|| ".".to_owned()),
             );
             if which != Which::Directory {
-                a.push(format!("{filter} | *.json"));
+                // kdialog 的写法：`标签 (*.a *.b)`
+                a.push(filter.spec());
                 a.push("所有文件 | *".to_owned());
             }
             a
@@ -115,7 +150,8 @@ pub fn args(
                 a.push(format!("--filename={}", s.display()));
             }
             if which != Which::Directory {
-                a.push(format!("--file-filter={}", filter.replace(" (*.json)", " | *.json")));
+                // zenity 的写法：`--file-filter=标签 | *.a *.b`
+                a.push(format!("--file-filter={} | {}", filter.label, filter.patterns));
                 a.push("--file-filter=所有文件 | *".to_owned());
             }
             a
@@ -127,16 +163,21 @@ pub fn args(
 ///
 /// 取消与失败的区分：**标准输出为空就算取消**（两个程序取消时都不输出、退出码不为 0），
 /// 只有"程序起不来"才算错误 —— 这样用户按 Esc 不会被报成故障。
-pub fn pick(which: Which, start: Option<&Path>) -> Result<Option<PathBuf>, String> {
+pub fn pick(which: Which, start: Option<&Path>, filter: Filter) -> Result<Option<PathBuf>, String> {
     match detect() {
-        Some(prog) => pick_with(prog, which, start),
+        Some(prog) => pick_with(prog, which, start, filter),
         None => Err("系统里没有 kdialog/zenity —— 请用内置路径输入框".to_owned()),
     }
 }
 
 /// 指定程序版本的 [`pick`]（测试注入假程序用，不必真的弹窗）
-pub fn pick_with(prog: &str, which: Which, start: Option<&Path>) -> Result<Option<PathBuf>, String> {
-    let argv = args(prog, which, start, CHART_FILTER);
+pub fn pick_with(
+    prog: &str,
+    which: Which,
+    start: Option<&Path>,
+    filter: Filter,
+) -> Result<Option<PathBuf>, String> {
+    let argv = args(prog, which, start, filter);
     let out = Command::new(prog)
         .args(&argv)
         .output()
@@ -152,7 +193,7 @@ pub fn pick_with(prog: &str, which: Which, start: Option<&Path>) -> Result<Optio
 /// 选一个目录（"保存窗口"里的"选择文件夹"）。`Ok(None)` = 取消。
 pub fn pick_folder(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     match detect() {
-        Some(prog) => pick_with(prog, Which::Directory, start),
+        Some(prog) => pick_with(prog, Which::Directory, start, CHART_FILTER),
         None => Err("系统里没有 kdialog/zenity —— 请直接输入文件夹".to_owned()),
     }
 }
@@ -365,6 +406,36 @@ mod tests {
         let a = args("zenity", Which::Open, None, CHART_FILTER);
         assert!(!a.contains(&"--save".to_owned()), "打开不该带 --save");
 
+        // **每个过滤器各带自己的通配** —— 这条是用户报的 bug（"选音乐的系统框只列 json"）的回归测试
+        let a = args("kdialog", Which::Open, None, AUDIO_FILTER);
+        assert!(
+            a.iter().any(|s| s == "音频 (*.ogg *.mp3 *.wav *.flac *.m4a *.aac *.opus *.mp4)"),
+            "{a:?}"
+        );
+        assert!(!a.iter().any(|s| s.contains("*.json")), "选音乐不该出现 json 通配：{a:?}");
+        let a = args("zenity", Which::Open, None, AUDIO_FILTER);
+        assert!(
+            a.iter().any(|s| s
+                == "--file-filter=音频 | *.ogg *.mp3 *.wav *.flac *.m4a *.aac *.opus *.mp4"),
+            "{a:?}"
+        );
+        assert!(a.contains(&"--file-filter=所有文件 | *".to_owned()), "所有文件要留着兜底：{a:?}");
+        // 曲绘走图片通配
+        let a = args("kdialog", Which::Open, None, IMAGE_FILTER);
+        assert!(a.iter().any(|s| s == "曲绘 (*.png *.jpg *.jpeg *.webp *.bmp)"), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains("*.json")), "{a:?}");
+        let a = args("zenity", Which::Open, None, IMAGE_FILTER);
+        assert!(
+            a.iter().any(|s| s == "--file-filter=曲绘 | *.png *.jpg *.jpeg *.webp *.bmp"),
+            "{a:?}"
+        );
+        // 三个过滤器的形状约定（`spec`/`first_pattern` 是拼命令行与建议扩展名的公共入口）
+        for f in [CHART_FILTER, AUDIO_FILTER, IMAGE_FILTER] {
+            assert_ne!(f.patterns, "*");
+            assert!(f.spec().starts_with(f.label), "{f:?}");
+            assert!(f.first_pattern().starts_with("*."), "{f:?}");
+        }
+
         // 只选目录：KDE 用 --getexistingdirectory，GTK 用 --directory，且都不该带文件过滤器
         let a = args("kdialog", Which::Directory, Some(dir), CHART_FILTER);
         assert_eq!(a[2], "--getexistingdirectory");
@@ -410,22 +481,22 @@ mod tests {
         };
 
         let ok = stub("ok.sh", "echo /tmp/charts/picked.json");
-        let got = pick_with(ok.to_str().unwrap(), Which::Save, None).unwrap();
+        let got = pick_with(ok.to_str().unwrap(), Which::Save, None, CHART_FILTER).unwrap();
         assert_eq!(got, Some(PathBuf::from("/tmp/charts/picked.json")));
 
         // 取消：不输出（真实 kdialog/zenity 取消时就是这样，退出码可能是 1）
         let cancel = stub("cancel.sh", "exit 1");
-        assert_eq!(pick_with(cancel.to_str().unwrap(), Which::Open, None).unwrap(), None);
+        assert_eq!(pick_with(cancel.to_str().unwrap(), Which::Open, None, CHART_FILTER).unwrap(), None);
 
         // 输出里带空白也要能解析（有些程序会多打一个换行）
         let spaced = stub("spaced.sh", "printf '  /tmp/a b.json  \\n'");
         assert_eq!(
-            pick_with(spaced.to_str().unwrap(), Which::Open, None).unwrap(),
+            pick_with(spaced.to_str().unwrap(), Which::Open, None, CHART_FILTER).unwrap(),
             Some(PathBuf::from("/tmp/a b.json"))
         );
 
         // 程序不存在 → 明确报错，而不是当成"用户取消"
-        let err = pick_with("/nonexistent/kdialog", Which::Open, None).unwrap_err();
+        let err = pick_with("/nonexistent/kdialog", Which::Open, None, CHART_FILTER).unwrap_err();
         assert!(err.contains("无法启动"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();

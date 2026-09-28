@@ -254,6 +254,8 @@ pub enum StartAction {
     Create,
     /// 用系统对话框挑音乐文件（结果写回表单的 `audio`）
     PickAudio,
+    /// 用系统对话框挑曲绘/背景图（结果写回表单的 `illustration`）
+    PickIllustration,
     /// 什么都不选，直接进编辑器
     Skip,
     /// 从列表里移除一条（不删文件）
@@ -261,6 +263,86 @@ pub enum StartAction {
     ClearAll,
     /// 界面上要显示一条提示（例如"文件不在了"）
     Notice(String),
+}
+
+/// 表单里"要挑文件"的那个字段（也是它在 `meta` 里的名字来源）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetField {
+    /// `meta.audio` —— 音乐
+    Audio,
+    /// `meta.background` —— 曲绘/背景
+    Illustration,
+}
+
+impl AssetField {
+    /// 文档 `meta` 里的字段名（`new` 命令用它）
+    pub fn meta_key(self) -> &'static str {
+        match self {
+            AssetField::Audio => "audio",
+            AssetField::Illustration => "background",
+        }
+    }
+}
+
+/// 「挑一个资源文件」这件事的**全部**参数：挑完写回哪个字段、界面怎么称呼它、系统框列什么。
+///
+/// 为什么放进库里：用户报过"**新建谱面时音乐的系统框只列 json 文件**" —— 根因是那处
+/// `filedialog::pick` 复用了谱面过滤器，而"谁该用哪个过滤器"当时写在 `main.rs` 里，**测不到**
+/// （bin crate 的单测够不着那里的接线）。现在映射与过滤器都在这里，单测直接钉住。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetPick {
+    pub field: AssetField,
+    /// 界面上的称呼（"音乐" / "曲绘"）
+    pub what: &'static str,
+    /// 输入框里的占位说明
+    pub hint: &'static str,
+    /// "浏览…"按钮的悬停说明
+    pub hover: &'static str,
+    pub filter: crate::filedialog::Filter,
+}
+
+/// 表单里两个要挑文件的字段（**顺序即界面顺序**；以后加资源类型只改这里）
+pub const ASSET_PICKS: [AssetPick; 2] = [
+    AssetPick {
+        field: AssetField::Audio,
+        what: "音乐",
+        // 占位说明要**短到不被截断**（输入框宽度有限）：例子 + 字段名就够，细节在悬停里
+        hint: "song.ogg → meta.audio",
+        hover: "用系统文件对话框选音频（ogg/mp3/wav/flac/m4a/aac/opus）；保存 .opm 时一起装进容器",
+        filter: crate::filedialog::AUDIO_FILTER,
+    },
+    AssetPick {
+        field: AssetField::Illustration,
+        what: "曲绘",
+        hint: "bg.png → meta.background",
+        hover: "用系统文件对话框选曲绘（png/jpg/jpeg/webp/bmp）；保存 .opm 时一起装进容器",
+        filter: crate::filedialog::IMAGE_FILTER,
+    },
+];
+
+impl AssetPick {
+    /// 界面上的行标签（"音乐路径"）
+    pub fn label(&self) -> String {
+        format!("{}路径", self.what)
+    }
+    /// 这一行对应的动作（按钮按下时交给调用方）
+    pub fn action(&self) -> StartAction {
+        match self.field {
+            AssetField::Audio => StartAction::PickAudio,
+            AssetField::Illustration => StartAction::PickIllustration,
+        }
+    }
+}
+
+impl StartAction {
+    /// 这个动作要挑资源吗？挑的话，参数全在这里（`None` = 不弹文件对话框）
+    pub fn asset(&self) -> Option<AssetPick> {
+        match self {
+            StartAction::PickAudio => Some(ASSET_PICKS[0]),
+            StartAction::PickIllustration => Some(ASSET_PICKS[1]),
+            _ => None,
+        }
+    }
 }
 
 /// "新建谱面"表单的值。**放在库里**：它的校验规则（曲名必填、BPM 必须为正）要有单测，
@@ -271,6 +353,8 @@ pub struct NewChartForm {
     pub charter: String,
     pub composer: String,
     pub audio: String,
+    /// 曲绘/背景图路径 —— 写进 `meta.background`，保存成 `.opm` 时和音乐一起装进容器
+    pub illustration: String,
     pub bpm: f32,
 }
 
@@ -281,6 +365,7 @@ impl Default for NewChartForm {
             charter: String::new(),
             composer: String::new(),
             audio: String::new(),
+            illustration: String::new(),
             // 174 是 Phigros 常见档位，作为默认值比 120 更贴近实际；填错也就改一个数
             bpm: 174.0,
         }
@@ -308,16 +393,36 @@ impl NewChartForm {
     }
     /// 提交给 `{"op":"new"}` 的参数（BPM 已在 `validate` 里保证为正）
     pub fn to_new_command(&self) -> serde_json::Value {
-        serde_json::json!({
-            "op": "new",
-            "meta": {
-                "name": self.name_or_untitled(),
-                "charter": self.charter.trim(),
-                "composer": self.composer.trim(),
-                "audio": self.audio.trim(),
-            },
-            "bpm": self.bpm as f64,
-        })
+        let mut meta = serde_json::Map::new();
+        meta.insert("name".to_owned(), serde_json::json!(self.name_or_untitled()));
+        meta.insert("charter".to_owned(), serde_json::json!(self.charter.trim()));
+        meta.insert("composer".to_owned(), serde_json::json!(self.composer.trim()));
+        // 资源字段名与写回字段**同源**（`AssetField::meta_key`），不再各处写字符串
+        meta.insert("audio".to_owned(), serde_json::json!(self.audio.trim()));
+        meta.insert(
+            AssetField::Illustration.meta_key().to_owned(),
+            serde_json::json!(self.illustration.trim()),
+        );
+        serde_json::json!({ "op": "new", "meta": meta, "bpm": self.bpm as f64 })
+    }
+
+    /// 表单里某个资源字段的值（给界面用：标签/占位/按钮都从 [`ASSET_PICKS`] 来）
+    pub fn asset(&self, field: AssetField) -> &str {
+        match field {
+            AssetField::Audio => &self.audio,
+            AssetField::Illustration => &self.illustration,
+        }
+    }
+    /// 同上，可变版（输入框直接改它）
+    pub fn asset_mut(&mut self, field: AssetField) -> &mut String {
+        match field {
+            AssetField::Audio => &mut self.audio,
+            AssetField::Illustration => &mut self.illustration,
+        }
+    }
+    /// 系统对话框挑完之后写回（`asset_mut` 的语义化包装）
+    pub fn set_asset(&mut self, field: AssetField, path: &str) {
+        *self.asset_mut(field) = path.to_owned();
     }
 }
 
@@ -562,7 +667,8 @@ pub fn new_chart_modal(
         dialog::title(ui, "新建谱面");
         dialog::hint(
             ui,
-            "这些会写进谱面文件（曲名 / 谱面作者 / 音乐作者 / 音乐路径 / 基础 BPM）",
+            "这些会写进谱面文件（曲名 / 谱面作者 / 音乐作者 / 音乐与曲绘路径 / 基础 BPM）；\
+             音乐与曲绘会一起装进 `.opm` 容器",
         );
         ui.add_space(8.0);
         // 输入框宽度是**弹窗宽度的函数**（纯量），不看屏幕、也不看上一层还剩多少地方
@@ -592,18 +698,22 @@ pub fn new_chart_modal(
                         .hint_text("composer"),
                 );
                 ui.end_row();
-                ui.label("音乐路径");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.audio)
-                            .desired_width(w - 90.0)
-                            .hint_text("song.ogg（写进 meta.audio）"),
-                    );
-                    if ui.button("浏览…").on_hover_text("用系统文件对话框选音频").clicked() {
-                        action = Some(StartAction::PickAudio);
-                    }
-                });
-                ui.end_row();
+                // 资源行（音乐 / 曲绘）**由 `ASSET_PICKS` 驱动**：标签、占位、悬停、按钮动作、
+                // 以及按下后弹哪种过滤器，全都来自那一处定义 —— 界面与"挑文件要带什么过滤器"不会各说各话
+                for spec in ASSET_PICKS {
+                    ui.label(spec.label());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(form.asset_mut(spec.field))
+                                .desired_width(w - 90.0)
+                                .hint_text(spec.hint),
+                        );
+                        if ui.button("浏览…").on_hover_text(spec.hover).clicked() {
+                            action = Some(spec.action());
+                        }
+                    });
+                    ui.end_row();
+                }
                 ui.label("基础 BPM");
                 ui.horizontal(|ui| {
                     ui.add(
@@ -948,16 +1058,68 @@ mod tests {
         f.charter = "  me  ".to_owned();
         f.composer = " someone ".to_owned();
         f.audio = " song.ogg ".to_owned();
+        f.illustration = " bg.png ".to_owned();
         let cmd = f.to_new_command();
         assert_eq!(cmd["op"], "new");
         assert_eq!(cmd["meta"]["name"], "Belle de Nuit");
         assert_eq!(cmd["meta"]["charter"], "me");
         assert_eq!(cmd["meta"]["composer"], "someone");
         assert_eq!(cmd["meta"]["audio"], "song.ogg");
+        // 曲绘走 `meta.background`（文档模型里的字段名），而且要去空白 —— 空着就是"没有曲绘"
+        assert_eq!(cmd["meta"]["background"], "bg.png");
+        assert_eq!(
+            NewChartForm { illustration: "  ".to_owned(), ..f.clone() }.to_new_command()["meta"]["background"],
+            ""
+        );
         assert_eq!(cmd["bpm"], 180.5);
         let empty = NewChartForm { name: String::new(), ..f.clone() };
         assert_eq!(empty.name_or_untitled(), "untitled");
         assert_eq!(empty.to_new_command()["meta"]["name"], "untitled");
+    }
+
+    /// **每个资源字段用自己那套过滤器** —— 用户报的"新建时音乐的系统框只列 json"就是这条断了。
+    ///
+    /// 映射（动作 → 字段/过滤器/界面文案）全在库里，所以这条能在 bin 之外被钉住；
+    /// 界面那两行也由同一份 [`ASSET_PICKS`] 驱动，不会各说各话。
+    #[test]
+    fn asset_picks_use_their_own_filters() {
+        use crate::filedialog::{AUDIO_FILTER, IMAGE_FILTER};
+        let audio = StartAction::PickAudio.asset().expect("选音乐要给出参数");
+        assert_eq!(audio.field, AssetField::Audio);
+        assert_eq!(audio.filter, AUDIO_FILTER);
+        assert_eq!(audio.what, "音乐");
+        assert_eq!(audio.label(), "音乐路径");
+        assert!(!audio.filter.patterns.contains("json"), "音乐过滤器不该列 json");
+
+        let art = StartAction::PickIllustration.asset().expect("选曲绘要给出参数");
+        assert_eq!(art.field, AssetField::Illustration);
+        assert_eq!(art.filter, IMAGE_FILTER);
+        assert_eq!(art.what, "曲绘");
+        assert_eq!(art.label(), "曲绘路径");
+        assert!(art.filter.patterns.contains("png") && art.filter.patterns.contains("jpg"));
+
+        // 两个字段互不相同，且文档字段名就是 `new` 命令认的那两个
+        assert_ne!(audio.field, art.field);
+        assert_eq!(AssetField::Audio.meta_key(), "audio");
+        assert_eq!(AssetField::Illustration.meta_key(), "background");
+
+        // 双向一致：`ASSET_PICKS[i].action().asset() == ASSET_PICKS[i]`（界面按 spec.action() 发动作）
+        for spec in ASSET_PICKS {
+            assert_eq!(spec.action().asset(), Some(spec), "{spec:?}");
+        }
+        // 不是资源动作的就没有 asset()
+        for other in [StartAction::Create, StartAction::Skip, StartAction::OpenDialog] {
+            assert!(other.asset().is_none(), "{other:?}");
+        }
+
+        // 写回字段 → `new` 命令的 meta：两边字段名同源，路径要去空白
+        let mut f = NewChartForm::default();
+        f.set_asset(AssetField::Audio, " /m/song.ogg ");
+        f.set_asset(AssetField::Illustration, " /m/bg.png ");
+        assert_eq!(f.asset(AssetField::Audio), " /m/song.ogg ");
+        let cmd = f.to_new_command();
+        assert_eq!(cmd["meta"]["audio"], "/m/song.ogg");
+        assert_eq!(cmd["meta"]["background"], "/m/bg.png");
     }
 
     /// 新建谱面是**盖在列表上的模态**（不换整屏）：Esc 是"返回列表"，

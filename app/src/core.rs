@@ -129,6 +129,25 @@ impl SaveFormat {
             }
         }
     }
+    /// `Auto` 且**还没有保存目标**（新建出来的谱面）时，建议用哪个扩展名。
+    ///
+    /// 规则里的那一条是用户要求推出来的：**引用了音乐/曲绘就该存成容器 `.opm`** ——
+    /// 否则默认给出 `曲名.opm.json`，第一次保存就把音乐和曲绘留在包外了
+    /// （"音乐和曲绘都要放到 opm 文件中"）。没有引用资源时维持裸 `.opm.json`（可 diff、可入版本库）。
+    pub fn suggested_extension(self, loaded: Format, references_assets: bool) -> &'static str {
+        match self {
+            SaveFormat::Opm => Format::OpmZip.extension(),
+            SaveFormat::OpmBare => Format::Opm.extension(),
+            SaveFormat::Rpe => Format::Rpe.extension(),
+            SaveFormat::Auto => {
+                if matches!(loaded, Format::OpmZip) || references_assets {
+                    Format::OpmZip.extension()
+                } else {
+                    loaded.extension()
+                }
+            }
+        }
+    }
 }
 
 /// 保真度报告 → JSON（CLI/控制通道输出）
@@ -528,6 +547,17 @@ impl EditCore {
         self.path.as_deref()
     }
 
+    /// 文档有没有引用外部资源（音乐 / 曲绘）。
+    ///
+    /// 用途只有一个但很关键：**新建谱面第一次保存时建议哪种扩展名** —— 引用了资源就建议
+    /// 容器 `.opm`（它们得装进包里），否则维持裸 `.opm.json`（见 [`SaveFormat::suggested_extension`]）。
+    pub fn references_assets(&self) -> bool {
+        [self.doc.meta.audio.as_deref(), self.doc.meta.background.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|s| !s.trim().is_empty())
+    }
+
     /// 当前 revision（广播序号；测试用来断言"视图状态没碰过文档"）。
     pub fn revision(&self) -> u64 {
         self.revision
@@ -684,7 +714,12 @@ impl EditCore {
                         let a = get("audio");
                         if a.is_empty() { None } else { Some(a) }
                     },
-                    background: None,
+                    // 曲绘/背景：与 `audio` 同口径 —— 表单里填了什么就写什么。
+                    // 存 `.opm` 时由 `container::collect_assets` 读进来装进包里（§7.48）
+                    background: {
+                        let b = get("background");
+                        if b.is_empty() { None } else { Some(b) }
+                    },
                     foreign: Default::default(),
                 };
                 self.doc = Document::fresh(meta, if bpm > 0.0 { bpm } else { 174.0 });

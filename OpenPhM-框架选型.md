@@ -2822,3 +2822,96 @@ warn:  41e7d1f2-a591-4f7b-a2e5-fa9c843e1c12
   实测：Wine 下这行紧挨着那条 ERROR 出现；Linux 下 0 次（`grep -c 图形环境` = 0）。
 - 想让这行彻底消失只剩一条路：在 Wine 上只开 Vulkan（不建 DX12 实例）—— **故意不做**：
   后端集合在 Windows 上归平台管（§7.44.3），而 Wine 不是目标平台。
+
+## 7.48 新建谱面：音乐选择器 + 曲绘字段 + 两份资源都进 `.opm`（2026-09-28）
+
+用户："**创建谱面时需要填写的音乐路径不对，选择器限制json文件。添加曲绘路径，音乐和曲绘都要放到opm文件中。**"
+
+三个问题，两个是真 bug、一个是"最后一段没接上"。
+
+### ① 选音乐的系统框只列 json —— 过滤器是硬编码的
+
+`filedialog::args` 里两个分支都把通配写死成 `*.json`：
+
+```rust
+a.push(format!("{filter} | *.json"));                                  // kdialog
+a.push(format!("--file-filter={}", filter.replace(" (*.json)", " | *.json"))); // zenity
+```
+
+而 `pick()` / `pick_with()` 又写死用 `CHART_FILTER` —— 于是"选音乐"这条调用路径（`main.rs` 里那个
+`filedialog::pick(Which::Open, start)`）**必然**只列 json。修法是把"标签"和"通配"绑成一个值：
+
+```rust
+pub struct Filter { pub label: &'static str, pub patterns: &'static str }
+pub const CHART_FILTER: Filter = … "*.json";
+pub const AUDIO_FILTER: Filter = … "*.ogg *.mp3 *.wav *.flac *.m4a *.aac *.opus *.mp4";
+pub const IMAGE_FILTER: Filter = … "*.png *.jpg *.jpeg *.webp *.bmp";
+```
+
+`args`/`pick`/`pick_with` 都多一个 `filter` 参数；两种程序各按自己的语法拼（kdialog
+`标签 (*.a *.b)`、zenity `--file-filter=标签 | *.a *.b`），"所有文件 | *"照旧留着兜底。
+音频那份通配**与 `audio.rs` 里解码器真正支持的容器对齐**（symphonia 的 features）。
+
+### ② 表单没有曲绘字段；而且 `new` 命令**把它硬编码成 None**
+
+- `NewChartForm` 多了 `illustration`，走 `meta.background`（文档模型里就叫这个，容器那侧
+  `collect_assets` / `planned_asset_renames` **早就支持它**，缺的只是"谁来填"）；
+- `{"op":"new"}` 原来写着 `background: None` —— 就算表单填了也会被丢掉。现在与 `audio` 同口径读 `meta`。
+
+### ③ 关键设计：把"哪个字段用哪个过滤器"放进库里
+
+用户报的这个 bug 之所以能存在，是因为**接线写在 `main.rs` 里**（bin crate，单测够不着）。
+现在映射与文案都在库里：
+
+```rust
+pub struct AssetPick { field: AssetField, what: &'static str, hint: …, hover: …, filter: Filter }
+pub const ASSET_PICKS: [AssetPick; 2] = [音乐 → AUDIO_FILTER, 曲绘 → IMAGE_FILTER];
+
+impl StartAction { pub fn asset(&self) -> Option<AssetPick> }   // 动作 → 该弹哪种框、写回哪
+impl NewChartForm { fn asset_mut(field) / set_asset(field, path) }
+```
+
+界面那两行**由 `ASSET_PICKS` 驱动**（标签"音乐路径/曲绘路径"、占位、悬停、按钮动作、过滤器全来自同一处），
+`main.rs` 只剩一句 `filedialog::pick(Which::Open, start, spec.filter)`，而且匹配臂写成
+`Some(action @ (PickAudio | PickIllustration))` —— **以后加资源类型会编译不过**，不会被悄悄漏掉。
+
+### ④ 最后一公里：默认保存建议的扩展名
+
+就算前面都对了，新建的谱面第一次保存仍会建议 **`曲名.opm.json`（裸）** —— 音乐与曲绘留在包外，
+"都要放到 opm 文件中"只兑现一半。所以定了一条规则（纯函数，有单测）：
+
+```rust
+// SaveFormat::suggested_extension(loaded, references_assets)
+// Auto + 还没有保存目标：引用了音乐/曲绘 ⇒ `.opm`（容器）；否则维持 `.opm.json`（可 diff）
+// 用户显式选的格式一律优先（选了"裸 opm"就还是裸）
+```
+
+配套 `EditCore::references_assets()`（音乐/曲绘任一**非空白**即真）。GUI 的 `save_ext()` 相应分成两支：
+**已有目标**沿用它的扩展名（`Auto` = 跟着名字走，`resolve` 原样）；**还没有目标**才用这条建议。
+
+### 实测与测试
+
+- **真跑一遍**（`opm-ctl --cmd '{"op":"new",…}' --cmd '{"op":"save","path":"…/端到端.opm"}'`）：
+  保真度报告逐条说明"音乐 `/tmp/…/song.flac`（366 KiB）已装入容器，包内名 `song.flac`"、
+  "曲绘/背景 `bg.png`（1 KiB）已装入容器"、"…→ 包内相对名（文档字段同步改写，可撤销）"；
+  `7z l` 列出来就是 **3 个条目**：`song.flac` 375608 / `bg.png` 1491 / `opm.json` 736；
+  读回来 `meta = {"audio":"song.flac","background":"bg.png",…}`（包内相对名）。
+- 单测：过滤器两套语法各自的 argv（音频/曲绘/谱面三份，含"选音乐不该出现 json 通配"这条回归）+
+  `ASSET_PICKS[i].action().asset() == ASSET_PICKS[i]` 双向一致 + 扩展名规则 + `references_assets`。
+- 集成测试（`tests/lifecycle.rs`）：**命令由表单自己产出**（`NewChartForm::to_new_command()`）→
+  `save_as(.opm)` → 重新读容器，断言两份资源的**字节一致**、字段被规范成包内名。
+  于是"表单字段 → meta 字段 → 容器条目"是一条完整的链，中间改名/写错字段会在这里断掉。
+- 截图：`artifacts/new-chart-form.png`（模态里两行"音乐路径/曲绘路径"，各带"浏览…"）。
+
+### 顺手修掉的测试基础设施坑
+
+`tests/lifecycle.rs` 的 `tmpdir()` 原来**按进程号命名一个共享目录**，而每个用例结尾都
+`remove_dir_all` 它 —— cargo 默认**并行跑同一文件里的用例**，于是 A 的清理会把 B 正在用的目录删掉。
+表现是 `写入失败: No such file or directory`，而且**只在跑整个测试文件时**出现（单跑那个用例是绿的）。
+现在改成**按用例 tag 命名**（`tmpdir("packing")`），并加了一句注释说明为什么。
+
+### 仍未验证
+
+**没有真的点过那两个"浏览…"按钮、也没弹过真的 kdialog**（本会话无法往 Wayland 窗口注入鼠标）：
+"动作 → 过滤器"的映射与"过滤器 → argv"的拼接分别由单测钉住，模态本身有截图，但"点下去弹出来的
+确实是音频框"这条链路只有人工确认才算最终验证。

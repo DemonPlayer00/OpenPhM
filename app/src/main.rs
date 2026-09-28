@@ -1271,15 +1271,18 @@ impl App {
     /// [`opm_app::codec::Format::extension`]。原先这里另有一份 `match`，而对话框的提示文字
     /// 又是第三份说法 —— 结果提示说"opm → `.opm.json`"、实际写出 `.opm`。
     fn save_ext(&self) -> &'static str {
-        let loaded = self
+        let (loaded, has_assets) = self
             .core
             .lock()
-            .map(|c| c.source_format())
-            .unwrap_or(opm_app::codec::Format::Opm);
-        let draft = self
-            .target_path()
-            .unwrap_or_else(|| std::path::PathBuf::from("未命名"));
-        self.save_format.resolve(&draft, loaded).extension()
+            .map(|c| (c.source_format(), c.references_assets()))
+            .unwrap_or((opm_app::codec::Format::Opm, false));
+        match self.target_path() {
+            // 已有保存目标：沿用它的扩展名（`Auto` 就是"跟着名字走"）
+            Some(p) => self.save_format.resolve(&p, loaded).extension(),
+            // 还没有目标（新建的谱面）：**引用了音乐/曲绘就建议 `.opm` 容器** ——
+            // 否则第一次保存默认给 `曲名.opm.json`，音乐与曲绘会留在包外（用户要求它们进包）
+            None => self.save_format.suggested_extension(loaded, has_assets),
+        }
     }
 
     /// 草稿目标（界面上那行"保存目标"）→ 路径。空串表示"还没指定"。
@@ -1457,7 +1460,7 @@ impl App {
             c.path().map(std::path::Path::to_path_buf)
         };
         let start = filedialog::start_for_open(cur.as_deref());
-        match filedialog::pick(filedialog::Which::Open, start.as_deref()) {
+        match filedialog::pick(filedialog::Which::Open, start.as_deref(), filedialog::CHART_FILTER) {
             Ok(Some(p)) => self.open_doc(&p.display().to_string()),
             Ok(None) => self.file_message = Some((true, "已取消".to_owned())),
             Err(e) => {
@@ -1486,7 +1489,7 @@ impl App {
             &self.file_stem(),
             self.save_ext(),
         ));
-        match filedialog::pick(filedialog::Which::Save, start.as_deref()) {
+        match filedialog::pick(filedialog::Which::Save, start.as_deref(), filedialog::CHART_FILTER) {
             Ok(Some(p)) => {
                 self.save_doc_as(&p.display().to_string());
                 self.sync_file_fields();
@@ -2342,12 +2345,19 @@ impl App {
                 self.new_form_open = false;
                 self.file_message = None;
             }
-            Some(opm_app::recents::StartAction::PickAudio) => {
+            // 选资源（音乐 / 曲绘）：**过滤器与写回字段由库里 `StartAction::asset()` 给** ——
+            // 用户报过"选音乐的系统框只列 json"，根因就是这一处的过滤器硬编码在 bin 里、测不到。
+            Some(
+                action @ (opm_app::recents::StartAction::PickAudio
+                | opm_app::recents::StartAction::PickIllustration),
+            ) => {
+                // 新增资源类型时这里会**编译不过**（or 模式没覆盖到），不会被悄悄漏掉
+                let spec = action.asset().expect("这两个动作一定有 asset()");
                 let start = filedialog::start_for_open(None);
-                match filedialog::pick(filedialog::Which::Open, start.as_deref()) {
+                match filedialog::pick(filedialog::Which::Open, start.as_deref(), spec.filter) {
                     Ok(Some(p)) => {
-                        self.new_form.audio = p.display().to_string();
-                        self.file_message = Some((true, format!("音乐 → {}", p.display())));
+                        self.new_form.set_asset(spec.field, &p.display().to_string());
+                        self.file_message = Some((true, format!("{} → {}", spec.what, p.display())));
                     }
                     Ok(None) => {}
                     Err(e) => self.file_message = Some((false, e)),
