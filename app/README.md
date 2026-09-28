@@ -4,10 +4,17 @@
 并在 Wine 上跑通（GUI 窗口、无头渲染、中文显示都验过），见「Windows exe（交叉编译）」一节 ——
 但**没有在真 Windows 机器上跑过**。中文**自带字体**（内嵌思源黑体，不依赖系统字体），见「字体」一节。
 
+> **两条约定**（2026-09-28 整理仓库时加的）：
+> 1. 文中「本机」= 一台 **AMD 核显 + NVIDIA 独显**的笔记本（Wayland/KDE）；主机名、显卡型号、
+>    账号与家目录路径不写进文档，**实测数字全部保留**。
+> 2. `本机证据/xxx.png` = **不在仓库里**的取证图。截图与测试音频曾经入库（29 M / 109 件，
+>    随每轮开发无限增长），现归档在 `~/.dsh/workspace/OpenPhM-artifacts/app-artifacts/`；
+>    文字里保留文件名作记录，只是不再随仓库分发（见「界面取证」一节）。
+
 ## 启动到底在等什么（`--trace-startup`）
 
 启动慢在哪，猜不如量：`opm-app --trace-startup`（或 `OPM_TRACE_STARTUP=1`）会把
-"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。本机（AMD 610M 核显 + Vulkan，
+"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。本机（AMD 核显 + Vulkan，
 debug 构建，热启动取 5 次中位）实测：
 
 | 阶段 | 中位耗时 | 说明 |
@@ -100,7 +107,7 @@ cargo run --release -- --scale 1.5 --verify-align            # 分数缩放 + �
 
 **为什么不让两边各写一份**：早先 GUI 自己维护 `conflicts` 缓存 + "哪条线动过"的判断，
 CLI 完全没有这个能力 —— 同一件事两套实现，迟早出现"GUI 说 3 处、CLI 说 2 处"。
-现在只有一份缓存，**两侧的输出可以逐字比对**（`artifacts/conflict-browser.png` 与 `opm-ctl … overlaps`
+现在只有一份缓存，**两侧的输出可以逐字比对**（`本机证据/conflict-browser.png` 与 `opm-ctl … overlaps`
 列的是同一批 pointer/label）。
 - **冲突浏览器**：冲突一出现就自动展开（关掉后不会自己弹回来），每条列出
   `线 #L · 轨道 · 事件 i→j 重叠 [起, 止) 拍`，**点一下跳到那里**（选中该线/轨道/事件 + 播放头定位到重叠起点）。
@@ -116,7 +123,7 @@ CLI 完全没有这个能力 —— 同一件事两套实现，迟早出现"GUI 
 事件的头/尾改时间走 `resize_event`（**只改这一个事件** —— 早先的版本会同步邻块，用户明确否掉了那个语义），值/缓动走 `set_event`。
 **流速轨不给缓动下拉框**（它只按线性求值，见「下落速度」一节）：导入的谱面若带着非线性缓动，
 那里会显示 `inOutCubic → 按线性求值` 并说明"名字原样保留"
-（证据：`artifacts/speed-easing-linear-only.png` —— 左边事件列表照旧印文件里的 `inOutCubic`，
+（证据：`本机证据/speed-easing-linear-only.png` —— 左边事件列表照旧印文件里的 `inOutCubic`，
 右边检查器标出"按线性求值"，时间轴那条曲线也是直线）。
 
 ### 输入时机：**只在回车 / 失焦时提交**（用户要求）
@@ -153,7 +160,7 @@ CLI 完全没有这个能力 —— 同一件事两套实现，迟早出现"GUI 
 - **认不出的缓动**（老文件里的怪名字）：原样显示 + 一句"无法识别，已原样保留"，**不拿一个猜的名字
   去改用户的文件**。
 
-证据：`artifacts/easing-two-part.png`（`inOutBack` 显示为 `回拉 back` + `io`；同一个谱面的 `linear`
+证据：`本机证据/easing-two-part.png`（`inOutBack` 显示为 `回拉 back` + `io`；同一个谱面的 `linear`
 事件在第二张里显示为 `线性` + 置灰的 `out`）。
 
 ## 数据边界：谁有权写谱面
@@ -271,7 +278,7 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 **细但看得见**（用户要求"最细的线也画明显"；纵向坐标分格线同色同宽，两个方向的"最细档"是同一档东西）。
 纵轴轴带里**每一拍补一个小刻度**（标注位置的更长，压在上面），所以节奏基元在轴上是看得见的：
 实测轴带内缘亮段，改前 16 处 / 平均 46.3px（= 每 2 拍，只有标注位），改后 **32 处 / 平均 23.1px = 正好一拍**
-（32 拍可见时一拍 ≈ 23.1px）。对比图 `artifacts/beat-base.png`。
+（32 拍可见时一拍 ≈ 23.1px）。对比图 `本机证据/beat-base.png`。
 
 **网格线就是吸附目标**：线画在哪、吸附到哪，用的是**同一个数** —— `EditorState::effective_beat_div()`
 （`overlay::beat_grid_lines` 画线、`snap_beat`/`beat_json` 吸附，全部读它）。**整拍线在抽稀时永不跳过**。
@@ -322,7 +329,7 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 - **纵轴数字标注的密度与精度随缩放变**（`overlay::axis_ticks`）：网格多密由设置（每拍 N 条）决定，
   标注多密由"放不放得下字"决定（`AXIS_LABEL_MIN_PX = 34`）。步长只走 4·2^k 阶梯（… 1/4、1/2、1、2、4、8 …），
   精度由步长定：4 拍可见 → 每 1/4 拍一条、两位小数（`0.25` `1.50`）；32 拍可见 → 每 2 拍、整数；
-  256 拍可见 → 每 16 拍、整数。实测截图见 `artifacts/zoom-labels.png`。
+  256 拍可见 → 每 16 拍、整数。实测截图见 `本机证据/zoom-labels.png`。
 - 纵轴画在**中间**（两区之间），拍号写在轴带里；见上面的布局图。
 - 跟随播放头：窗口是 `[播放头 − 2 拍, +30 拍)`，暂停在哪就停在哪。
 - 左半与右半都是**当前判定线**的：线是父对象，音符和事件都是它的子数据（与左侧判定线树同一个模型）。
@@ -444,7 +451,7 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 | 播放时 | 自动隐藏（`ui_stats.overlay_visible` 可观察） |
 
 无头出图（`render`）**不含**编辑区 —— 给 agent 的图里不该有编辑器 chrome。
-实测（截图：`artifacts/edit-overlay.png` 暂停态 / `artifacts/edit-overlay-hidden.png` 播放态）：
+实测（截图：`本机证据/edit-overlay.png` 暂停态 / `本机证据/edit-overlay-hidden.png` 播放态）：
 暂停时 `overlay_visible=true`，播放中 `false`，再暂停 `true`；
 `{"op":"nudge","beats":N}` 全部精确落位（+2→18.00 拍、−4→14.00、10×+1→24.00、往前滚过头停在 0 拍）。
 
@@ -742,12 +749,12 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
 ## 显卡选择（Linux 混显笔记本）：默认核显，独显要显式指定
 
 wgpu 的默认电源偏好是 `HighPerformance`，于是**什么都不设**时程序会去开独显。编谱是 2D、几十个实例的
-活儿，核显足够，而独显（这台机器上是 RTX 5070 Max-Q）的功耗与发热高得多 —— 所以这里改成
+活儿，核显足够，而独显（这台机器上是 NVIDIA 独显（笔记本））的功耗与发热高得多 —— 所以这里改成
 **核显优先，独显只在显式指定时才用**：
 
 | 怎么指定 | 结果 |
 |---|---|
-| 什么都不设 | **核显优先**（本机实测：AMD Radeon 610M / IntegratedGpu） |
+| 什么都不设 | **核显优先**（本机实测：AMD 核显 / IntegratedGpu） |
 | `prime-run opm-app …` | 独显（prime-run 设的 `__NV_PRIME_RENDER_OFFLOAD=1` / `__VK_LAYER_NV_optimus=NVIDIA_only` / `__GLX_VENDOR_LIBRARY_NAME=nvidia` 就是"我要独显"） |
 | `DRI_PRIME=1` | 独显（Mesa 那套写法；`DRI_PRIME=0` 表示"不要"，不算指定） |
 | `OPM_GPU=discrete` / `OPM_GPU=integrated` | 明确要独显 / 明确要核显（程序自己的开关，优先级最高） |
@@ -773,9 +780,9 @@ Windows 跑一遍（认不出的值退回编译期平台）。本机实测（`--
 
 | 跑法 | 启动日志 | 独显 `runtime_status` | 首帧 |
 |---|---|---|---|
-| Linux 默认（摘 NVIDIA ICD、只开 Vulkan、装选择器） | `保留 3 个：radeon/intel_hasvk/intel_icd.json` + `显卡选用: AMD Radeon 610M` | `suspended` **全程没被碰** | 248 ms |
+| Linux 默认（摘 NVIDIA ICD、只开 Vulkan、装选择器） | `保留 3 个：radeon/intel_hasvk/intel_icd.json` + `显卡选用: AMD 核显` | `suspended` **全程没被碰** | 248 ms |
 | `OPM_GPU_PLATFORM=windows` | `非 Linux：不改 ICD、不改后端集合、不装适配器选择器` + `图形后端: 全部后端` + `显卡策略: 交给平台默认` | `suspended` → **`active`**（ICD 未被过滤 ⇒ 枚举到 NVIDIA） | **4773 ms** |
-| `OPM_GPU_PLATFORM=windows OPM_GPU=integrated` | 上面三行 + `适配器候选 [1] NVIDIA GeForce RTX 5070` + `显卡选用: AMD Radeon 610M` | `active` | 5584 ms |
+| `OPM_GPU_PLATFORM=windows OPM_GPU=integrated` | 上面三行 + `适配器候选 [1] NVIDIA 独显` + `显卡选用: AMD 核显` | `active` | 5584 ms |
 
 第二行是"Windows 分支真的没干预"的**硬证据**：枚举里出现了 NVIDIA 适配器、后端集合是默认的、日志里
 根本没有 `显卡选用` 那一行（说明我们的选择器压根没装）。启动慢 4.5 s 也正是"枚举独显 + 初始化 GL"的代价。
@@ -788,7 +795,7 @@ Windows 跑一遍（认不出的值退回编译期平台）。本机实测（`--
 
 | 组合 | 怎么模拟 | 结果 |
 |---|---|---|
-| 核显 + 独显（本机真实） | —— | 选核显（AMD 610M） |
+| 核显 + 独显（本机真实） | —— | 选核显（AMD） |
 | **只有核显** | 只挂 `radeon_icd.json` | 选核显 ✓ |
 | **只有独显** | 只挂 `nvidia_icd.json` | **照样选独显** ✓（不会因为"核显优先"就不给用硬件） |
 | 只有虚拟卡 / 只有软件渲染 | `WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1` | 选 llvmpipe（`Gl/Cpu`）✓（比开不了窗口好） |
@@ -823,8 +830,8 @@ release 体积：**`opm-app.exe` 29.3 MB**（其中内嵌字 8.4 MB，见下）/
 | `opm-app.exe --fonts` | 内嵌字体 + 355 字探针**全有字形**（见下节） |
 | `opm-ctl.exe new --out rel2.opm --demo-notes 24` | 造出 9.9 KB 谱面；**本机 Linux 的 `opm-ctl` 能直接读**（格式互通） |
 | `--file rel2.opm validate --json` / `overlaps` | 正常（校验按契约报 ERROR、退出码正确） |
-| `--file rel2.opm render --at 1.5 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例 → `artifacts/windows-exe-wine-render.png` |
-| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动）：中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态** → `artifacts/windows-exe-wine-ui.png` |
+| `--file rel2.opm render --at 1.5 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例 → `本机证据/windows-exe-wine-render.png` |
+| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动）：中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态** → `本机证据/windows-exe-wine-ui.png` |
 
 **已知缺口（如实说）**：控制通道（`opm-app --control` / `opm-ctl --attach`）是 Unix socket，**Windows 上
 还没有等价实现**（该换命名管道，线协议与所有视图命令都不用改）—— 那里 `spawn_server`/`attach` 直接
@@ -918,7 +925,7 @@ $ wine opm-app.exe --fonts        # Windows 二进制、默认 wine 前缀（那
 
 自动化钩子：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>` 或 `OPM_EDIT_AUTO=event:<track>,<start>,<end>`
 启动就把"正在跟随的草稿"摆出来（截图/自检用；没人能往窗口里注入按键，这是唯一能把它拍下来的办法）。
-工件：`artifacts/pending-hold.png`、`artifacts/pending-hold-handles.png`、`artifacts/pending-event.png`。
+工件：`本机证据/pending-hold.png`、`本机证据/pending-hold-handles.png`、`本机证据/pending-event.png`。
 
 ## 按键也能被"真的按一遍"：`OPM_KEY_AUTO`
 
@@ -939,7 +946,7 @@ OPM_KEY_AUTO=30:Delete';'70:ctrl+z     opm-app --doc x.opm --shot /tmp/b.png --s
 塞事件只让 `key_pressed` 为真，`modifiers.command` 仍是 false，于是 `ctrl+z` **一声不响地什么都没做**
 （实测：日志里根本没有 `[core] update`）。正确做法是直接写 `i.modifiers` —— 与真实事件的效果完全一致。
 
-实测（2026-09-28，`--verbose-updates` 的 [core] 留痕，工件 `artifacts/multi-select-{deleted,undone}.png`）：
+实测（2026-09-28，`--verbose-updates` 的 [core] 留痕，工件 `本机证据/multi-select-{deleted,undone}.png`）：
 
 ```text
   OPM_KEY_AUTO     : 帧 30 注入 1 次按键（Delete）
@@ -960,8 +967,8 @@ opm-ctl --attach auto --cmd '{"op":"select","notes":[0,1,2]}'
 opm-ctl --attach auto --cmd '{"op":"select","events":[["alpha",0],["alpha",1]]}'
 ```
 
-工件：`artifacts/multi-select-notes.png`（已选 3 个音符 + 三处白框 + 标题下一行读数）、
-`artifacts/multi-select-events.png`（已选 2 条事件）、`multi-select-deleted.png`（删完：音符 8→5、底栏"已删除 3 个音符"）、
+工件：`本机证据/multi-select-notes.png`（已选 3 个音符 + 三处白框 + 标题下一行读数）、
+`本机证据/multi-select-events.png`（已选 2 条事件）、`multi-select-deleted.png`（删完：音符 8→5、底栏"已删除 3 个音符"）、
 `multi-select-undone.png`（`Ctrl+Z` 之后音符回到 8）。
 
 
@@ -1023,7 +1030,7 @@ opm-app --doc x.opm.json --audio song.wav --audio-offset-ms -12   # 手动校准
   （用户报的"第二次打击动画时 hold 会消失"）。现在段是**带符号**的（`dy.abs()`），
   尾巴一过身子就消失。（**那个累加器已经被检查点表换掉了**，见「下落速度」一节 ——
   现在头尾都是查表，过去/现在/将来都能问，这个病根不存在了。）
-  证据：`artifacts/hold-tail-at-second-pulse.png`（3 拍那一帧：身子 + 效果同时在，
+  证据：`本机证据/hold-tail-at-second-pulse.png`（3 拍那一帧：身子 + 效果同时在，
   尾巴在 180 单位而不是钉死的 360）、`hold-tail-near-end.png`（尾巴降到 60 单位）；
   自检：`a_held_hold_tail_follows_the_current_time`（0/0.5/1.0/1.5/1.9 秒处尾巴必须分别在
   2400/1800/1200/600/120）+ `a_held_hold_body_never_vanishes_mid_way`（3 流速 × 2 音符 speed × 3 时长）。
@@ -1046,9 +1053,9 @@ opm-app --doc x.opm.json --audio song.wav --audio-offset-ms -12   # 手动校准
    会被整条裁掉）。
 
 证据（截图都是 `--overlay off` + 控制通道 `seek` 到精确时刻拍的，这样停在那一帧上不会被编辑区挡住）：
-`artifacts/hit-effect.png`（一个 tap 的击中效果正压在判定线上）、
-`artifacts/hold-pulse.png`（按住中：身子从判定线往上 + 3 拍的那次脉冲）、
-`artifacts/note-vanishes-at-line.png`（音符停在线上收缩 + 效果框）。
+`本机证据/hit-effect.png`（一个 tap 的击中效果正压在判定线上）、
+`本机证据/hold-pulse.png`（按住中：身子从判定线往上 + 3 拍的那次脉冲）、
+`本机证据/note-vanishes-at-line.png`（音符停在线上收缩 + 效果框）。
 自检：`cargo test --test lines` 的 `a_note_hits_the_judge_line_then_vanishes`、
 `a_hold_pulses_a_hit_effect_every_three_beats`、`a_held_hold_body_starts_at_the_judge_line`、
 `a_long_hold_stays_visible_after_its_head_is_hit`、`a_fake_note_does_not_flash`。
@@ -1160,7 +1167,7 @@ y_local = (H(t_音符) − H(t_此刻)) × 音符自身 speed        H(t) = 120 
 （600 单位）**不再上报实例**（已飞出 ±450 的窗口）；把流速改成 20 则 0.1 秒后是 240、0.3 秒后的飞出窗口。
 另一条测试把手册那条算例直接钉死：流速 10 走 0.75 秒**正好** 900 单位。
 
-性能（本机 RX 610M 核显，1600×900，`--bench`）：400 音符 p50 实例构建 **0.006 ms**、
+性能（本机 AMD 核显，1600×900，`--bench`）：400 音符 p50 实例构建 **0.006 ms**、
 4000 音符 **0.009 ms**。**这些数是"每帧现积"时代的**；现在音符位置是加载时算好的
 （见下一节），每帧只查表，所以构建代价与"窗口内的流速事件条数"彻底无关了。
 
@@ -1210,7 +1217,7 @@ y_local = (H(t_音符) − H(t_此刻)) × 音符自身 speed        H(t) = 120 
 早先 `track_value` 在"首条事件之前"返回 `None`，调用方于是回落到**全局默认值** ——
 一条从第 4 秒才开始、值 0.25 的透明度事件，会让判定线在 0~4 秒**完全不透明**；
 时间轴的曲线也会在事件块之后就断掉，看上去像"回到了默认值"。
-证据：`artifacts/timeline-curve-broken-before-fix.png` ↔ `timeline-holds-value-across-gaps.png`
+证据：`本机证据/timeline-curve-broken-before-fix.png` ↔ `timeline-holds-value-across-gaps.png`
 （同一份谱面：前者曲线只画到事件块末尾，后者保持那条水平线画满整条时间轴）。
 
 ## 音符位置：加载时算好，流速改了异步补
@@ -1271,7 +1278,7 @@ y_local = (H(t_音符) − H(t_此刻)) × 音符自身 speed        H(t) = 120 
    `a_note_after_a_gap_sits_where_the_direct_integral_says`（这条**手算**期望值：流速
    0~1 秒 0.5 / 1~2 秒空隙 / 2~5 秒 10，播放头 0.875 秒时 2.125 与 2.25 秒那两颗必须是
    217.5 与 367.5 —— 旧代码给 75 / 82.5，实测摘掉修复即红）。
-   证据：`artifacts/gap-note-after-gap.png`（修好之后：两颗在 217.5 / 367.5）与
+   证据：`本机证据/gap-note-after-gap.png`（修好之后：两颗在 217.5 / 367.5）与
    `gap-note-before-fix.png`（同一份谱面、同一个播放头，旧代码把它们挤在判定线附近）。
 2. **hold 的尾巴没被算进"要重算"的范围**：一开始只按"音符时刻在改动之后"标脏，
    于是**跨过改动点的长 hold**（头在前、尾在后）留着旧尾巴 —— 由上面那条
@@ -1285,7 +1292,7 @@ y_local = (H(t_音符) − H(t_此刻)) × 音符自身 speed        H(t) = 120 
 "位置此刻是负的"的不同来路。到线那一刻（`age ≥ 0`）就不再算"之下"，所以击中效果照旧会播。
 （这条的来龙去脉见下面「预览里画哪些音符」的三条规则。）
 
-证据：`artifacts/floor-rebuild-progress.png`（20 万音符的谱面，改一笔流速之后**第 31 帧**：
+证据：`本机证据/floor-rebuild-progress.png`（20 万音符的谱面，改一笔流速之后**第 31 帧**：
 底栏 `⟳ 音符位置重算 40960/200000` —— 正好是 10 帧 × 4096 的预算）、
 `floor-rebuild-done.png`（同一份谱面补完之后：底栏那行字自己消失）。
 
@@ -1315,7 +1322,7 @@ opm-app --boundary off             # 只关边框，不改判定线长度
 opm-ctl --file x.opm.json render --line-len 1600 --no-boundary --out a.png
 ```
 
-证据：`artifacts/judge-line-3000.png`（默认线长下"线 #0 长 3000（伸出窗口）"贴在窗口右边缘）。
+证据：`本机证据/judge-line-3000.png`（默认线长下"线 #0 长 3000（伸出窗口）"贴在窗口右边缘）。
 
 ### 音符"会不会被裁掉"：候选集按**位置**选，不按时间窗口选
 
@@ -1359,7 +1366,7 @@ opm-ctl --file x.opm.json render --line-len 1600 --no-boundary --out a.png
 现在判据改成：把这颗音符（连它的半宽半高、按旋转取外接半径）变换到屏幕坐标，
 看它的**包围盒是否与窗口相交**；余量仍是 `EditorState::NOTE_SPAN_MARGIN = 60`。
 断言在 `notes_inside_the_window_are_drawn_however_far_they_are_from_the_line`（三种线位姿逐一对账）。
-证据：`artifacts/note-visible-with-offset-line.png`（线在 y=−300，音符一直画到窗口上沿）。
+证据：`本机证据/note-visible-with-offset-line.png`（线在 y=−300，音符一直画到窗口上沿）。
 
 **"所有音符都能显示"是可执行的断言**（`tests/lines.rs::every_note_becomes_visible_inside_the_window_before_its_hit`）：
 流速取 10 / 3 / 1 / 0.5，五颗音符横向铺在 ±600 上，逐帧扫过"进画面"的整个过程，断言
@@ -1390,11 +1397,11 @@ opm-ctl --file x.opm.json render --line-len 1600 --no-boundary --out a.png
 3.4 秒，而流速过零时音符会贴着判定线逗留 ⇒ 又漏画）；以及**流速换过符号时时间窗口根本不成立**
 （正负相消 ⇒ 一颗远在 3.3 秒之外的音符仍贴在窗口里，却被窗口挡在外面）。
 现在候选集按位置选，这两条自然消失。
-证据：`artifacts/sign-change-note-in-window.png`（流速 10→−10→−20，播放头 0.2 秒：
+证据：`本机证据/sign-change-note-in-window.png`（流速 10→−10→−20，播放头 0.2 秒：
 3.5 秒那颗画在 **+360**）与 `sign-change-note-missing-before-fix.png`（同一份谱面、同一个播放头，
 旧时间窗口下**整颗不见了**，画面上只剩判定线）。
 
-**"第二个负流速事件确实在控制音符"**也能拿出来看（`artifacts/second-negative-event-controls-note.png`）：
+**"第二个负流速事件确实在控制音符"**也能拿出来看（`本机证据/second-negative-event-controls-note.png`）：
 流速 10 → −10 → **−20** → +200，一颗 8.125 秒的音符在播放头 0.2 秒时偏移 +360（画出来了）；
 把那个 −20 改成 −10，同一帧的偏移变成 +2760 ⇒ 它移出了窗口（同一支 `opm-ctl render` 的实例数
 18 → 17）。改之前这两种情形**都**是 17：那颗音符离播放头 7.9 秒，早被时间窗口挡在外面。
@@ -1404,7 +1411,7 @@ opm-ctl --file x.opm.json render --line-len 1600 --no-boundary --out a.png
 线下采样（独立积分给出的偏移 < −1）**被画出来**就失败，线上采样（> +1）**没被画出来**也失败；
 用例还要求两侧都得采样到（否则白写）。跑下来四种形状 × 6720 个采样点，两侧都是 0 违例。
 
-证据：`artifacts/zero-crossing-before-hit.png`（过零段、击中之前：画面里只有判定线）、
+证据：`本机证据/zero-crossing-before-hit.png`（过零段、击中之前：画面里只有判定线）、
 `zero-crossing-hit-flash.png`（到线那一刻闪光）、`negative-speed-hit-flash.png`（纯负流速同理）、
 `slow-speed-note-enters.png`（流速 1、播放头 0：3.5 秒处那颗音符正确地贴在窗口上沿，
 修构建窗口之前它是**不显示**的）。
@@ -1534,7 +1541,7 @@ GUI 控制台 / 远端 opm-ctl
 当前选中对象（选中事件时是它的起止拍/值/缓动；选中音符时是音符字段；选中线时是线名/zOrder）。
 漏刷的后果是实测到的（2026-09-28，用户报「第二个负变速事件似乎不生效 / 下拉选择框总选上一次选的」）：
 命令**改了文档**、左边的事件列表也换了新值，**只有检查器停在改之前那份快照上**
-（证据：`artifacts/inspector-stale-before-fix.png` vs `inspector-follows-track-edit.png`）。
+（证据：`本机证据/inspector-stale-before-fix.png` vs `inspector-follows-track-edit.png`）。
 代价很小：检查器快照只是"锁一次文档 + 读选中项"，**不是**整表重建；音符列表那一半仍然是零。
 
 `LineProps` 会牵连 `bpmFactor`，因此事件话题**不得**附带 `LineProps`（见 §已知问题里的实测教训）。
@@ -1559,6 +1566,11 @@ python3 scripts/accept-broadcast.py
 - 字段：`builds_structure`（判定线整表）/ `builds_props` / `builds_notes` / `builds_tracks` / `builds_meta` / `builds_inspector`。
 
 ### 界面取证：让应用自己截图
+
+> 截图落在 `本机证据/`（= `~/.dsh/workspace/OpenPhM-artifacts/app-artifacts/`，**不入库**，
+> 见文件开头的约定 ②）。它是**本机**的证据："在这台机器上，这一栏画成了什么样" ——
+> 换台机器（字体/显卡/DPI 不同）就不该照搬，所以它不该进版本库；而"当时验的是哪一张"这件事
+> 又必须留痕，于是文档里保留文件名。
 
 外部抓屏在 Wayland 下**不可靠**：`with_position` 只是给合成器的提示（实测被无视），
 连"按深色像素找窗口"都会认错窗口（终端底色也接近）。所以验证界面用**应用自截屏**：
@@ -1612,7 +1624,7 @@ opm-app --control auto --shot /tmp/ui.png --shot-frame 40   # 也可以常驻着
 `EditCore` 提交到广播投递、再到 GUI 应用，发生在同一帧内（微秒级）。
 远端改动之所以能立刻看到，是因为控制线程改完后调用了 `waker()`（`ctx.request_repaint()`）—— 否则空闲心跳下最多要等 1 秒。
 
-证据图：[`artifacts/broadcast-scoped-update.png`](./artifacts/broadcast-scoped-update.png)：一次 `add_event`（0 号线 alpha）之后，
+证据图：[`本机证据/broadcast-scoped-update.png`](本机证据/broadcast-scoped-update.png)：一次 `add_event`（0 号线 alpha）之后，
 诊断面板里 `最近 #450 Remote add_event[0:alpha:1] → [Track[0]]`、`整表重建 0.000 ms`、
 `重建 整表0 属性0 音符0` / `重建 轨道1 检查1`（只有那条线的轨道缓存与检查器动了，
 音符/属性计数没动；同一张图里还有 `位置缓存 已算准（400 条）`）。
@@ -1655,7 +1667,7 @@ Rust 侧验收：`cargo test --test broadcast`（只命中相关订阅者 / 失�
 **不划算**。同理没有给叠加层的网格/刻度缓存：它们每次只是几十次浮点与一次 `format!`。
 判断依据是数字，不是"每帧 = 坏"。
 
-## 已实测（2560×1600@240Hz，NVIDIA 5070 / Vulkan，scale 1 与 1.5）
+## 已实测（2560×1600@240Hz，NVIDIA 独显 / Vulkan，scale 1 与 1.5）
 
 | 场景 | 整帧 p50 | UI 构建 p50 | 实例构建 p50 |
 |---|---|---|---|

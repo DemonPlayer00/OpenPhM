@@ -4,6 +4,17 @@
 > 编制日期：2026-09-27。**所有版本号与许可证均为本次直读上游文件所得**（见第 10 节来源）；标注「未核实」的不臆断。
 > 相关文档：[`OpenPhM-格式设计提案.md`](./OpenPhM-格式设计提案.md)、[`spec/opm-format.md`](./spec/opm-format.md)
 
+> **两条阅读约定**（2026-09-28 整理仓库时加的）：
+>
+> 1. **「本机」= 一台笔记本**：AMD 核显 + NVIDIA 独显，Wayland/KDE。文中所有 fps / ms 都是在它上面量的。
+>    主机名、显卡型号、账号与家目录路径**不写进文档**（写在这儿就等于公开）；设备**类别**保留 ——
+>    "核显优先"这条策略正是由"这台机器上有两种卡"推出来的。分辨率的数字也保留：
+>    它解释 vsync 封顶那笔账（`1000/240 = 4.1667 ms`），去掉数字那句话就不成立。
+> 2. **`本机证据/xxx.png` = 不在仓库里的截图**。取证图与测试音频曾经入库（29 M / 109 件），
+>    现归档在 `~/.dsh/workspace/OpenPhM-artifacts/app-artifacts/`（`本机证据/spike-*` 是同处的
+>    `spikes-artifacts/`）。文字里保留文件名 —— 那是"当时看到的是哪一张"的记录，只是不再随仓库分发。
+>    同批移出仓库的还有框架选型 spike 脚手架（`~/.dsh/workspace/OpenPhM-artifacts/spikes-crate/`）。
+
 ---
 
 ## 1. 先把"图形加速"翻译成可验收的指标
@@ -140,14 +151,16 @@
 
 **顺序建议**：先 S3（最可能否决框架）→ 再 S1（核心性能）→ 再 S2（音频）→ 最后 S4（打包发布前）。
 
-### 7.1 已完成实测（2026-09-27，本机 DPBox，Vulkan 1.4.357）
+### 7.1 已完成实测（2026-09-27，本机，Vulkan 1.4.357）
 
-工程：`spikes/`（Rust，`cargo build --release` 通过；依赖版本与本文一致）。
+工程：`spikes/`（Rust 脚手架，`cargo build --release` 通过；依赖版本与本文一致）。
+**注（2026-09-28）**：这具脚手架已随仓库整理移出到 `~/.dsh/workspace/OpenPhM-artifacts/spikes-crate/` ——
+结论在本文里，脚手架是一次性的。
 
 **S1 — 实例化 2D 渲染（离屏 1920×1080，单次 instanced draw，alpha 混合 + 纹理采样）**
 
-适配器：`NVIDIA GeForce RTX 5070 Laptop GPU`，backend=Vulkan，device_type=DiscreteGpu，驱动 615.71.09。
-环境同时枚举出 `AMD Radeon 610M (RADV)`（Vulkan，IntegratedGpu）与 `NVIDIA .../PCIe/SSE2`（GL 后端，注意 **device_type 报为 `Other`**，不能靠 device_type 判断 GL 适配器）。
+适配器：`NVIDIA 独显（笔记本）`，backend=Vulkan，device_type=DiscreteGpu，驱动 615.71.09。
+环境同时枚举出 `AMD 核显（RADV）`（Vulkan，IntegratedGpu）与 `NVIDIA .../PCIe/SSE2`（GL 后端，注意 **device_type 报为 `Other`**，不能靠 device_type 判断 GL 适配器）。
 
 | 实例数 | p50 (ms) | p99 (ms) | min (ms) | max (ms) | 等效 FPS |
 |---|---|---|---|---|---|
@@ -163,7 +176,7 @@
 **S3 — CJK 文本渲染（部分通过；IME 待人工验证）**
 
 环境：Wayland（`wayland-0`，KDE），fcitx5 运行中，`XMODIFIERS=@im=fcitx`、`SDL_IM_MODULE=wayland`、`INPUT_METHOD=wayland`，系统 84 个中文字体。
-窗口正常创建并渲染（`eframe` + wgpu 后端），截图见 `spikes/artifacts/`。字形结果：
+窗口正常创建并渲染（`eframe` + wgpu 后端），截图见 `本机证据/spike-s1*.png`（未入库）。字形结果：
 
 | 语种 | 结果 |
 |---|---|
@@ -515,7 +528,7 @@ Document
 | 16 拍（中点） | **78.75°** ← 线性会给 45° | **0.00** |
 | 32 拍 | 90.00° | 250.00 |
 
-几何（无头出图 + 应用自截屏，`artifacts/lines-events-ui.png`、`artifacts/multiline-demo.opm.json`）：
+几何（无头出图 + 应用自截屏，`本机证据/lines-events-ui.png`、`本机证据/multiline-demo.opm.json`）：
 4 条线各自处于不同的平移/旋转/透明度，**旋转 78.75° 的那条线，它下面的音符也是 78.75° 的斜块**；
 `alpha` 淡出的那条线与它的音符一起变淡；`-45°` 起手的线是斜的、到中点回到水平。
 
@@ -786,7 +799,7 @@ GUI 线程 ──读──▶ playhead = 帧数/采样率 − 输出延迟 + 用
 2. **`opm-ctl new`** 的元信息与 BPM 直写：改成走 `set_meta`/`set_bpm`。
 
 改动后**等价性已验证**：命令路径生成的演示谱面与旧的直接构造版
-（`artifacts/multiline-demo.opm.json`）**逐字段一致** —— 曲名、BPM、4 条线的 name/zOrder/isCover/bpmFactor、
+（`本机证据/multiline-demo.opm.json`）**逐字段一致** —— 曲名、BPM、4 条线的 name/zOrder/isCover/bpmFactor、
 每条线 5 条轨道的全部事件（起止拍/起止值/缓动）、400 个音符（拍/类型/laneX/时长）全部相同。
 
 ### 视图状态：改了又改，文档一个字节都不变
@@ -1006,7 +1019,7 @@ let is_beat = b % div == 0;         // 再用 (b+1) 判档 ⟹ 线落在 (div-1)
 顺手修掉一个相邻小问题：`lane_div` 为奇数时最外侧那对竖网格线会超出 ±675，被画到轴带/事件区上
 （音符区的映射对越界值是钳制的，不能拿它当"线在窗内"的依据）—— 现在只画落在窗口内的线。
 
-证据：`artifacts/grid-align.png`（拍号 12/16/20/24/28 正坐在粗线上，1/4 细分线在它们之间）。
+证据：`本机证据/grid-align.png`（拍号 12/16/20/24/28 正坐在粗线上，1/4 细分线在它们之间）。
 测试 **39 条**全绿，0 警告。
 
 
@@ -1117,7 +1130,7 @@ effective = 最大的 d（d | beat_div）使 beats_visible · d ≤ budget
 | 32（默认） | 18.75 | 2 拍 | `0 2 4 … 30` |
 | 256 | 2.3 | 16 拍 | `0 16 32 … 240` |
 
-（截图 `artifacts/zoom-labels.png`：三条轴带并排；`artifacts/grid-density.png`：每拍 1/2/4/8 条对比。）
+（截图 `本机证据/zoom-labels.png`：三条轴带并排；`本机证据/grid-density.png`：每拍 1/2/4/8 条对比。）
 
 ### 验收方式（注意可注入性）
 
@@ -1160,8 +1173,8 @@ effective = 最大的 d（d | beat_div）使 beats_visible · d ≤ budget
 
 线加亮的量化效果（同一区域亮行均值）：beat_div=1 时 23.4 → **42.7**；div=4 时 26.0 → **40.5**；
 div=8 时 26.3 → **42.5**（≈ ×1.6）。亮行计数随之变多（div=8：156 → **248**）—— 因为亮线更容易被检测到，
-这也正是"画明显"的直接证据。工件 `artifacts/beat-base.png`（改前 / 改后 / 每拍 1 条 三栏对比）、
-`artifacts/grid-density.png`、`artifacts/zoom-labels.png`（后两者按新配色重出）。
+这也正是"画明显"的直接证据。工件 `本机证据/beat-base.png`（改前 / 改后 / 每拍 1 条 三栏对比）、
+`本机证据/grid-density.png`、`本机证据/zoom-labels.png`（后两者按新配色重出）。
 测试 **43 条**全绿、0 警告。
 
 ## 7.19 最细的线也画明显 + 默认缩放拉长 4 倍（Linux 侧，2026-09-27 续）
@@ -1241,7 +1254,7 @@ pub fn normalize_lane_div(d: u32) -> u32 { d.clamp(1, 128) }   // 不再强制�
 ② `grid_is_a_lattice_and_snapping_lands_on_it` 里"吸附后的值必须是步长整数倍"改成
 "`(s+675)/step` 必须是整数"（旧式只在偶数下碰巧成立，是**旧模型的化石**）；
 并补上 5 等分的格点贴边、中轴非格点、`snap_lane(0) → 135`（半格处取上）三条断言。
-测试 **43 条**全绿、0 警告。工件 `artifacts/lane-division.png`（5 等分 vs 16 等分对照）。
+测试 **43 条**全绿、0 警告。工件 `本机证据/lane-division.png`（5 等分 vs 16 等分对照）。
 
 ## 7.21 顶栏多行 + 音符区窗口 X 偏移（编辑窗口外的音符）（Linux 侧，2026-09-27 续）
 
@@ -1307,7 +1320,7 @@ pane_x_to_lane(pane, x,    off) = off - 675 + (x - pane.min.x)/pane.width() * 13
 修法：临时值初始化**从状态取**（`state.window_offset_x`）。教训：**双向同步的"临时值"必须用状态初始化**，
 否则"默认值"会被当成用户输入。这条也解释了为什么我坚持每轮都截图量相位而不是"看代码觉得对"。
 
-测试 **45 条**全绿、0 警告。工件 `artifacts/window-offset.png`（偏移 0 vs +675 对照）。
+测试 **45 条**全绿、0 警告。工件 `本机证据/window-offset.png`（偏移 0 vs +675 对照）。
 
 ## 7.22 RPE 保存/加载（codec 层落地）（Linux 侧，2026-09-27 续）
 
@@ -1365,7 +1378,7 @@ GUI「文件 📂」与控制通道 `{"op":"load"}` 走的是同一条路。
 另外**独立确认了那个最贵的坑**：真实数据里唯一带时长（`endTime ≠ startTime`）的类型是 **2**，
 共 370 个 100% 有长度，1/3/4 全部零长度 ⇒ RPE `2 = Hold` 成立，与官谱（2 = Drag）相反。
 
-验证记录（含出处 URL 与 md5）落在 `app/artifacts/rpe-verify.txt`；**谱面本体是第三方作品，不入库**。
+验证记录（含出处 URL 与 md5）落在 `本机证据/rpe-verify.txt`；**谱面本体是第三方作品，不入库**。
 
 测试 **58 条**全绿、0 警告；`app/README.md`、`app/AGENT-API.md`、`spec/opm-format.md` §9 已更新。
 
@@ -1423,7 +1436,7 @@ GUI「文件 📂」与控制通道 `{"op":"load"}` 走的是同一条路。
 - `filedialog` 单测 4 条：argv 拼装（KDE/GTK 两套语法、保存必须带覆盖确认）、起始位置与建议名、
   **管道**（用临时 shell 脚本当假对话框：输出路径 → 返回该路径；空输出 → 视为取消；程序不存在 → 明确报错
   而不是当成"用户取消"）、探测结果只可能是受支持的两个程序。
-- 截图 `artifacts/file-dialog.png`（`--file-dialog` + `--shot`）。
+- 截图 `本机证据/file-dialog.png`（`--file-dialog` + `--shot`）。
 - **未做**：真机上点一次系统对话框需要有人在屏幕前按（我这轮没有在你桌面上弹窗）。argv 对着
   `kdialog --help` 核过、管道用假程序测过，但"点下去真的出现 KDE 文件框并返回路径"这一步
   得你按一次 Ctrl+O 才算验证完。
@@ -1448,7 +1461,7 @@ GUI「文件 📂」与控制通道 `{"op":"load"}` 走的是同一条路。
 ```
 文件夹   tests/data                    [选择文件夹…] [浏览…]
 谱面名字 codec test                    [应用名字]
-将写入   /var/www/OpenPhM/app/tests/data/codec test.opm.json
+将写入   仓库里的 app//tests/data/codec test.opm.json
 ```
 
 - **文件夹**：`选择文件夹…` 走系统目录对话框（新增 `filedialog::Which::Directory`：
@@ -1480,7 +1493,7 @@ GUI「文件 📂」与控制通道 `{"op":"load"}` 走的是同一条路。
 控制通道走了一遍与按钮**同一条**命令链（`{"op":"load"}` → `set_meta` → `{"op":"save","path":…,"format":"auto"}`）：
 RPE 谱面导入 → 名字改成 `我的 谱面/名 : 测试` → 落到 `我的 谱面-名 - 测试.opm.json`（8240 字节，
 `format: "opm"`，`fidelity.lossless = true`，文档里 `meta.name` 仍是原名）。
-截图 `artifacts/file-dialog.png`（顶栏已无保存按钮，对话框两段式路径 + 绝对路径预览）。
+截图 `本机证据/file-dialog.png`（顶栏已无保存按钮，对话框两段式路径 + 绝对路径预览）。
 
 测试 **65 条**全绿、0 警告。
 
@@ -1541,8 +1554,8 @@ RPE 谱面导入 → 名字改成 `我的 谱面/名 : 测试` → 落到 `我�
 - 端到端（控制通道，与 GUI 按钮同一条命令链）：`{"op":"new",…}` → `path: null`；
   `{"op":"save"}` → **明确拒绝** `未指定保存路径`（GUI 据此弹保存窗口）；
   `{"op":"save","path":"/tmp/nf/新曲.opm.json"}` → 写出、`format: opm`、`validate` 零 ERROR。
-- 截图 `artifacts/file-dialogs.png`（守卫 / 新建 / 文件三个对话框；**已随 §7.34 进回收站** ——
-  那张拼图里的"新建"是当时编辑页上的对话框，现在是启动页上的模态，见 `artifacts/new-chart-modal.png`）。
+- 截图 `本机证据/file-dialogs.png`（守卫 / 新建 / 文件三个对话框；**已随 §7.34 进回收站** ——
+  那张拼图里的"新建"是当时编辑页上的对话框，现在是启动页上的模态，见 `本机证据/new-chart-modal.png`）。
 
 测试 **69 条**全绿、0 警告。
 
@@ -1604,7 +1617,7 @@ RPE 谱面导入 → 名字改成 `我的 谱面/名 : 测试` → 落到 `我�
 
 第一版布局踩了个坑：两栏宽度靠 `ui.available_width()` 一层层吃下去，右栏被挤成一条缝
 （截图里"开始"只剩一个字宽）⇒ 改成**先算清楚 `left_w/right_w` 再 `allocate_ui_with_layout`**。
-截图 `artifacts/start-screen.png`。
+截图 `本机证据/start-screen.png`。
 
 ## 7.28 opm 容器：`.opm` 是 ZIP，打包交给 7z（Linux 侧，2026-09-27 续）
 
@@ -1689,7 +1702,7 @@ Windows 上给子进程加 `CREATE_NO_WINDOW`（`CommandExt::creation_flags`）�
 
 - 单测 5 条新增：Windows 候选表（含常见安装目录）、"不可执行的同名文件/目录不算可用"、
   `OPM_7Z` 显式优先且调不动不复用候选、`open_url` 只收 http(s)。
-- 提示窗**截图验证**（`OPM_7Z=/nonexistent/7z` 触发）：`artifacts/missing-7z.png`；
+- 提示窗**截图验证**（`OPM_7Z=/nonexistent/7z` 触发）：`本机证据/missing-7z.png`；
   有 7z 时启动打印 `7z: /usr/bin/7z` 并正常显示起始界面。
 - **Windows 分支本机无法编译验证**：`rustup target add x86_64-pc-windows-gnu` 失败
   （static.rust-lang.org TLS 被重置）。`#[cfg(windows)]` 那几处（`cmd /C start`、`CREATE_NO_WINDOW`、
@@ -1773,10 +1786,10 @@ eframe 0.36 的 `App::ui` **只对根视口调用**；子视口走 `show_viewpor
 
 ### 实测
 
-`--shot` 三张：`artifacts/start-window.png`（980×620，标题"OpenPhM — 选择谱面"）、
-`artifacts/missing-7z-window.png`（640×360，`OPM_7Z=/nonexistent/7z` 触发；**已随 §7.34 进回收站** ——
-缺 7z 现在是启动页上的黏性模态，见 `artifacts/missing-7z-modal.png`）、
-`artifacts/editor-after-launch.png`（`OPM_LAUNCH_AUTO=skip` 走完转场后的编辑页：✅ 空谱面 ♪ 0、无启动页残留）。
+`--shot` 三张：`本机证据/start-window.png`（980×620，标题"OpenPhM — 选择谱面"）、
+`本机证据/missing-7z-window.png`（640×360，`OPM_7Z=/nonexistent/7z` 触发；**已随 §7.34 进回收站** ——
+缺 7z 现在是启动页上的黏性模态，见 `本机证据/missing-7z-modal.png`）、
+`本机证据/editor-after-launch.png`（`OPM_LAUNCH_AUTO=skip` 走完转场后的编辑页：✅ 空谱面 ♪ 0、无启动页残留）。
 
 测试 **102 条**全绿、0 警告。
 
@@ -1863,7 +1876,7 @@ None if self.frames as u32 == self.args.shot_frame =>   // 默认 30
 - 端到端（自动化钩子）：`OPM_LAUNCH_AUTO=new` → 截到表单那一屏（760×480）；
   `OPM_LAUNCH_AUTO=create:从表单建的谱面` → 建谱面 → 进编辑页，顶栏显示曲名、`♪ 0`（空谱面无内建内容）、
   状态栏 `[opm]（未命名）•`（脏且还没保存目标 ✓）。
-- 工件：`artifacts/{start-window,new-chart-page,editor-after-form}.png`
+- 工件：`本机证据/{start-window,new-chart-page,editor-after-form}.png`
   —— **`new-chart-page.png` 与 `editor-after-form.png` 已随 §7.34 进回收站**（它们拍的是"整屏填表"，
   那个界面不存在了），替代品是 `new-chart-modal.png` 与 `editor-after-modal.png`。
 
@@ -1925,13 +1938,13 @@ None if self.frames as u32 == self.args.shot_frame =>   // 默认 30
   `dialog::inner_value_is_passed_through`、
   `recents::new_chart_modal_esc_goes_back_to_the_list_and_never_skips`（列表 + 模态同帧绘制，
   一份 Esc **只产生一个动作**）、`recents::start_screen_returns_actions_for_clicks`（模态开着时列表一个动作都不给）。
-- 截图（`--shot`）：`artifacts/new-chart-modal.png`（980×620，模态盖在列表上，**尺寸与标题都没变**）、
-  `artifacts/missing-7z-modal.png`（`OPM_7Z=/nonexistent/7z` 触发的门槛）、
-  `artifacts/guard-dialog.png` 与 `artifacts/file-dialog.png`（编辑页两个弹窗，改用 `dialog` 后外观不变）、
-  `artifacts/editor-after-modal.png`（`OPM_LAUNCH_AUTO=create:` 走完"填表→建谱→编辑页"）。
+- 截图（`--shot`）：`本机证据/new-chart-modal.png`（980×620，模态盖在列表上，**尺寸与标题都没变**）、
+  `本机证据/missing-7z-modal.png`（`OPM_7Z=/nonexistent/7z` 触发的门槛）、
+  `本机证据/guard-dialog.png` 与 `本机证据/file-dialog.png`（编辑页两个弹窗，改用 `dialog` 后外观不变）、
+  `本机证据/editor-after-modal.png`（`OPM_LAUNCH_AUTO=create:` 走完"填表→建谱→编辑页"）。
 - 另外两条路也复查过：`OPM_LAUNCH_AUTO=skip` → 编辑页；`--doc … OPM_7Z=/nonexistent/7z` → 编辑页 + 门槛模态。
 - 失败路径也拍了：`OPM_LAUNCH_AUTO=create:`（曲名为空）⇒ **留在模态里**、窗口仍是 980×620、
-  表单下方给出"曲名不能为空"（`artifacts/new-chart-modal-invalid.png`）。
+  表单下方给出"曲名不能为空"（`本机证据/new-chart-modal-invalid.png`）。
 - 进回收站的旧截图（拍的是已不存在的界面）：`file-dialogs.png`、`missing-7z.png`、`start-screen.png`、
   `new-chart-page.png`、`missing-7z-window.png`、`editor-after-form.png`。
 
@@ -2021,10 +2034,10 @@ example.com 与 7-zip 官网两个标签页（用户点名）。现在校验与"
 
 - `cargo test` **114 条全绿、0 警告**（新增 5 条：空话题广播两个方向、订阅表清理、`check_url`、
   列表行快照；`open_url` 那条改为不联网）。
-- 截图复核：`artifacts/status-badge.png`（状态栏新文案：`[opm] multiline-demo.opm.json ✓ 已保存` /
-  `[opm]（未命名） ● 有未保存改动`）、`artifacts/launcher-list-rows.png`（行快照画出来的行：
+- 截图复核：`本机证据/status-badge.png`（状态栏新文案：`[opm] multiline-demo.opm.json ✓ 已保存` /
+  `[opm]（未命名） ● 有未保存改动`）、`本机证据/launcher-list-rows.png`（行快照画出来的行：
   曲名 + `[opm] 2 分钟前` + ✕，用的是临时 `XDG_CONFIG_HOME` 造的假记录，不碰用户的配置）、
-  `artifacts/file-dialog.png`（扩展名提示改成从 `Format::extension()` 拼出来）。
+  `本机证据/file-dialog.png`（扩展名提示改成从 `Format::extension()` 拼出来）。
   复核时**抓到一个我自己引入的 bug**：`file_badge` 原先只在 `sync_file_fields` / `apply_dirty` 里算，
   而 `--doc FILE` 这条启动路径两个都不经过 ⇒ 已载入的文件被显示成「尚未保存」。
   修法是把拼装逻辑抽成纯读函数 `file_badge_of(&SharedCore)`，`App::new` 的初值与事件刷新共用同一份。
@@ -2066,7 +2079,7 @@ GUI 只把这份缓存抄出来显示；CLI 多了 `opm-ctl --file F overlaps [-
 - `Change::line()` 是新加的纯访问器：把"这条改动落在哪条线"从 `journal` 里问出来（事务/增删线返回 `None`
   ⇒ 走全量），有单测。
 - 实测：同一份谱面，GUI 的冲突浏览器列的两条与 `opm-ctl … overlaps` 列的两条**完全一致**
-  （`artifacts/conflict-browser.png`）。
+  （`本机证据/conflict-browser.png`）。
 
 ### 三、修掉一个真 flake（上一轮留下的未解之谜）
 
@@ -2310,8 +2323,8 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 
 - `cargo test` **170 条全绿、0 警告**（本轮新增 3 条 overlay：控制杆命中、快速放置动作与吸附、
   跟随/提交/取消 + 键门控；另有自动重复与草稿几何各一条）。
-- **合成器在本轮恢复**，于是这次能真看：`artifacts/pending-hold.png` 与
-  `artifacts/pending-hold-handles.png`（放大）——草稿从 0.0 拍到 4.0 拍，**头（下方，带短竖）与尾（上方）
+- **合成器在本轮恢复**，于是这次能真看：`本机证据/pending-hold.png` 与
+  `本机证据/pending-hold-handles.png`（放大）——草稿从 0.0 拍到 4.0 拍，**头（下方，带短竖）与尾（上方）
   两个控制杆都在**，位置与左侧拍标注对齐。
 - 恢复后顺手复核了第 4~5 轮那三块（状态栏 / 属性编辑器 / 冲突浏览器）在真实窗口里正常。
 
@@ -2335,15 +2348,15 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 
 - `cargo test` **173 条全绿、0 警告**（本轮 +3：事件草稿规则与互斥、事件区起草稿/跟随/左键放下、
   事件放置命令与初值）。
-- 截图（合成器已恢复）：`artifacts/pending-event.png` —— 草稿落在 **moveX 那一列**、2→6 拍，
-  头（下方，带短竖）与尾（上方）两个控制杆齐全；`artifacts/pending-hold.png` 是 hold 版。
+- 截图（合成器已恢复）：`本机证据/pending-event.png` —— 草稿落在 **moveX 那一列**、2→6 拍，
+  头（下方，带短竖）与尾（上方）两个控制杆齐全；`本机证据/pending-hold.png` 是 hold 版。
 - 顺带把 `OPM_EDIT_AUTO` 扩成两式：`hold:<lane>,<start>,<end>` / `event:<track>,<start>,<end>`。
 
 ## 7.43 显卡策略：默认核显，独显只在显式指定时用（Linux 侧，2026-09-28）
 
 用户："**在linux上让显卡调用策略遵循prime-run，不要在没有指定的情况下去调用功耗更高的nvidia显卡。**"
 
-先说现状（实测）：启动日志里 `适配器: NVIDIA GeForce RTX 5070 Laptop GPU [Vulkan/DiscreteGpu]` ——
+先说现状（实测）：启动日志里 `适配器: NVIDIA 独显（笔记本） [Vulkan/DiscreteGpu]` ——
 **什么都没设，程序就在用独显**。根因在 wgpu/egui-wgpu 的默认值：
 `WgpuSetupCreateNew::from_env_or_default()` 里 `power_preference` = `WGPU_POWER_PREF` 解析值，
 **没有就是 `HighPerformance`**。
@@ -2371,11 +2384,11 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 
 | 场景 | 选中的适配器 |
 |---|---|
-| 默认 | **AMD Radeon 610M（RADV，IntegratedGpu）** |
-| `DRI_PRIME=1` | NVIDIA RTX 5070（DiscreteGpu） |
-| `OPM_GPU=discrete` | NVIDIA RTX 5070 |
-| `OPM_GPU=integrated` | AMD Radeon 610M |
-| `prime-run`（系统真脚本） | NVIDIA RTX 5070（日志里还能看到 GL 那条 NVIDIA 适配器被标"不能出图到这个 surface"而被排除） |
+| 默认 | **AMD 核显（RADV，IntegratedGpu）** |
+| `DRI_PRIME=1` | NVIDIA 独显（DiscreteGpu） |
+| `OPM_GPU=discrete` | NVIDIA 独显 |
+| `OPM_GPU=integrated` | AMD 核显 |
+| `prime-run`（系统真脚本） | NVIDIA 独显（日志里还能看到 GL 那条 NVIDIA 适配器被标"不能出图到这个 surface"而被排除） |
 
 候选清单也一并打出来（`适配器候选: [i] 名字 [后端/类型]`），谁都能核对程序为什么挑它。
 **只验证了"用了哪块卡"，没量功耗** —— 功耗差别是常识判断，不是本次实测数据。
@@ -2399,9 +2412,9 @@ hold长度随鼠标移动。按esc取消，按r或回车放置。hold支持事�
 
 | 组合 | 怎么模拟 | 实测结果 |
 |---|---|---|
-| 核显 + 独显（真实） | —— | AMD Radeon 610M（Integrated） |
-| 只有核显 | 只挂 `radeon_icd.json` | AMD 610M ✓ |
-| 只有独显 | 只挂 `nvidia_icd.json` | **NVIDIA RTX 5070** ✓ |
+| 核显 + 独显（真实） | —— | AMD 核显（Integrated） |
+| 只有核显 | 只挂 `radeon_icd.json` | AMD 核显 ✓ |
+| 只有独显 | 只挂 `nvidia_icd.json` | **NVIDIA 独显** ✓ |
 | 只有软件渲染 | `WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1` | llvmpipe（`Gl/Cpu`）✓ |
 | 后端退化（Vulkan 无可用卡） | 只挂 `intel_icd.json`（本机无 Intel 卡） | 退到 GL 的 AMD 适配器并正常出图 ✓ |
 | 完全没后端 | `WGPU_BACKEND=vulkan` + 假 ICD 路径 | eframe：`FailedToCreateSurfaceForAnyBackend`，可读错误退出（不 panic）✓ |
@@ -2427,7 +2440,7 @@ eframe 在更早一步就报错退出了。选择器只在"有适配器可挑"�
 先给它一个可复现的度量工具（沿用项目里"猜不如量"的做法）：`--trace-startup` / `OPM_TRACE_STARTUP=1`
 打点打印每一步的**累计 + 本步**耗时。打点跨了两处（`main` 与首帧初始化），因为这条链路本来就跨两处。
 
-### 实测（本机 AMD 610M 核显 + Vulkan，debug 构建，热启动 5 次取中位）
+### 实测（本机 AMD 核显 + Vulkan，debug 构建，热启动 5 次取中位）
 
 | 阶段 | 中位 | 备注 |
 |---|---|---|
@@ -2579,9 +2592,9 @@ wgpu 枚举适配器时，Vulkan loader 会把 ICD 目录里的**所有**驱动�
 
 | 跑法 | 独显 `runtime_status` | 首帧 | 关键日志 |
 |---|---|---|---|
-| Linux 默认 | `suspended`（**全程没被碰**） | 248 ms | `保留 3 个：radeon/intel_hasvk/intel_icd.json`、`显卡选用: AMD Radeon 610M` |
+| Linux 默认 | `suspended`（**全程没被碰**） | 248 ms | `保留 3 个：radeon/intel_hasvk/intel_icd.json`、`显卡选用: AMD 核显` |
 | `OPM_GPU_PLATFORM=windows` | `suspended` → **`active`** | **4773 ms** | `非 Linux：不改 ICD、不改后端集合、不装适配器选择器`、`图形后端: 全部后端`、`显卡策略: 交给平台默认`、**没有 `显卡选用` 那一行** |
-| + `OPM_GPU=integrated` | `active` | 5584 ms | 上面三行 + `适配器候选 [1] NVIDIA GeForce RTX 5070 Laptop GPU` + `显卡选用: AMD Radeon 610M` |
+| + `OPM_GPU=integrated` | `active` | 5584 ms | 上面三行 + `适配器候选 [1] NVIDIA 独显（笔记本）` + `显卡选用: AMD 核显` |
 
 第二行的证据链是闭合的：枚举里出现 NVIDIA 适配器（ICD 未被过滤）、后端是默认集合、
 日志里**根本没有 `显卡选用`**（我们的选择器没装）；首帧慢 4.5 s 正是"枚举独显 + 初始化 GL"的代价。
@@ -2659,8 +2672,8 @@ Vulkan / D3D12 是运行时动态加载 ⇒ 实际门槛是 **Windows 10+**（ap
 | `opm-app.exe --help` | 同样正常 |
 | `opm-ctl.exe new --out rel2.opm --demo-notes 24` | 造出 9887 字节 `.opm`；**本机 Linux 的 `opm-ctl` 直接读得出来** ⇒ 两边文件格式互通 |
 | `--file rel2.opm validate --json` / `overlaps` | 正常（按契约报 ERROR、退出码正确） |
-| `--file rel2.opm render --at 1.5 --width 480 --height 270 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例，图里音符块与判定线都在（`artifacts/windows-exe-wine-render.png`） |
-| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动 —— 这台机器没有 X11，本来以为测不了），中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态**：`artifacts/windows-exe-wine-ui.png` |
+| `--file rel2.opm render --at 1.5 --width 480 --height 270 --out rel2.png` | **wgpu 无头渲染成功**：480×270 PNG、24 个实例，图里音符块与判定线都在（`本机证据/windows-exe-wine-render.png`） |
+| `opm-app.exe --shot win-ui.png --shot-frame 20 --shot-exit` | **GUI 窗口真的开出来了并自截屏**（Wine 的 Wayland 驱动 —— 这台机器没有 X11，本来以为测不了），中文全部正常，还带着 **Windows 专有的「缺少 7-Zip / 获取 7z…」模态**：`本机证据/windows-exe-wine-ui.png` |
 
 **这最后一行顺带补上了 §7.29 留下的窟窿**：`#[cfg(windows)]` 那几处（`cmd /C start`、`CREATE_NO_WINDOW`、
 `.exe` 候选、"获取 7z…"按钮）以前只是"逻辑上单测过"，现在是**在 Windows 二进制上真的看见了**。
@@ -2901,7 +2914,7 @@ impl NewChartForm { fn asset_mut(field) / set_asset(field, path) }
 - 集成测试（`tests/lifecycle.rs`）：**命令由表单自己产出**（`NewChartForm::to_new_command()`）→
   `save_as(.opm)` → 重新读容器，断言两份资源的**字节一致**、字段被规范成包内名。
   于是"表单字段 → meta 字段 → 容器条目"是一条完整的链，中间改名/写错字段会在这里断掉。
-- 截图：`artifacts/new-chart-form.png`（模态里两行"音乐路径/曲绘路径"，各带"浏览…"）。
+- 截图：`本机证据/new-chart-form.png`（模态里两行"音乐路径/曲绘路径"，各带"浏览…"）。
 
 ### 顺手修掉的测试基础设施坑
 
@@ -2956,7 +2969,7 @@ if ctx.input(|i| i.viewport().close_requested()) && !self.quit_allowed {
 | 场景 | 期望 | 实测 |
 |---|---|---|
 | 有未保存改动 + 关窗（启动页） | 拦下 | 进程**还活着**（`kill -0` 为真）✓ |
-| 有未保存改动 + 关窗（**编辑页**，`OPM_LAUNCH_AUTO=skip`） | 拦下并盖在编辑页上 | 截图 `artifacts/unsaved-guard-on-quit.png`：编辑器变暗，弹窗写着"谱面「demo-50」…**退出**之前要先保存吗？"✓ |
+| 有未保存改动 + 关窗（**编辑页**，`OPM_LAUNCH_AUTO=skip`） | 拦下并盖在编辑页上 | 截图 `本机证据/unsaved-guard-on-quit.png`：编辑器变暗，弹窗写着"谱面「demo-50」…**退出**之前要先保存吗？"✓ |
 | 干净文档 + 关窗 | 直接退 | 自己退出，`exit=0` ✓（走的就是守卫放行后的 `pending_quit` 那条路） |
 | **回归**：`--shot-exit` 在有未保存改动时 | 照旧退出 | `exit=0` ✓（旗子按预期挡掉了自我拦截） |
 
@@ -3125,7 +3138,7 @@ pub fn timeline_duration(&self) -> f64 {
 | 没有音乐 | 谱面自身跨度 | 同左（不变） |
 
 日志里多一行 `时间轴总长 : 60.0s（按乐曲时长；谱面自身 2.0s）`，装没装音乐一眼可见；
-截图 `artifacts/timeline-follows-music.png` 里时间轴刻度铺满整首歌（`拍线 1/1 步长（0.345s），共 174 条`）。
+截图 `本机证据/timeline-follows-music.png` 里时间轴刻度铺满整首歌（`拍线 1/1 步长（0.345s），共 174 条`）。
 
 测试 **213 通过 / 0 失败 / 0 警告**（新增 2 条：总长规则含退化输入、无音频时推进到总长而非谱面末尾）；
 Windows 目标 0 警告。
@@ -3166,7 +3179,7 @@ Windows 目标 0 警告。
 
 ### 实测
 
-- 截图 `artifacts/file-dialog-target-readonly.png`（无目标）与手动核对（有目标）：对话框里
+- 截图 `本机证据/file-dialog-target-readonly.png`（无目标）与手动核对（有目标）：对话框里
   只有只读一行「保存目标」，输入框与「采用此目标」都已消失。
 - 核心那侧的行为没变、也早有测试：`save(None)` 在没有目标时明确拒绝（`未指定保存路径`）——
   GUI 现在**在调用它之前**就把用户送到系统文件选择窗。
@@ -3206,7 +3219,7 @@ ctx.send_viewport_cmd(ViewportCommand::InnerSize(…));   // 换尺寸 ← 去�
 | 启动页（`--width 1000 --height 600`） | 980×620 | **1000×600**（跟着编辑器尺寸走） |
 | `OPM_LAUNCH_AUTO=create:x` 运行中切到编辑页（1000×600） | 1000×600 | **1000×600**（不再动，日志写"窗口尺寸不变"） |
 
-截图 `artifacts/launcher-at-editor-size.png`。
+截图 `本机证据/launcher-at-editor-size.png`。
 
 ### 一个如实的观察（没有顺手改）
 
@@ -3267,7 +3280,7 @@ pub fn edit_area_span(&self, lead_beats: f64) -> (f64, f64)  // [底部, 顶部]
 - `--doc tldemo.opm`（60s 音乐 + 两个音符）→ 日志 `时间轴总长 : 63.4s`（= 60s + 10 拍 @174BPM）✔
 - 控制通道 `{"op":"seek","to":30}` 把播放头挪到 30s 后截图：
   `浅色 = 编辑区窗口（29.3→32.1s）`（30s − 2 拍 → +8 拍 ✔），时间轴上黄线在浅色带左沿、白线在带内偏右
-  —— `artifacts/timeline-window-and-start.png`。
+  —— `本机证据/timeline-window-and-start.png`。
 - **一个如实观察**：`opm-ctl new` 会补五条"铺满全谱"的 `set_track_constant`，它们把**内容末端**撑到
   5120 拍，于是按这条公式总长会是 1710s（≈28 分钟）。公式是你点名要的、事件也确实是内容，
   所以这轮**照公式实现**；要收掉那种占位跨度得单独处理 `set_track_constant` 的默认长度。
@@ -3307,7 +3320,7 @@ let text_w = |s: &str| ctx.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clo
 | 760×480 | ~190 px | `总长 63.4s ｜ 拍线 1/2（2.759s）` + 紧凑图例 `黄线=起点 ｜ 浅色=窗口 0→25`；**右上角那条已让位** ✔ |
 | 620×460 | ~55 px | 只剩 `总长 63.4s`（其余各级都放不下）✔ |
 
-截图 `artifacts/timeline-readouts-narrow.png`（760×480）。
+截图 `本机证据/timeline-readouts-narrow.png`（760×480）。
 
 **踩到的坑（值得记）**：加完守卫后窄窗**仍然**重叠 —— 因为原来那条右上角标签**没删**，
 于是"带守卫的新副本"与"没守卫的旧副本"各画一遍。**改显示逻辑时先 grep 一遍要替换的字符串**
@@ -3370,7 +3383,7 @@ if d.structure || !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_emp
 | 改前 | `总长 20.0s`（音符在 68.966s，落在轴外） |
 | 改后 | **`总长 72.4s`**（= 200 拍 + 10 拍 @174BPM）✔ |
 
-截图：`artifacts/timeline-stale-length-bug.png`（改前）与 `artifacts/timeline-grows-with-notes.png`（改后）。
+截图：`本机证据/timeline-stale-length-bug.png`（改前）与 `本机证据/timeline-grows-with-notes.png`（改后）。
 
 ### 单测钉住的那条不变量
 
@@ -3399,7 +3412,7 @@ if d.structure || !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_emp
 黄线/浅色带、读数省略……全都在其后）**早了三个小时**。如果是在 Wine / Windows 上测，看到的正是
 "原来的时间轴机制"。⇒ 本轮把 Windows 两份**重建**（13:25 / 13:26），并从 **exe 自己**截图核对：
 读数已经是 `总长 20.0s ｜ 拍线 1/1（0.345s）` + `黄线 = 编辑区起点 ｜ 浅色 = 编辑区窗口（0.0→2.1s）｜ 白线 = 播放头`
-（`artifacts/windows-exe-timeline-current.png`）。
+（`本机证据/windows-exe-timeline-current.png`）。
 **教训**：跨目标构建的产物**不会**跟着 `cargo build`（Linux）一起更新 —— 报"改了没效果"之前，
 先对时间戳与关键字符串（`grep -a '黄线 = 编辑区起点' <binary>`）。
 
@@ -3428,7 +3441,7 @@ if let Some(t) = out.seek { self.state.seek(t); }
 
 ## 7.60 "时间轴状态无改变"：把公式的输入显示出来 + 一行可复现的诊断（2026-09-28）
 
-用户："**在 /var/www/OpenPhM/app 使用 `cargo run --release --bin opm-app` 启动，但时间轴状态无改变**"
+用户："**在 仓库里的 app/ 使用 `cargo run --release --bin opm-app` 启动，但时间轴状态无改变**"
 
 ### 先用**用户自己的启动方式**复现
 
@@ -3468,7 +3481,7 @@ cargo run --release --bin opm-app -- --control auto --idle-fps 60 --shot … --s
 `clicking_the_timeline_requests_a_seek`：重写把 `allocate_rect`（命中注册）从"块首"挪到了 `draw()` 末尾，
 这是最容易碰坏又最难手动发现的地方 —— 无头喂一次合成点击，断言请求的 seek ≈ 总长一半。
 
-截图：`artifacts/timeline-inputs-in-readout.png`（1600×900，能看到两个输入都在读数里）。
+截图：`本机证据/timeline-inputs-in-readout.png`（1600×900，能看到两个输入都在读数里）。
 
 测试 **221 通过 / 0 失败 / 0 警告**（新增 2 条）；Windows 目标 0 警告（debug 13:35 / release 13:36）。
 
@@ -3479,7 +3492,7 @@ cargo run --release --bin opm-app -- --control auto --idle-fps 60 --shot … --s
 
 ### 根因不是解码，是"没人把包摊开"
 
-用户那份 `/home/DemonPlayer/Desktop/朝色の紙飛行機.opm` 里装着 41 MB 的 FLAC，`meta.audio` 写的是
+用户那份 `~/Desktop/朝色の紙飛行機.opm` 里装着 41 MB 的 FLAC，`meta.audio` 写的是
 **裸文件名**，而"按路径装载音频"是既有链路（`--audio-probe` 单独跑那份 FLAC 一切正常：
 `FLAC / 44100 Hz / 2 ch / 282.26 s`）。缺的一环是：容器里的资源**从来没被摊到磁盘上** ——
 `container::extract_assets` 写了却**没有任何调用点**，于是解析到的是"谱面旁边那个同名文件"。
@@ -3565,11 +3578,11 @@ core.load_staged(staged)?;                  // ② 正式加载编辑：唯一�
 
 | 场景 | 证据 |
 |---|---|
-| 强杀后重启 | `artifacts/crash-resume-dialog.png`：标题、谱面名、大小、年龄、原始文件、缓存目录、"有未保存改动（快照于 2 分钟前）"、三个按钮 |
-| 没编辑过就被强杀 | `artifacts/crash-resume-clean.png`：同一处改说「缓存里就是打开容器时摊出来的那份内容，没有未保存的改动」（说反了会让人不敢丢弃） |
-| 选「继续」 | `artifacts/crash-resume-continued.png`：进编辑页，状态栏 `[opm] pack.opm` + `● 有未保存改动`，退出后 `解压缓存已清理` |
-| 选「丢弃」 | `artifacts/crash-resume-discarded.png`：`/tmp/opm` 只剩 `.session.lock` |
-| 第二个实例 | `artifacts/session-busy.png`：`已经有一个 OpenPhM 在运行` + 进程 167893 + 启动时间；第一个实例的缓存 md5 未变、进程仍活 |
+| 强杀后重启 | `本机证据/crash-resume-dialog.png`：标题、谱面名、大小、年龄、原始文件、缓存目录、"有未保存改动（快照于 2 分钟前）"、三个按钮 |
+| 没编辑过就被强杀 | `本机证据/crash-resume-clean.png`：同一处改说「缓存里就是打开容器时摊出来的那份内容，没有未保存的改动」（说反了会让人不敢丢弃） |
+| 选「继续」 | `本机证据/crash-resume-continued.png`：进编辑页，状态栏 `[opm] pack.opm` + `● 有未保存改动`，退出后 `解压缓存已清理` |
+| 选「丢弃」 | `本机证据/crash-resume-discarded.png`：`/tmp/opm` 只剩 `.session.lock` |
+| 第二个实例 | `本机证据/session-busy.png`：`已经有一个 OpenPhM 在运行` + 进程 167893 + 启动时间；第一个实例的缓存 md5 未变、进程仍活 |
 
 ### 顺手修掉的两处**测试环境**竞态（不是产品缺陷，但会让 `cargo test` 偶发变红）
 
@@ -3692,10 +3705,10 @@ y_local = (H(t_音符) − H(t_此刻)) × 音符自身 speed        H(t) = 120 
 
 | 场景 | 证据 |
 |---|---|
-| 多选音符 | `artifacts/multi-select-notes.png`：三处白框 + 标题下一行「已选 3 个音符 · Del 删除 · 拖动整体平移（四向箭头）」，检查器显示锚 |
-| 多选事件 | `artifacts/multi-select-events.png`：「已选 2 条事件 · …（有空档才跨得过去）」 |
-| Del | `artifacts/multi-select-deleted.png`：音符 8→5、底栏「已删除 3 个音符（Ctrl+Z 可撤销）」 |
-| Del 后 `Ctrl+Z` | `artifacts/multi-select-undone.png`：音符回到 8；`[core] update #5 Local undo: 删除选中(3 条)` |
+| 多选音符 | `本机证据/multi-select-notes.png`：三处白框 + 标题下一行「已选 3 个音符 · Del 删除 · 拖动整体平移（四向箭头）」，检查器显示锚 |
+| 多选事件 | `本机证据/multi-select-events.png`：「已选 2 条事件 · …（有空档才跨得过去）」 |
+| Del | `本机证据/multi-select-deleted.png`：音符 8→5、底栏「已删除 3 个音符（Ctrl+Z 可撤销）」 |
+| Del 后 `Ctrl+Z` | `本机证据/multi-select-undone.png`：音符回到 8；`[core] update #5 Local undo: 删除选中(3 条)` |
 
 按键走 `OPM_KEY_AUTO=[帧:]按键[,…]`（`;` 分隔多组）注入 —— Wayland 下没人能往窗口注入按键，
 这是唯一能"真的按一遍"的办法。**踩过的坑**：修饰键不能靠往 `InputState.events` 里塞
@@ -3744,7 +3757,7 @@ Ctrl 切换、组拖动（`GrabStart`/`GrabMove`/`GrabEnd`）、重叠禁用（�
    同理裁剪判据从"最高的一端"改成"**最低的一端**"：尾巴远在窗口之上的长条不能被整条裁掉。
 
 三张证据都是 `--overlay off` + 控制通道 `seek` 到精确时刻拍的（停在那一帧上不会被编辑区挡住）：
-`artifacts/hit-effect.png`、`artifacts/hold-pulse.png`、`artifacts/note-vanishes-at-line.png`。
+`本机证据/hit-effect.png`、`本机证据/hold-pulse.png`、`本机证据/note-vanishes-at-line.png`。
 要按帧抓"刚击中那一瞬间"**不能**靠 `--autoplay --shot-frame N`：播放起点取决于启动动画何时结束，
 实测 70 帧只走到 0.6 s（应当 3.5 s）—— 准时刻要用 `seek`。
 
@@ -3793,7 +3806,7 @@ Ctrl 切换、组拖动（`GrabStart`/`GrabMove`/`GrabEnd`）、重叠禁用（�
 - 界面（`inspector.rs`）：两个 ComboBox —— 曲线（中文名 + 英文段，如"回拉 back"）与变体
   （显示 `in`/`out`/`io`，即用户口径；名字里拼的仍是 RPE 的 `inOut`）。**线性那一格把变体下拉置灰**
   而不是藏起来（布局不跳），"认不出的缓动"原样显示并说明，绝不拿猜测的名字改用户的文件。
-- 证据：`artifacts/easing-two-part.png`（`inOutBack` ⇒ 「回拉 back」+「io」；`linear` ⇒ 「线性」+
+- 证据：`本机证据/easing-two-part.png`（`inOutBack` ⇒ 「回拉 back」+「io」；`linear` ⇒ 「线性」+
   置灰的「out」）。
 
 测试 **275 通过 / 0 失败 / 0 警告**。
@@ -3837,7 +3850,7 @@ RPE 规范「流速为负时音符向上飞」。流速积分、命中时刻、�
 音符自身的 `speed` 也**带符号**（负值翻方向）；`speed = 0` 一律不渲染（RPE：速度 0 ⇒ 长度 0 ⇒ 不渲染），
 属性编辑器里音符 speed 的范围放成 `-20..=20`。裁剪判据也改成上下**两个方向**都看。
 
-证据：`artifacts/judge-line-3000.png`、`negative-speed-no-note.png`、`negative-speed-hit-flash.png`、
+证据：`本机证据/judge-line-3000.png`、`negative-speed-no-note.png`、`negative-speed-hit-flash.png`、
 `slow-speed-note-enters.png`（流速 1、播放头 0：3.5 秒那颗音符正确贴在窗口上沿 —— 修窗口之前不显示）。
 
 测试 **278 通过 / 0 失败 / 0 警告**。
@@ -3878,7 +3891,7 @@ RPE 规范「流速为负时音符向上飞」。流速积分、命中时刻、�
 负流速下音符从下方升起来（0.3 秒前 −360、0.1 秒前 −120，测试逐点对账），
 命中瞬间闪光、本体停在线上收缩消失 —— 与正流速**同一套**可见性判据，只是所在的那一侧不同。
 
-证据：`artifacts/note-visible-with-offset-line.png`（`moveY = -300`，音符一直画到窗口上沿）。
+证据：`本机证据/note-visible-with-offset-line.png`（`moveY = -300`，音符一直画到窗口上沿）。
 
 测试 **279 通过 / 0 失败 / 0 警告**。
 
@@ -3916,7 +3929,7 @@ RPE 规范「流速为负时音符向上飞」。流速积分、命中时刻、�
 - `a_held_hold_body_never_vanishes_mid_way`：3 流速 × 2 音符 speed × 3 时长逐帧扫"按住期间身子在不在"。
   摘掉修复时它报"长 1 拍：尾巴过去了身子还在"。
 
-证据：`artifacts/hold-tail-at-second-pulse.png`（3 拍那一帧：身子 + 效果同时在场，尾巴在 180 而非 360）、
+证据：`本机证据/hold-tail-at-second-pulse.png`（3 拍那一帧：身子 + 效果同时在场，尾巴在 180 而非 360）、
 `hold-tail-near-end.png`（尾巴降到 60）。
 
 测试 **281 通过 / 0 失败 / 0 警告**。
@@ -3959,7 +3972,7 @@ hold 的身子额外要求"整段不完全在判定线之下"（`body_a.max(tail
 
 修完：四种形状 × 6720 个采样点，两侧 0 违例。
 
-证据：`artifacts/zero-crossing-before-hit.png`（击中原画里只有判定线）、`zero-crossing-hit-flash.png`（到线闪光）、
+证据：`本机证据/zero-crossing-before-hit.png`（击中原画里只有判定线）、`zero-crossing-hit-flash.png`（到线闪光）、
 `negative-speed-hit-flash.png`、`slow-speed-note-enters.png`。测试 **282 通过 / 0 失败 / 0 警告**。
 
 **教训**：规则要**一条一条分开写**。"在哪画 / 画不画 / 算不算得过来"是三件事，
@@ -4010,7 +4023,7 @@ hold 的身子额外要求"整段不完全在判定线之下"（`body_a.max(tail
   当基准，而它和渲染侧的旧实现**共用同一个走法**，于是"一起错、对得上"，测试照过。
   改成手算之后立刻见红（0.5/空隙/10 的谱面：应 217.5，旧代码给 75）。
   修法：空隙段走完不动 `idx`，并给步长加 `.max(at_beat)` 保证走法单调向前。
-  证据：`artifacts/gap-note-after-gap.png` vs `gap-note-before-fix.png`（同一帧的两个版本）。
+  证据：`本机证据/gap-note-after-gap.png` vs `gap-note-before-fix.png`（同一帧的两个版本）。
   另注：**（文件层）空隙本来就是"不合规但容得下"的输入** —— 校验器报 ERROR，
   而编辑器会话里拖一下事件就能拖出一个空隙，所以这条路必须走对。
 
@@ -4029,7 +4042,7 @@ hold 的身子额外要求"整段不完全在判定线之下"（`body_a.max(tail
 - `a_speed_edit_is_correct_before_and_after_the_async_rebuild`：走 GUI 那条路（`tracks_of` → `set_tracks`），
   ① 改完立刻与"从头加载改过的谱面"逐实例相同；② 确实标脏了一部分（否则等于没测异步）；③ 补完仍然相同；
 - `pump_floors` 的预算与优先级：一帧不许超过预算、先补播放头之后那一半、补完进度归零；
-- GUI 取证：`artifacts/floor-rebuild-progress.png`（20 万音符、改一笔流速后的**第 31 帧**：底栏
+- GUI 取证：`本机证据/floor-rebuild-progress.png`（20 万音符、改一笔流速后的**第 31 帧**：底栏
   `⟳ 音符位置重算 40960/200000` = 10 帧 × 4096 的预算）与 `floor-rebuild-done.png`（补完之后那行字消失）。
 
 ### 边界（这条纪律写在 README 里，也写在这里）
@@ -4047,7 +4060,7 @@ hold 的身子额外要求"整段不完全在判定线之下"（`body_a.max(tail
 是不是指错了事件、`split_easing`/`easing_name` 的往返是不是有问题），都对。
 于是用控制通道把**每一步都截图**：`select speed#1` → `set_event {endValue:-30}` → 看面板。
 
-**一张图定案**（`artifacts/inspector-stale-before-fix.png`）：左边事件列表已经写着
+**一张图定案**（`本机证据/inspector-stale-before-fix.png`）：左边事件列表已经写着
 `1  2.00s -10.0→-30.0  outQuad`，右边检查器还写着 `值止 -10.0`、只读段还写着 `-10.0 → -10.0`。
 ⇒ 命令**改了文档**、视图也更新了，**只有检查器停在改之前那份快照上**。
 
@@ -4140,7 +4153,7 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
   （播放头 0.2s ⇒ 画在 +360；0.4s ⇒ +120；0.6s 起在线下 ⇒ 按规则②不画）。
 - 探针版（临时）：三张谱面 × 241 个播放头逐帧对账 —— **该画而没画 0 颗**（改前 12~24 颗），
   画出来的位置与稠密积分最大差 0.03/0.03/9.84。
-- 证据：`artifacts/sign-change-note-in-window.png` ↔ `sign-change-note-missing-before-fix.png`
+- 证据：`本机证据/sign-change-note-in-window.png` ↔ `sign-change-note-missing-before-fix.png`
   （同一份谱面、同一个播放头：旧版只剩判定线）。
 - 教训：**"拿时间算可见性"在这套模型里是个反复复发的错误**。位置是 `H` 的差，
   而 `H` 不单调 —— 凡是"从时间推位置"的判据都要重新审一遍。
@@ -4208,7 +4221,7 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
 
 （"现算"那一列少了 8 点抽样那一层；查询命中时仍是 4 ns —— 查表本来就只查一次。）
 
-- 证据：`artifacts/speed-easing-linear-only.png`；RPE 导入报告实测输出
+- 证据：`本机证据/speed-easing-linear-only.png`；RPE 导入报告实测输出
   「⚠ 流速事件的缓动：共 1 处（首次于 …speedEvents[0]）—— opm 的流速事件只按 linear 求值…」。
 
 ## 7.74 事件重叠：运行时的预览必须等于"重新加载之后"（用户报"安放第二个变速事件要重载才行"）（2026-09-28）
@@ -4257,7 +4270,7 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
   且与"从头加载改过的谱面"逐位一致；
 - `core::tests::normalize_command_keeps_the_later_events_start`：
   命令之后后一条仍在第 4 拍起、前一条被裁到 4 拍、无空隙无重叠；
-- 证据：`artifacts/speed-event-placed-ignored-before-fix.png` ↔ `speed-event-placed-runtime.png`。
+- 证据：`本机证据/speed-event-placed-ignored-before-fix.png` ↔ `speed-event-placed-runtime.png`。
 
 ### 教训
 
@@ -4295,7 +4308,7 @@ TopicKind::Track => { d.tracks.push(l); d.render = true; }   // ← 少了 d.ins
 - `perf::the_sampled_curve_holds_values_across_gaps`（从拍 0 画到谱尾、空位是水平段、空位里不出现 0）、
 - `state::tests::a_leading_gap_uses_the_first_blocks_value_not_a_global_default`
   （`Line::perf` 在块前取块的起始值；**空轨道**才用 10 / 1）、
-- 证据：`artifacts/timeline-curve-broken-before-fix.png` ↔ `timeline-holds-value-across-gaps.png`。
+- 证据：`本机证据/timeline-curve-broken-before-fix.png` ↔ `timeline-holds-value-across-gaps.png`。
 
 ### 教训
 
