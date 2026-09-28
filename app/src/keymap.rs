@@ -244,6 +244,167 @@ pub fn quick_place_kind(key: egui::Key) -> Option<crate::doc::NoteKind> {
     }
 }
 
+/// 一次性**编辑动作**（按一下做一件确定的事；与空格那种"按住/状态机"分开）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditAction {
+    Undo,
+    Redo,
+}
+
+impl EditAction {
+    /// 命令名（`{"op": …}`）与给人看的动词都从这里来，免得三处各写一份字符串
+    pub fn op(self) -> &'static str {
+        match self {
+            EditAction::Undo => "undo",
+            EditAction::Redo => "redo",
+        }
+    }
+    /// 命令回话里那个"做了什么"的字段名（`undone` / `redone`）
+    pub fn result_key(self) -> &'static str {
+        match self {
+            EditAction::Undo => "undone",
+            EditAction::Redo => "redone",
+        }
+    }
+    pub fn verb(self) -> &'static str {
+        match self {
+            EditAction::Undo => "撤销",
+            EditAction::Redo => "重做",
+        }
+    }
+}
+
+/// **编辑快捷键表**：`Ctrl+Z` = 撤销、`Ctrl+Shift+Z` = 重做。
+///
+/// `command` 就是 egui 说的"平台主修饰键"（Linux/Windows 是 Ctrl，macOS 是 Cmd）——
+/// 于是同一个绑定在两端都符合各自的习惯。**没有主修饰键就不算数**（裸 `Z` 是给未来的
+/// "Z 轴"之类留的，不当撤销用）；别的修饰键（Alt/Super）也不参与，免得和窗口管理器抢。
+///
+/// 只做"键 + 修饰键 → 动作"：**能不能用**（正在文本框里打字、模态开着）由调用方用
+/// [`shortcut_allowed`] 算好 —— 与 [`quick_place_kind`] 同一条纪律，三件事各自可测。
+pub fn edit_shortcut(key: egui::Key, command: bool, shift: bool) -> Option<EditAction> {
+    if !command {
+        return None;
+    }
+    match (key, shift) {
+        (egui::Key::Z, false) => Some(EditAction::Undo),
+        (egui::Key::Z, true) => Some(EditAction::Redo),
+        _ => None,
+    }
+}
+
+/// 从**这一帧的输入**里取出一次性编辑动作（`ctx.input(keymap::edit_action_from_input)`）。
+///
+/// 为什么要这一层：按键的原始形态是 egui 的 `InputState`（按键 + 平台修饰键），而"哪个组合算什么"
+/// 是需求本身 —— 收进库里，就能用无头 egui 喂**合成按键**来验（`bin` 里的接线只是"取到动作就执行"，
+/// 那段没有逻辑可测，也不该有）。
+pub fn edit_action_from_input(i: &egui::InputState) -> Option<EditAction> {
+    [egui::Key::Z]
+        .into_iter()
+        .find(|k| i.key_pressed(*k))
+        .and_then(|k| edit_shortcut(k, i.modifiers.command, i.modifiers.shift))
+}
+
+#[cfg(test)]
+mod edit_shortcut_tests {
+    use super::*;
+
+    /// 这张表就是需求本身：`Ctrl+Z` 撤销、`Ctrl+Shift+Z` 重做
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_shift_z_redoes() {
+        assert_eq!(edit_shortcut(egui::Key::Z, true, false), Some(EditAction::Undo));
+        assert_eq!(edit_shortcut(egui::Key::Z, true, true), Some(EditAction::Redo));
+        assert_eq!(EditAction::Undo.op(), "undo");
+        assert_eq!(EditAction::Redo.op(), "redo");
+        assert_eq!(EditAction::Undo.verb(), "撤销");
+        assert_eq!(EditAction::Redo.verb(), "重做");
+        assert_ne!(EditAction::Undo.result_key(), EditAction::Redo.result_key());
+    }
+
+    /// 边界：没有主修饰键**不算**（裸 Z 不是撤销）；别的键也不算
+    #[test]
+    fn without_control_or_on_other_keys_nothing_happens() {
+        assert_eq!(edit_shortcut(egui::Key::Z, false, false), None);
+        assert_eq!(edit_shortcut(egui::Key::Z, false, true), None, "Shift+Z 不是撤销");
+        for k in [egui::Key::Y, egui::Key::X, egui::Key::A, egui::Key::S, egui::Key::Space] {
+            assert_eq!(edit_shortcut(k, true, false), None, "{k:?}");
+        }
+    }
+
+    /// **无头喂真实按键事件**：`Ctrl+Z` / `Ctrl+Shift+Z` 真的能被这一层认出来
+    /// （不是只测那张纯表 —— 这里连 egui 的修饰键状态一起验了）。
+    #[test]
+    fn headless_key_events_drive_undo_and_redo() {
+        /// 按键 → 动作：**在帧内读输入**（与真实调用点一样，`ctx.input` 在 `ui()` 里读），
+        /// 而且先空跑一帧 —— 第一帧还没有输入状态（本项目的既有教训："frame 0 指针、frame 1 按键"）。
+        fn action(key: egui::Key, modifiers: egui::Modifiers) -> Option<EditAction> {
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+            out.textures_delta.clear();
+            // **必须先来一条 `ModifiersChanged`**：egui 只从那个事件更新修饰键状态，
+            // `Event::Key` 自带的 `modifiers` 不参与（winit 也是先发修饰键变化、再发按键）。
+            // 少这一条，`i.modifiers.command` 就是 false —— 合成输入最容易踩这里。
+            let raw = egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut found = None;
+            let mut out = ctx.run_ui(raw, |ui| {
+                found = ui.input(edit_action_from_input);
+            });
+            out.textures_delta.clear();
+            found
+        }
+
+        let ctrl = egui::Modifiers::COMMAND;
+        let ctrl_shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        assert_eq!(action(egui::Key::Z, ctrl), Some(EditAction::Undo));
+        assert_eq!(action(egui::Key::Z, ctrl_shift), Some(EditAction::Redo));
+        // 没有主修饰键、或是别的键：什么都不做
+        assert_eq!(action(egui::Key::Z, egui::Modifiers::NONE), None);
+        assert_eq!(action(egui::Key::Z, egui::Modifiers::SHIFT), None);
+        assert_eq!(action(egui::Key::Y, ctrl), None);
+
+        // 松开的那个事件不该触发（只有 `pressed` 算）
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        out.textures_delta.clear();
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            ..Default::default()
+        };
+        let mut released = None;
+        let mut out = ctx.run_ui(raw, |ui| {
+            released = ui.input(edit_action_from_input);
+        });
+        out.textures_delta.clear();
+        assert_eq!(released, None, "松开不算按下");
+    }
+
+    /// 打字或模态期间**一律不吃**快捷键（与空格、Ctrl+S 同一条纪律）
+    #[test]
+    fn shortcuts_are_gated_by_typing_and_modals() {
+        assert!(shortcut_allowed(false, false));
+        assert!(!shortcut_allowed(true, false), "在文本框里打字时 Ctrl+Z 归文本框");
+        assert!(!shortcut_allowed(false, true), "模态开着时不吃快捷键");
+    }
+}
+
 #[cfg(test)]
 mod quick_place_tests {
     use super::*;

@@ -3021,3 +3021,51 @@ if ctx.input(|i| i.viewport().close_requested()) && !self.quit_allowed {
   界面上"尚未保存"由"**没有保存目标**"表达（`statusbar::file_mark`），不依赖这个标记。
 
 测试 **207 通过 / 0 失败 / 0 警告**（新增 3 条：范式契约、`abort` 的计数、`rollback_since`）；Windows 目标 0 警告。
+
+## 7.52 撤销/重做接入键盘：`Ctrl+Z` / `Ctrl+Shift+Z`（2026-09-28）
+
+用户："**添加撤销/重做功能，快捷键分别为ctrl+z和ctrl+shift+z**"
+
+### 先说清现状：功能在，**键盘不在**
+
+撤销/重做在核心与日志层早就齐了（`journal` 记逆操作、`EditCore::undo/redo`、控制通道 `{"op":"undo"}`），
+但 GUI 里**一个键都没绑、也没有按钮** —— 只有控制通道能触发。所以这件事是"**接线 + 一张可测的键位表**"，
+不是重写功能。
+
+### 键位表进库里（于是"哪个组合算什么"有单测）
+
+```rust
+// keymap.rs
+pub enum EditAction { Undo, Redo }          // 顺带把 op / 回话字段名 / 中文动词收在一处
+pub fn edit_shortcut(key, command, shift) -> Option<EditAction>   // Ctrl+Z / Ctrl+Shift+Z
+pub fn edit_action_from_input(i: &egui::InputState) -> Option<EditAction>  // 这一帧的输入 → 动作
+```
+
+`bin` 里只剩"取到动作就执行"（没有可测的逻辑，也不该有）：
+```rust
+if keymap::shortcut_allowed(typing, modal_open) {
+    if let Some(a) = ctx.input(keymap::edit_action_from_input) { self.apply_edit_action(a); }
+}
+```
+三条纪律沿用现成的：**没有主修饰键不算**（裸 `Z` 不当撤销）、**打字时不吃**（文本框的 Ctrl+Z 归文本框）、
+**模态开着不吃**。执行走**命令路径**（`exec({"op":"undo"})`，与顶栏/控制通道同一条）——
+界面不发明第二套编辑入口；栈空时**明说**"没有可撤销的了"，而不是静默吞掉这次按键。
+
+顺带在「文件」对话框里写一行 `编辑：Ctrl+Z 撤销 / Ctrl+Shift+Z 重做` —— 快捷键不该只活在源码里。
+
+### 验证（含一个合成输入的坑）
+
+- **无头喂真实按键**（`Context::run_ui` + 合成的 `Event::Key`）：
+  `Ctrl+Z` → Undo、`Ctrl+Shift+Z` → Redo、裸 `Z` / `Shift+Z` / `Ctrl+Y` → 什么都不做、**松开不算按下**。
+  **坑**：合成输入必须**先发一条 `Event::ModifiersChanged`** —— egui 只从那个事件更新修饰键状态，
+  `Event::Key` 自带的 `modifiers` 不参与（winit 也是先发修饰键变化再发按键）。
+  少了它，`i.modifiers.command` 恒为 false，测试会以"按键没反应"的样子失败。另外要**先空跑一帧**
+  （第一帧还没有输入状态），并**在帧内读**输入（与真实调用点一致）。
+- **活着的 GUI 进程**（控制通道，验的正是键处理调用的那条命令）：
+  `set_meta` → 撤销（回话 `undone:"set_meta"`、undoDepth 1→0、redoDepth 0→1、字段真的退回去）→
+  重做（`redone:"set_meta"`、字段又回来），全程 GUI 存活。
+- **没验到**：真的往窗口发一次 `Ctrl+Z` 按键（本会话没有可用的注入工具：`wtype`/`ydotool` 都没装，
+  只有 `xdotool` 而桌面是纯 Wayland）。所以"键位表 → 动作"与"动作 → 文档变化"两段分别验过，
+  中间那段 egui 事件管线由上面那条合成输入测试覆盖。
+
+测试 **211 通过 / 0 失败 / 0 警告**（新增 4 条键位测试）；Windows 目标 0 警告。

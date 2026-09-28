@@ -452,14 +452,14 @@ KDE 会把它当目录并报"目录不存在"，于是"新文件还没有对应�
 
 | 入口 | 说明 |
 |---|---|
-| 快捷键 | `Ctrl+S` 保存（**没有保存目标时弹保存窗口**；有则写回，RPE 进 RPE 出）、`Ctrl+Shift+S` 系统另存为、`Ctrl+O` 系统打开 |
+| 快捷键 | `Ctrl+S` 保存（**没有保存目标时弹保存窗口**；有则写回，RPE 进 RPE 出）、`Ctrl+Shift+S` 系统另存为、`Ctrl+O` 系统打开、**`Ctrl+Z` 撤销 / `Ctrl+Shift+Z` 重做**（键位表在 `keymap::edit_shortcut`，有单测；在文本框里打字或模态打开时不吃这些键） |
 | 命令行 | `opm-app --dialog file\|new\|guard`：启动就把对应对话框摊开（截图/人工检查用，不参与正常流程；`new` = 启动页上的新建模态） |
 | CLI | `opm-ctl --file <opm 容器 / 裸 opm / RPE> …`（validate/summary/dump/render/lines 三种都吃） |
-| 转换 | `opm-ctl convert IN [--to opm\|opm-bare\|rpe] [--out FILE] [--rpe-version N]` |
+| 转换 | `opm-ctl convert IN [--to opm\|opm-dir\|rpe\|rpe-dir] [--out PATH] [--rpe-version N]` |
 | 控制通道 | `{"op":"load","path":…}`、`{"op":"save"}`、`{"op":"save","path":…,"format":"auto\|opm\|rpe"}` |
 
 **格式守恒**：RPE 进就 RPE 出。打开一个 RPE 谱面然后 `Ctrl+S`，写回去的还是 RPE ——
-不会悄悄变成 opm。另存为按扩展名判：`*.opm.json` → opm，其余 `*.json` → RPE（生态习惯）。
+不会悄悄变成 opm。另存为按扩展名/目标名判：`.opm` → opm 包、`.pez` → RPE 包、目录 → 对应文件夹；**新建单文件 `.json` 会被拒绝**（保存形态只有那四种），但**已存在的**单文件依旧按原形态写回。
 
 **保真度报告**：每次导入/导出都产出（CLI 打印、GUI 进控制台、`ui_stats` 里也有）。
 报告分两栏：**做了什么转换**（信息）与**哪里降级了**（要人看）。同类问题会合并计数 ——

@@ -1430,6 +1430,30 @@ impl App {
         self.save_doc();
     }
 
+    /// 执行一次编辑动作（撤销/重做）。
+    ///
+    /// **走命令路径**（`{"op":"undo"}`），不直接调 `EditCore::undo()`：那样才有统一的结构化回话、
+    /// 才会进核心日志，而且与控制通道、CLI 走的是同一条 —— 界面不发明第二套编辑入口。
+    /// 界面只做三件事：按键 → 发命令 → 把结果说清楚（没事可撤时**明说**，不静默吞掉这一次按键）。
+    fn apply_edit_action(&mut self, action: keymap::EditAction) {
+        let resp = {
+            let mut c = self.core.lock().unwrap();
+            c.exec(&serde_json::json!({"op": action.op()}))
+        };
+        let ok = resp.get("ok").and_then(|v| v.as_bool()) == Some(true);
+        if !ok {
+            let e = resp.get("error").and_then(|v| v.as_str()).unwrap_or("?");
+            self.file_message = Some((false, format!("{}失败：{e}", action.verb())));
+            return;
+        }
+        let r = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        match r.get(action.result_key()).and_then(|v| v.as_str()) {
+            Some(label) => self.console_log.push((true, format!("{}：{label}", action.verb()))),
+            // 栈空了：说一句，别让人以为按键没生效（"再按一次也没反应"最容易让人怀疑程序坏了）
+            None => self.file_message = Some((true, format!("没有可{}的了", action.verb()))),
+        }
+    }
+
     /// 把当前文件记进"最近打开"（起始界面左半边的内容）
     fn remember_recent(&mut self) {
         let (path, title, fmt) = {
@@ -2713,6 +2737,16 @@ impl eframe::App for App {
         if !typing && cmd_o {
             self.open_via_system(); // Ctrl+O = 系统"打开"
         }
+        // 撤销/重做：`Ctrl+Z` / `Ctrl+Shift+Z`（键位表在 `keymap::edit_shortcut`，有单测）。
+        // 与 Ctrl+S 同一条纪律：**在文本框里打字时不吃**（那时的 Ctrl+Z 归文本框自己）。
+        if keymap::shortcut_allowed(typing, modal_open) {
+            // "按键 + 修饰键 → 动作"整条链在库里（`keymap::edit_action_from_input`），
+            // 这里只剩"取到就执行" —— bin 里没有可测的逻辑，也不该有
+            let hit = ctx.input(keymap::edit_action_from_input);
+            if let Some(action) = hit {
+                self.apply_edit_action(action);
+            }
+        }
         // 按住 H：临时藏掉编辑区（放开即恢复）。同样不能在控制台打字时误触发。
         self.h_held = !typing && !modal_open && ctx.input(|i| i.key_down(egui::Key::H));
         // 可见性规则抽成纯函数（有单测）：**自动播放中或按住 H 时隐藏**
@@ -3132,6 +3166,9 @@ impl eframe::App for App {
                     {
                         pending = Some(FileAction::Reveal);
                     }
+                    // 撤销/重做**只有快捷键**（用户点名的就是这两个组合）：把键位写在这儿，
+                    // 否则没人会知道它存在 —— 快捷键不该只活在源码里
+                    opm_app::dialog::hint(ui, "编辑：Ctrl+Z 撤销 / Ctrl+Shift+Z 重做");
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
