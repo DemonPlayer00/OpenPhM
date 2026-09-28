@@ -277,7 +277,7 @@ pub fn draw(
             let span = (mx - mn).max(1e-6);
             let top = rect.min.y + rect.height() * 0.08;
             let h = rect.height() * 0.62;
-            let pts: Vec<egui::Pos2> = track
+            let mut pts: Vec<egui::Pos2> = track
                 .curve
                 .iter()
                 .map(|q| {
@@ -285,6 +285,17 @@ pub fn draw(
                     egui::pos2(geom.x_of(q[0] as f64), y)
                 })
                 .collect();
+            // 采样只到"谱面末尾"（`sample_track` 把事件块前后的空位也按"保持相邻那块的值"补上了）；
+            // 时间轴可能比谱面长（有音乐时按音乐长度）⇒ 两端补齐到画面边缘，**值不变** ——
+            // 否则事件块之后那段看上去像"回到了默认值"（用户报的正是这个）。
+            if let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) {
+                if first.x > rect.left() + 0.5 {
+                    pts.insert(0, egui::pos2(rect.left(), first.y));
+                }
+                if last.x < rect.right() - 0.5 {
+                    pts.push(egui::pos2(rect.right(), last.y));
+                }
+            }
             p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, rgb(CURVE))));
         }
         for (i, n) in line.notes.iter().enumerate() {

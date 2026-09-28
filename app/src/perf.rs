@@ -330,13 +330,23 @@ pub fn speed_value(e: &Event, beat: f64) -> f64 {
 /// 流速轨（`"speed"`）走 [`speed_value`]（只线性），其余四条走 [`eval_events`]（事件自己的缓动）。
 /// 单独一个入口是为了不漏：树面板/检查器/时间轴/`lines` 各显示一个"此刻的值"，
 /// 谁要是直接调 `eval_events`，同一时刻就会显示两个不同的流速。
+///
+/// **返回值里的"空位"口径**（用户要求：事件块前后有空位时保持相邻那块的值）：
+/// · 事件块**之后**：保持末事件的**终值**（`active_event` 取到末条，取值夹在它自己的终点上）；
+/// · 事件块**之前**：取首事件的**起始值**（`unwrap_or(0)` 那一步 —— 早先这里返回 `None`，
+///   调用方于是回落到**全局默认值**（流速 10 / 透明度 1 / 移动 0），
+///   和这条轨道真正的值不是一个东西）；
+/// · **空轨道**才返回 `None` —— 那是"全局默认值"唯一该出现的地方（流速 10、透明度 1、移动 0）。
 pub fn track_value(track: &str, events: &[Event], beat: f64) -> Option<f64> {
-    if track == "speed" {
-        let i = active_event(events, beat)?;
-        Some(speed_value(&events[i], beat))
-    } else {
-        eval_events(events, beat)
+    if events.is_empty() {
+        return None;
     }
+    let i = active_event(events, beat).unwrap_or(0);
+    Some(if track == "speed" {
+        speed_value(&events[i], beat)
+    } else {
+        event_value(&events[i], beat)
+    })
 }
 
 // ---------------------------------------------------------------- 流速（RPE 的 floor position）
@@ -695,21 +705,53 @@ pub fn sample_track(
     linear_only: bool,
 ) -> Vec<[f32; 2]> {
     let mut out: Vec<[f32; 2]> = Vec::new();
+    if events.is_empty() {
+        return out;
+    }
     let n = per_event.max(1);
-    for e in events {
+    // `linear_only` = 流速轨：曲线要与求值**同一条口径**（只用线性），
+    // 否则时间轴画的是缓动、音符位置却是线性积分 —— 两个面板互相打脸
+    let value_of = |e: &Event, beat: f64| -> f64 {
+        if linear_only {
+            speed_value(e, beat)
+        } else {
+            event_value(e, beat)
+        }
+    };
+    let mut push = |beat: f64, v: f64| out.push([tmap.sec(beat) as f32, v as f32]);
+
+    // ① 首条事件**之前**的空位：保持首条的起始值（与 `track_value`/`active_event` 同一条规则）
+    let b0 = tmap.beat(0.0);
+    let first = &events[0];
+    if first.start.to_f64() > b0 + 1e-9 {
+        let v = value_of(first, first.start.to_f64());
+        push(b0, v);
+        push(first.start.to_f64(), v);
+    }
+    for (i, e) in events.iter().enumerate() {
         let (a, b) = (e.start.to_f64(), e.end.to_f64());
         for k in 0..=n {
             let t = k as f64 / n as f64;
-            let beat = a + (b - a) * t;
-            // `linear_only` = 流速轨：曲线要与求值**同一条口径**（只用线性），
-            // 否则时间轴画的是缓动、音符位置却是线性积分 —— 两个面板互相打脸
-            let v = if linear_only {
-                speed_value(e, beat)
-            } else {
-                eval_events(std::slice::from_ref(e), beat).unwrap_or(0.0)
-            };
-            out.push([tmap.sec(beat) as f32, v as f32]);
+            push(a + (b - a) * t, value_of(e, a + (b - a) * t));
         }
+        // ② 两条事件之间的空位：**保持这一条的终值**（不是插值过去 —— 那与求值器不一致）
+        if let Some(next) = events.get(i + 1) {
+            let ns = next.start.to_f64();
+            if ns > b + 1e-9 {
+                let v = value_of(e, b);
+                push(b, v);
+                push(ns, v);
+            }
+        }
+    }
+    // ③ 末条事件**之后**的空位：保持末条的终值，一直画到谱面末尾
+    //（时间轴比谱面长时由画图那一侧补到画面边缘）
+    let last = events.last().expect("上面判过非空");
+    let le = last.end.to_f64();
+    if tmap.end_beat > le + 1e-9 {
+        let v = value_of(last, le);
+        push(le, v);
+        push(tmap.end_beat, v);
     }
     out
 }
@@ -897,6 +939,77 @@ mod speed_tests {
         }
     }
 
+    /// **事件块前后的空位：保持相邻那块的值**（用户口径），而不是回落到全局默认值。
+    ///
+    /// 早先 `track_value("speed", …)` 在"首条事件之前"这一步返回 `None`，调用方于是回落到
+    /// **全局默认值**（流速 10 / 透明度 1 / 移动 0）—— 与这条轨道真正的值不是一个东西。
+    /// 空轨道才该返回 `None`（那是全局默认值唯一该出现的地方）。
+    #[test]
+    fn gaps_hold_the_neighbouring_block_value() {
+        let tmap = tmap120();
+        // 块在 [8,16] 拍（4~8 秒），值 7
+        let events = vec![ev(8.0, 16.0, 7.0, 7.0)];
+        assert_eq!(track_value("speed", &events, 2.0), Some(7.0), "块**之前**取块的起始值");
+        assert_eq!(track_value("alpha", &events, 2.0), Some(7.0), "四条轨道同一口径");
+        assert_eq!(track_value("speed", &events, 12.0), Some(7.0), "块里");
+        assert_eq!(track_value("speed", &events, 100.0), Some(7.0), "块**之后**保持终值");
+        // 斜坡：块前取起始值、块后取终值（不是 0、也不是别的默认值）
+        let ramp = vec![ev(8.0, 16.0, 2.0, 9.0)];
+        assert_eq!(track_value("moveX", &ramp, 2.0), Some(2.0));
+        assert_eq!(track_value("moveX", &ramp, 100.0), Some(9.0));
+        // **空轨道** ⇒ None（调用方用自己的默认值：流速 10 / 透明度 1 / 移动 0）
+        assert_eq!(track_value("speed", &[], 2.0), None);
+        assert_eq!(eval_events(&[], 2.0), None);
+        let _ = tmap;
+    }
+
+    /// **时间轴曲线在空位里保持相邻那块的值**（`sample_track`），而且画满整条谱面。
+    ///
+    /// 早先它只在事件**内部**采样 ⇒ 事件块前后的空位"断线"，看上去像回到了默认值。
+    #[test]
+    fn the_sampled_curve_holds_values_across_gaps() {
+        // 谱面末尾要有内容（拍 32），否则 `end_beat` = 0，"画到末尾"这条断言就没意义
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        doc.judge_lines = vec![crate::doc::JudgeLine::default()];
+        doc.judge_lines[0].notes.push(crate::doc::Note::new(
+            crate::doc::NoteKind::Tap,
+            Beat::new(32, 1),
+            0.0,
+        ));
+        let tmap = TimeMap::from_doc(&doc);
+        assert_eq!(tmap.end_beat, 32.0, "用例前提：谱面末尾在拍 32");
+        // 块 [8,12] 值 5 ⇒ 曲线应从拍 0 起就保持 5，一直画到谱面末尾
+        let one = vec![ev(8.0, 12.0, 5.0, 5.0)];
+        let pts = sample_track(&one, &tmap, 4, false);
+        let first = pts.first().expect("非空");
+        assert!(first[0].abs() < 1e-6, "曲线要从谱面开头（拍 0 = 0 秒）起");
+        assert!((first[1] - 5.0).abs() < 1e-6, "开头是首事件的起始值，实际 {}", first[1]);
+        let last = pts.last().expect("非空");
+        assert!((last[0] as f64 - tmap.sec(tmap.end_beat)).abs() < 1e-3, "画到谱面末尾");
+        assert!((last[1] - 5.0).abs() < 1e-6, "末尾保持末事件的终值，实际 {}", last[1]);
+        // 事件之间的空位：保持前一条的终值（两点同值 ⇒ 水平段，不是插值）
+        let gap = vec![ev(0.0, 4.0, 5.0, 5.0), ev(8.0, 12.0, 9.0, 9.0)];
+        let pts = sample_track(&gap, &tmap, 4, false);
+        let at = |sec: f64| -> Option<f32> {
+            pts.iter().find(|q| (q[0] as f64 - sec).abs() < 1e-4).map(|q| q[1])
+        };
+        assert_eq!(at(tmap.sec(4.0)).map(|v| v.round()), Some(5.0), "空位起点 = 前一条的终值");
+        assert_eq!(at(tmap.sec(8.0)).map(|v| v.round()), Some(5.0), "空位终点仍是前一条的终值");
+        // 空位里没有任何"回到默认值"的采样点
+        assert!(
+            !pts.iter().any(|q| {
+                let sec = q[0] as f64;
+                sec > tmap.sec(4.0) + 1e-6 && sec < tmap.sec(8.0) - 1e-6 && q[1].abs() < 1e-6
+            }),
+            "空位里不该出现 0（那就是「回到默认值」）"
+        );
+    }
+
     /// **流速事件只按线性取**：`easing` 字段被忽略，且闭式积分是**精确值**（无抽样误差）。
     ///
     /// 记一条 `outElastic` 的流速事件，`H` 必须与记成 `linear` 的**一模一样**。
@@ -1059,5 +1172,6 @@ mod speed_tests {
         assert_eq!(table.h_at(&events, &tmap, 0.0), 0.0);
     }
 }
+
 
 

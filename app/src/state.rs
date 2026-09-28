@@ -1866,6 +1866,36 @@ mod tests {
         }
     }
 
+    /// **事件块前后的空位：线的表演值取相邻那块的值**，不是全局默认值（用户口径）。
+    ///
+    /// 早先 `track_value("speed", …)` 在"首条事件之前"返回 `None`，`Line::perf` 于是留着
+    /// `LinePerf::default()` 里的 **10**（流速）/ **1**（透明度）—— 一条从第 4 秒才开始的不透明
+    /// 事件会让判定线在 0~4 秒**完全可见**（该是事件自己的起始值才对）。
+    #[test]
+    fn a_leading_gap_uses_the_first_blocks_value_not_a_global_default() {
+        // 事件块 [8,16] 拍（4~8 秒）：alpha 0.25、流速 3
+        let doc = speed_doc(
+            vec![ev(8.0, 16.0, 3.0, 3.0)],
+            &[("tap", 20.0, None)],
+        );
+        let chart = chart_from_doc(&doc);
+        let tmap = chart.tmap.clone();
+        let line = &chart.lines[0];
+        // 块之前（1 秒）：取块的起始值
+        let p = line.perf(&tmap, 1.0);
+        assert!((p.speed - 3.0).abs() < 1e-6, "块前流速该是 3（块的起始值），实际 {}", p.speed);
+        // 块之后（20 秒）：保持终值
+        let p = line.perf(&tmap, 20.0);
+        assert!((p.speed - 3.0).abs() < 1e-6, "块后流速该保持 3，实际 {}", p.speed);
+        // 空轨道仍然是**全局默认**（那是默认值唯一该出现的地方：流速 10 / 透明度 1）
+        let doc = speed_doc(vec![], &[("tap", 20.0, None)]);
+        let chart = chart_from_doc(&doc);
+        let tmap = chart.tmap.clone();
+        let p = chart.lines[0].perf(&tmap, 1.0);
+        assert!((p.speed - 10.0).abs() < 1e-6, "空流速轨道按 RPE 默认 10 走");
+        assert!((p.alpha - 1.0).abs() < 1e-6, "空透明度轨道按 1（不透明）走");
+    }
+
     /// **流速事件一改：只有它之后的音符被标脏**（前缀积分的直接推论），其余仍是"已算准"。
     /// 唯一的例外是**跨过改动点的长 hold** —— 它的头没变、尾巴变了（见下）。
     #[test]
