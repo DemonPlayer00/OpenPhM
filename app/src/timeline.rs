@@ -13,9 +13,10 @@
 //! | [`readouts`] | 按可用宽度逐级省略的读数 | **能**（把"量宽度"作为参数传进来） |
 //! | [`draw`] | 把上面两者画出来 | 只有这一层只剩 egui 调用 |
 //!
-//! 时间轴的内容规范（谁在上、谁代表什么）见 [`draw`] 的注释与《框架选型》§7.56–7.58。
+//! 时间轴的内容规范（谁在上、谁代表什么）见 [`draw`] 的注释与《框架选型》§7.56–7.58；
+//! **子音符条 = 4 行（4 种音符）+ 行内合并**见 §7.77。
 
-use crate::state::EditorState;
+use crate::state::{EditorState, Line, NoteKind};
 
 /// 面板配色（只有一处，改色不用满文件找）
 const BG: [u8; 3] = [16, 16, 24];
@@ -29,6 +30,175 @@ const CURVE: [u8; 3] = [120, 220, 160];
 const TEXT_DIM: [u8; 3] = [120, 125, 160];
 const TEXT_LEGEND: [u8; 3] = [150, 155, 185];
 const TEXT_TRACK: [u8; 3] = [120, 220, 160];
+
+// ---- 子音符条：4 行 = 4 种音符（用户："将音符显示改造为4行，分别对应4个音符"）----
+
+/// 音符条的行数。**必须等于音符种类数** —— `kind_row` 的 `match` 不写通配臂，
+/// 将来加第 5 种音符会**编译不过**，而不是悄悄挤进同一行。
+pub const NOTE_ROWS: usize = 4;
+/// 行号的规范顺序（自上而下）。行键文本与单测都由它生成 ⇒ 改顺序只有这一处。
+pub const KIND_ROWS: [NoteKind; NOTE_ROWS] =
+    [NoteKind::Tap, NoteKind::Hold, NoteKind::Drag, NoteKind::Flick];
+/// 单颗音符至少占的像素宽（原口径 1.5px：不然一颗 tap 细到看不见）
+const NOTE_MIN_PX: f32 = 1.5;
+/// 相邻两段间隙不足这么多像素就并起来。**必须 ≥1px**：段数因此有上界（≈ 轴宽 / 1px × 4 行），
+/// 而"间隙 0.4px 的两段"在屏幕上本来就分不开 —— 合并它不丢信息。
+const NOTE_MERGE_GAP: f32 = 1.0;
+/// 每行的高度上限（时间轴再高，音符条也不该变成主视觉）
+const NOTE_ROW_H_MAX: f32 = 16.0;
+/// 行间空隙
+const NOTE_ROW_GAP: f32 = 1.0;
+/// 底部事件条的高度（`rect.max.y - EVENT_BAR_H .. rect.max.y - EVENT_BAR_BOTTOM`）
+const EVENT_BAR_H: f32 = 6.0;
+const EVENT_BAR_BOTTOM: f32 = 1.0;
+/// 音符条区与事件条之间留的空隙
+const NOTE_BAND_PAD: f32 = 3.0;
+/// 音符条区的上边界（占轴高比例）—— 曲线区是 0.08…0.70（见 [`draw`]），0.72 起不与它打架
+const NOTE_BAND_TOP_FRAC: f32 = 0.72;
+
+/// **音符种类 → 行号**（自上而下）。
+pub fn kind_row(k: NoteKind) -> usize {
+    match k {
+        NoteKind::Tap => 0,
+        NoteKind::Hold => 1,
+        NoteKind::Drag => 2,
+        NoteKind::Flick => 3,
+    }
+}
+
+/// 读数第 2 行末尾那截**行键**（"哪一行是哪种音符"）。由 [`KIND_ROWS`] 生成 ⇒ 不会与 [`kind_row`] 漂移。
+pub fn note_row_key() -> String {
+    let names: Vec<&str> = KIND_ROWS.iter().map(|k| k.label()).collect();
+    format!("音符行（自上而下）{}", names.join("/"))
+}
+
+/// 音符种类色（与演奏区同一套 [`NoteKind::color`]；转 `Color32` 的口径与改造前一致）
+fn kind_color(k: NoteKind) -> egui::Color32 {
+    let c = k.color();
+    egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+}
+
+/// 合并后的一段：一个矩形（像素区间）。**段与段在 x 上互不重叠** —— 那正是"合并"的判据。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteSpan {
+    pub x0: f32,
+    pub x1: f32,
+}
+
+/// 一行的两层：`base` 是**没选中**的（画种类色），`selected` 是**选中**的（画白）。
+///
+/// 分成两层而不是"选中状态不同就不合并"，是因为后者会留下一个恶心的边角：
+/// 密流里选一颗时，前一段的右端早就越过了这颗的左端 —— 想要"互不重叠"就得把前一段**裁短**，
+/// 而裁短会让"这一段到底有没有音符"变得可疑。两层则各自成立、各自不重叠，
+/// **白的那层最后画**（压在种类色上）⇒ 选中的那颗一定看得见，且合并永远不用为它让路。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowSpans {
+    pub base: Vec<NoteSpan>,
+    pub selected: Vec<NoteSpan>,
+}
+
+/// 往一行的段表里放一颗音符：与上一段重叠（或间隙 < `gap`）就**并进去**，否则另起一段。
+///
+/// 前提：同一行的输入按 `x0` **非降序**（[`line_spans`] 满足它，见那里的说明）——
+/// 这是"单趟贪心合并"成立的条件，`debug_assert` 盯着它（测试里若违反会当场炸）。
+fn push_span(out: &mut Vec<NoteSpan>, x0: f32, x1: f32, min_px: f32, gap: f32) {
+    if !(x0.is_finite() && x1.is_finite()) {
+        return; // 坏数据不该让整帧画不出来（原来一个 NaN 矩形也会被 egui 丢掉，这里顺手挡掉）
+    }
+    let (a, b) = (x0, x1.max(x0 + min_px));
+    match out.last_mut() {
+        Some(last) if a <= last.x1 + gap => {
+            debug_assert!(a + 1e-3 >= last.x0, "同一行必须按 x 非降序：{a} < {}", last.x0);
+            last.x1 = last.x1.max(b);
+        }
+        _ => out.push(NoteSpan { x0: a, x1: b }),
+    }
+}
+
+/// 合并一段序列（**输入顺序任意**：内部先按 `x0` 排序）。给单测与"顺序没保证"的调用方用；
+/// 帧里走的是 [`line_spans`] 那条**不排序、不建中间数组**的路。
+pub fn merge_spans(items: &[(f32, f32)], min_px: f32, gap: f32) -> Vec<NoteSpan> {
+    let mut v: Vec<(f32, f32)> =
+        items.iter().copied().filter(|(a, b)| a.is_finite() && b.is_finite()).collect();
+    v.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::new();
+    for (a, b) in v {
+        push_span(&mut out, a, b, min_px, gap);
+    }
+    out
+}
+
+/// **把一条线的音符压成 4 行、每行若干互不重叠的段** —— `draw` 与单测共用这一份实现
+/// （免得"测的"和"画的"不是一套）。
+///
+/// 为什么可以**不排序**：`Line::notes` 按时间升序（`state::notes_of` 排的），
+/// `TimelineGeom::x_of` 对时间单调 ⇒ 每一行拿到的子序列也按 `x0` 非降序。
+/// 于是单趟贪心合并即是正解，代价 O(音符数)、额外内存只有"段"本身（个位数）。
+///
+/// `sel` 是**视图下标**的升序集合（`Selection::notes_set()`）。这里用归并式游标而不是
+/// 每颗音符查一次集合：查一次是 O(log n) 且要跳 BTree 节点，5 万颗就是 5 万次随机访存。
+pub fn line_spans(
+    line: &Line,
+    geom: &TimelineGeom,
+    sel: &std::collections::BTreeSet<usize>,
+) -> [RowSpans; NOTE_ROWS] {
+    let mut rows: [RowSpans; NOTE_ROWS] = std::array::from_fn(|_| RowSpans::default());
+    let mut cursor = sel.iter().copied().peekable();
+    for (i, n) in line.notes.iter().enumerate() {
+        // 选区里可能有**不属于这条线的**（或已失效的）下标：游标只前进、不回退
+        while cursor.peek().is_some_and(|&j| j < i) {
+            cursor.next();
+        }
+        let is_sel = cursor.peek() == Some(&i);
+        if is_sel {
+            cursor.next();
+        }
+        let row = &mut rows[kind_row(n.kind)];
+        let dst = if is_sel { &mut row.selected } else { &mut row.base };
+        push_span(dst, geom.x_of(n.time), geom.x_of(n.end.max(n.time)), NOTE_MIN_PX, NOTE_MERGE_GAP);
+    }
+    rows
+}
+
+/// 音符条的**行布局**（4 行自上而下 = [`KIND_ROWS`]）。纯几何 ⇒ 可单测
+/// （"矮轴里 4 行不越界、不重叠"曾经是只能靠截图看的那类东西）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteRowLayout {
+    pub row_h: f32,
+    pub gap: f32,
+    pub top: f32,
+}
+
+impl NoteRowLayout {
+    pub fn new(rect: egui::Rect) -> Self {
+        let band_top = rect.min.y + rect.height() * NOTE_BAND_TOP_FRAC;
+        let band_bot = rect.max.y - EVENT_BAR_H - NOTE_BAND_PAD;
+        let gap = NOTE_ROW_GAP;
+        let avail = (band_bot - band_top).max(1.0);
+        // 贴着事件条往上排：轴一般高得够（`timeline_height` 的下限是 64px）⇒ 4 行正好铺满这一段；
+        // 轴高到离谱时行高封顶，不再把音符条撑成主视觉。
+        let row_h = ((avail - gap * (NOTE_ROWS as f32 - 1.0)) / NOTE_ROWS as f32)
+            .clamp(1.0, NOTE_ROW_H_MAX);
+        let total = row_h * NOTE_ROWS as f32 + gap * (NOTE_ROWS as f32 - 1.0);
+        // 轴矮到 4 行都塞不下时（时间轴隐藏 ⇒ 高度 0）：先保证**不跑到轴外去**，
+        // 行被 `painter_at` 裁掉是小事，越界画到别的面板上是大事。
+        let top = (band_bot - total).clamp(rect.min.y, band_bot.max(rect.min.y));
+        Self { row_h, gap, top }
+    }
+
+    /// 第 `row` 行的顶边
+    pub fn y_of(&self, row: usize) -> f32 {
+        self.top + row as f32 * (self.row_h + self.gap)
+    }
+
+    /// 第 `row` 行里 `x0..x1` 那一段的矩形
+    pub fn rect_of(&self, row: usize, x0: f32, x1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(x0, self.y_of(row)),
+            egui::pos2(x1, self.y_of(row) + self.row_h),
+        )
+    }
+}
 
 fn rgb(c: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(c[0], c[1], c[2])
@@ -59,6 +229,8 @@ pub struct TimelineGeom {
     pub music_sec: Option<f64>,
     pub content_sec: f64,
     pub content_beat: f64,
+    /// 子音符条的 4 行落在哪（纯几何，见 [`NoteRowLayout`]）
+    pub rows: NoteRowLayout,
 }
 
 impl TimelineGeom {
@@ -87,6 +259,7 @@ impl TimelineGeom {
             playhead: st.playhead,
             step_sec: base * mult as f64,
             mult,
+            rows: NoteRowLayout::new(rect),
         }
     }
 
@@ -192,8 +365,15 @@ pub fn readouts(
         }
     }
 
-    // 第 2 行：颜色图例（四档，挑放得下的最长那个；都放不下就不画）
+    // 第 2 行：颜色图例（逐档挑放得下的最长那个；都放不下就不画）
+    // 最长的一档多带一句"哪一行是哪种音符"（4 行靠颜色认，而 Tap/Hold 都是蓝的 —— 不给行键会看糊）
     let legends = [
+        format!(
+            "黄线 = 编辑区起点 ｜ 浅色 = 编辑区窗口（{:.1}→{:.1}s）｜ 白线 = 播放头 ｜ {}",
+            geom.span_lo,
+            geom.span_hi,
+            note_row_key()
+        ),
         format!(
             "黄线 = 编辑区起点 ｜ 浅色 = 编辑区窗口（{:.1}→{:.1}s）｜ 白线 = 播放头",
             geom.span_lo, geom.span_hi
@@ -221,8 +401,8 @@ pub struct TimelineOut {
 /// 画时间轴并返回本帧动作。
 ///
 /// 内容规范（这几条都是用户点名的，改动前先看 §7.56–7.58）：
-/// - 底色 → **浅色带**（编辑区从底层到顶层的跨度）→ 拍线 → 当前判定线的事件条/折线/子音符 →
-///   **黄线**（编辑区**底部** = "起点"）→ **细白线**（播放头）→ 两行读数。
+/// - 底色 → **浅色带**（编辑区从底层到顶层的跨度）→ 拍线 → 当前判定线的事件条/折线/**子音符条
+///   （4 行 = 4 种音符，行内重合已合并）** → **黄线**（编辑区**底部** = "起点"）→ **细白线**（播放头）→ 两行读数。
 /// - 浅色带画在拍线**之前**：它是底衬，不能把数据压灰。
 /// - 黄线与播放头是**两种东西**（播放头在黄线上方 `lead_beats` 拍），必须一眼分得清。
 pub fn draw(
@@ -267,8 +447,8 @@ pub fn draw(
             );
             p.rect_filled(
                 egui::Rect::from_min_max(
-                    egui::pos2(geom.x_of(t0), rect.max.y - 6.0),
-                    egui::pos2(geom.x_of(t1), rect.max.y - 1.0),
+                    egui::pos2(geom.x_of(t0), rect.max.y - EVENT_BAR_H),
+                    egui::pos2(geom.x_of(t1), rect.max.y - EVENT_BAR_BOTTOM),
                 ),
                 0.0,
                 rgba(EVENT_BAR),
@@ -300,20 +480,24 @@ pub fn draw(
             }
             p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, rgb(CURVE))));
         }
-        for (i, n) in line.notes.iter().enumerate() {
-            let y = rect.min.y + rect.height() * 0.74;
-            let (x0, x1) = (geom.x_of(n.time), geom.x_of(n.end.max(n.time)));
-            let col = if st.is_note_selected(i) {
-                egui::Color32::WHITE
-            } else {
-                let c = n.kind.color();
-                egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
-            };
-            p.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1.max(x0 + 1.5), y + 6.0)),
-                0.0,
-                col,
-            );
+        // 子音符条：**4 行 = 4 种音符**（Tap/Hold/Drag/Flick），行内时间重合的合并成一段。
+        // 用户："在时间轴上将有重合的音符合并为1个矩形，将音符显示改造为4行，分别对应4个音符"。
+        //
+        // 为什么必须合并：整谱可见时 5 万音符里有 30 颗挤在同一个像素上 —— 一颗一个矩形既是
+        // 5 万个形状/帧（实测到过 ~15 ms/帧），又**不含任何额外信息**（糊成一片）。
+        // 分 4 行反而多给了信息："这一段是谁在堆"。选中的那颗走单独一层、最后画（见 `line_spans`）。
+        let spans = line_spans(line, &geom, st.selection().notes_set());
+        for (r, row) in spans.iter().enumerate() {
+            let col = kind_color(KIND_ROWS[r]);
+            for s in &row.base {
+                p.rect_filled(geom.rows.rect_of(r, s.x0, s.x1), 0.0, col);
+            }
+        }
+        // 选中的那颗：白，**压在种类色之上**（两层各自合并，所以它永远不会被合并吃掉）
+        for (r, row) in spans.iter().enumerate() {
+            for s in &row.selected {
+                p.rect_filled(geom.rows.rect_of(r, s.x0, s.x1), 0.0, egui::Color32::WHITE);
+            }
         }
     }
 
@@ -403,6 +587,8 @@ fn trace_if_changed(geom: &TimelineGeom) {
 mod tests {
     use super::*;
     use crate::doc::{Beat, BpmEntry, Document, Note, NoteKind};
+    /// 视图侧的音符种类（与 `doc::NoteKind` 是两个类型 —— 名字在这一层撞车，用别名分开）
+    use crate::state::NoteKind as VKind;
     use crate::state::chart_from_doc;
 
     fn rect(w: f32) -> egui::Rect {
@@ -558,5 +744,171 @@ mod tests {
         assert!((g.span_hi - 13.0).abs() < 1e-9, "顶部 = +8 拍 = 13s");
         assert!((g.playhead - 10.0).abs() < 1e-9);
         assert!(g.x_of(g.span_lo) < g.x_of(g.playhead), "黄线在播放头左边");
+    }
+
+    // ---- 子音符条：4 行 + 行内合并（用户 2026-09-29 的口径）----
+
+    /// 造一份"给定种类/拍位/时长"的谱面（`doc_120bpm` 只会造 tap）
+    fn doc_kinds(notes: &[(NoteKind, i64, i64, i64)]) -> Document {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry { start: Beat::zero(), bpm: 120.0, foreign: Default::default() }];
+        for (k, num, den, len) in notes {
+            let mut n = Note::new(*k, Beat::new(*num, *den), 0.0);
+            if *len > 0 {
+                n.end = Some(Beat::new(*num + *len, *den));
+            }
+            doc.judge_lines[0].notes.push(n);
+        }
+        doc
+    }
+
+    fn sel_of(idx: &[usize]) -> std::collections::BTreeSet<usize> {
+        idx.iter().copied().collect()
+    }
+
+    /// 4 行 = 4 种音符：**每种各占一行**，且行号与 [`KIND_ROWS`] 一一对应（两处不能漂移）
+    #[test]
+    fn the_four_note_kinds_get_four_distinct_rows() {
+        let rows: Vec<usize> = KIND_ROWS.iter().map(|k| kind_row(*k)).collect();
+        assert_eq!(rows, (0..NOTE_ROWS).collect::<Vec<_>>(), "{KIND_ROWS:?} 的顺序就是行号顺序");
+        for i in 0..NOTE_ROWS {
+            for j in (i + 1)..NOTE_ROWS {
+                assert_ne!(KIND_ROWS[i], KIND_ROWS[j], "两种音符挤在同一行：{KIND_ROWS:?}");
+            }
+        }
+        // 行键文本得把 4 行都说出来（否则界面上 4 行颜色只能靠猜）
+        let key = note_row_key();
+        for k in KIND_ROWS {
+            assert!(key.contains(k.label()), "{key} 少了 {}", k.label());
+        }
+    }
+
+    /// **有重合的音符合并为 1 个矩形**（用户点名的规则）：分开的还是各是各的
+    #[test]
+    fn overlapping_notes_merge_into_one_rect() {
+        let s = merge_spans(&[(0.0, 10.0), (5.0, 15.0), (20.0, 22.0)], NOTE_MIN_PX, NOTE_MERGE_GAP);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!((s[0].x0, s[0].x1), (0.0, 15.0));
+        assert_eq!((s[1].x0, s[1].x1), (20.0, 22.0));
+    }
+
+    /// 段之间**永不重叠**、按 x 升序，且合并不丢区间（乱序输入也成立 ⇒ 内部先排序）
+    #[test]
+    fn merged_spans_never_overlap_and_keep_x_order() {
+        let items = [(30.0, 40.0), (0.0, 12.0), (5.0, 6.0), (41.0, 41.0), (12.5, 13.0), (13.4, 60.0)];
+        let s = merge_spans(&items, NOTE_MIN_PX, 0.0);
+        for w in s.windows(2) {
+            assert!(w[1].x0 > w[0].x1, "两段叠在一起了：{s:?}");
+        }
+        assert_eq!(s.first().unwrap().x0, 0.0, "起点被丢了：{s:?}");
+        assert_eq!(s.last().unwrap().x1, 60.0, "终点被丢了：{s:?}");
+    }
+
+    /// 一颗单独的 tap 也要看得见（最小 1.5px —— 改造前就是这个口径，别在合并时弄丢）
+    #[test]
+    fn a_lone_note_keeps_its_minimum_width() {
+        let s = merge_spans(&[(100.0, 100.0)], NOTE_MIN_PX, NOTE_MERGE_GAP);
+        assert_eq!(s.len(), 1);
+        assert!((s[0].x1 - s[0].x0 - NOTE_MIN_PX).abs() < 1e-6, "{s:?}");
+    }
+
+    /// **选中的那颗不会被合并吃掉**：它在单独一层里，密流合并出的那一段盖不住它
+    #[test]
+    fn selected_notes_form_their_own_layer_over_the_merged_run() {
+        // 2000 颗 tap 挤在 500 拍里（120bpm ⇒ 0.125s 一颗）：整谱可见时平均 0.25px 一颗，
+        // 于是"没选中的那些"必然合并成 1 段，而第 1000 颗选中的要单独成段、落在它的范围里。
+        let doc = doc_kinds(&(0..2000).map(|b| (NoteKind::Tap, b, 4, 0)).collect::<Vec<_>>());
+        let st = EditorState::new(chart_from_doc(&doc));
+        let geom = TimelineGeom::new(rect(500.0), &st, 2.0);
+        assert!(geom.duration > 250.0, "总长 {}（2000 颗 tap = 500 拍）", geom.duration);
+        let spans = line_spans(st.selected().expect("总有一条判定线"), &geom, &sel_of(&[1000]));
+
+        let tap = &spans[kind_row(VKind::Tap)];
+        assert_eq!(tap.base.len(), 1, "密流应当合并成 1 段：{:?}", tap.base);
+        assert_eq!(tap.selected.len(), 1, "选中的那颗要单独成段：{:?}", tap.selected);
+        let (run, hit) = (tap.base[0], tap.selected[0]);
+        assert!(hit.x0 >= run.x0 && hit.x1 <= run.x1, "选中段落在合并段之外：{run:?} vs {hit:?}");
+        assert!(hit.x1 - hit.x0 < run.x1 - run.x0, "选中的只是密流里的一颗");
+        // 其余 3 行没有 tap ⇒ 一条都不该画
+        for r in 1..NOTE_ROWS {
+            assert!(spans[r].base.is_empty() && spans[r].selected.is_empty(), "第 {r} 行凭空有东西");
+        }
+    }
+
+    /// 4 行各管各的：hold 的长条**不会**把同时间的 tap/drag/flick 盖住（分行的直接好处）
+    #[test]
+    fn kinds_do_not_bleed_into_each_others_rows() {
+        let doc = doc_kinds(&[
+            (NoteKind::Tap, 0, 1, 0),
+            (NoteKind::Hold, 0, 1, 8), // 0~8 拍的长条
+            (NoteKind::Drag, 2, 1, 0),
+            (NoteKind::Flick, 4, 1, 0),
+        ]);
+        let st = EditorState::new(chart_from_doc(&doc));
+        let geom = TimelineGeom::new(rect(500.0), &st, 2.0);
+        let spans = line_spans(st.selected().unwrap(), &geom, &std::collections::BTreeSet::new());
+        for (r, row) in spans.iter().enumerate() {
+            assert_eq!(row.base.len(), 1, "第 {r} 行应当各有一段：{spans:?}");
+        }
+        let hold = &spans[kind_row(VKind::Hold)].base[0];
+        let tap = &spans[kind_row(VKind::Tap)].base[0];
+        assert!(hold.x1 - hold.x0 > tap.x1 - tap.x0, "hold 是长条，tap 是一颗");
+    }
+
+    /// 矮/高时间轴里 4 行都不越界、不重叠（纯几何 —— 这类东西以前只能靠截图看）
+    #[test]
+    fn note_row_layout_stays_inside_the_axis() {
+        for h in [64.0f32, 100.0, 189.0, 271.0, 400.0, 900.0] {
+            let r = egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(800.0, h));
+            let lay = NoteRowLayout::new(r);
+            assert!(lay.row_h >= 1.0 && lay.row_h <= NOTE_ROW_H_MAX, "h={h} 行高 {}", lay.row_h);
+            for i in 0..NOTE_ROWS {
+                let y = lay.y_of(i);
+                assert!(y.is_finite() && y >= r.min.y - 0.01, "h={h} 第 {i} 行跑到轴上方：{y}");
+                assert!(y + lay.row_h <= r.max.y + 0.01, "h={h} 第 {i} 行跑到轴下方：{y}");
+                if i > 0 {
+                    assert!(lay.y_of(i) > lay.y_of(i - 1) + lay.row_h - 0.01, "h={h} 第 {i} 行与上一行重叠");
+                }
+            }
+            // 行不骑在底部事件条上（事件条的 6px 是"轨道事件"的地盘）
+            let last = lay.y_of(NOTE_ROWS - 1) + lay.row_h;
+            assert!(last <= r.max.y - EVENT_BAR_H + 0.01, "h={h} 音符条压住事件条：{last}");
+        }
+        // 时间轴隐藏（高度 0）时也不能算出一堆 NaN / 越界（`draw` 那时仍会被调用，只是全被裁掉）
+        for h in [0.0f32, 1.0, 8.0] {
+            let lay = NoteRowLayout::new(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, h)));
+            assert!(lay.row_h.is_finite() && lay.top.is_finite());
+            for i in 0..NOTE_ROWS {
+                assert!(lay.y_of(i).is_finite(), "h={h} 第 {i} 行不是有限数");
+                assert!(lay.y_of(i) >= 0.0, "h={h} 第 {i} 行跑到轴外：{}", lay.y_of(i));
+            }
+        }
+    }
+
+    /// **头条回归**：5 万音符整谱可见时只画个位数的矩形（改造前是"一颗音符一个矩形"= 50 000 个/帧）
+    #[test]
+    fn fifty_thousand_notes_collapse_to_a_handful_of_rects() {
+        // 与 `bench/stress-50k.opm` 同一形状：BPM 180、每秒 150 颗、四种音符轮流
+        let kinds = [NoteKind::Tap, NoteKind::Hold, NoteKind::Drag, NoteKind::Flick];
+        let notes: Vec<(NoteKind, i64, i64, i64)> = (0..50_000i64)
+            .map(|i| {
+                let k = kinds[(i % 4) as usize];
+                (k, i * 5, 250, if k == NoteKind::Hold { 25 } else { 0 })
+            })
+            .collect();
+        let st = EditorState::new(chart_from_doc(&doc_kinds(&notes)));
+        assert_eq!(st.chart.lines[0].notes.len(), 50_000);
+        let geom = TimelineGeom::new(rect(1500.0), &st, 2.0);
+        let spans = line_spans(st.selected().unwrap(), &geom, &std::collections::BTreeSet::new());
+
+        let drawn: usize =
+            spans.iter().map(|r| r.base.len() + r.selected.len()).sum();
+        for (r, row) in spans.iter().enumerate() {
+            assert!(!row.base.is_empty(), "第 {r} 行（{}）没画出来", KIND_ROWS[r].label());
+        }
+        assert!(
+            drawn <= 4 * NOTE_ROWS,
+            "5 万颗音符应当压成几十个矩形以内，实际 {drawn} 个（一颗一个就是 50 000 个）"
+        );
     }
 }
