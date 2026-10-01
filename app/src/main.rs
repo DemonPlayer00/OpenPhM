@@ -21,7 +21,7 @@
 //!           [--fps-cap 60] [--lookahead 2.0] [--control auto] [--doc x.opm.json]
 
 use opm_app::{
-    audio, broadcast, cli, cmd, control, core, filedialog, fonts, headless, keymap, recents,
+    audio, broadcast, cli, cmd, control, core, filedialog, fonts, fps, headless, keymap, recents,
     render, state, view, zip,
 };
 // 命令行参数与工作区预设（纯解析 + 单测在 `opm_app::cli`）
@@ -837,6 +837,9 @@ struct App {
     // 诊断
     frames: u32,
     last_frame: Option<Instant>,
+    /// **底栏那一格帧率**。只记账、从不 `request_repaint`（见 [`opm_app::fps`]）：
+    /// 它显示的是"实际出帧有多快"，不是"指示器让程序出帧有多快"。
+    fps: fps::FpsMeter,
     deltas: Vec<f64>,
     ui_ms: Vec<f64>,
     build_ms: Vec<f64>,
@@ -1104,6 +1107,7 @@ impl App {
             paint_us: Arc::new(AtomicU64::new(0)),
             frames: 0,
             last_frame: None,
+            fps: fps::FpsMeter::new(),
             deltas: Vec::new(),
             ui_ms: Vec::new(),
             build_ms: Vec::new(),
@@ -3772,6 +3776,8 @@ impl eframe::App for App {
                 notice: self.file_message.clone(),
                 // 音符位置重算的进度（流速事件改了之后要异步补的那批活）
                 floor_rebuild: self.state.floor_rebuild(),
+                // 帧率指示：值是**缓存**的（最多 0.5 秒变一次），这里只借字符串
+                fps: self.fps.text(),
                 diagnostics,
             };
             let act = egui::Panel::bottom("status").show(ui, |ui| {
@@ -4443,6 +4449,10 @@ impl eframe::App for App {
         if let Some(d) = delta_ms {
             self.deltas.push(d);
         }
+        // 底栏那一格帧率：**只记账**。它不返回"要不要重绘"，也不碰 `ctx` ——
+        // 指示器一旦参与请求重绘，就会把"空闲 1 fps"变成"指示器要的 fps"（用户口径：不影响帧刷新策略）。
+        // 显示值自己节流到 0.5 秒一次（`fps::MIN_INTERVAL`）。
+        self.fps.note_frame(now, delta_ms);
         self.last_frame = Some(now);
         self.frames += 1;
         self.frame_log(delta_ms, ui_ms, build_ms, inst_count);

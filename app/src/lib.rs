@@ -22,6 +22,8 @@
 //! · [`filedialog`] 系统文件对话框（kdialog/zenity）与"在文件管理器中显示"
 //! · [`keymap`]  快捷键的状态规则（空格＝单点切播 / 长按试听，纯逻辑可单测）
 //! · [`dirty`]  广播话题 → 面板脏位（唯一映射表；纯函数，有单测）
+//! · [`fps`]    **帧率指示**（底栏那一格）：只统计已经发生的帧、从不主动要求重绘；
+//!   显示值最多每 0.5 秒更新一次（用户口径）
 //! · [`demo`]   演示谱面（`--notes N`：走命令路径造的负载谱面）
 //! · [`edit`]   编辑意图 → 命令（手势翻译成命令 JSON；纯函数，可单测）
 //! · [`dialog`] 模态对话框的统一外观（颜色/宽度/Esc 归属；新建谱面与编辑页的弹窗共用一套）
@@ -49,6 +51,7 @@ pub mod journal;
 pub mod keymap;
 pub mod filedialog;
 pub mod fonts;
+pub mod fps;
 pub mod gpu;
 pub mod headless;
 pub mod perf;

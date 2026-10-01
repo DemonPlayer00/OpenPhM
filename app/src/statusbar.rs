@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 DemonPlayer
-//! **底部状态栏**：常用状态一行放下（播放头 / 音频 / 网格 / 文档标识 / 偏移 / 冲突 / 诊断）。
+//! **底部状态栏**：常用状态一行放下（播放头 / 音频 / 网格 / 文档标识 / 偏移 / 冲突 / 诊断 / 帧率）。
 //!
 //! 为什么单独一层：这一行是"用户唯一的常驻读数"，它的文字必须**能单独测**——
 //! 比如"没音频"该写 `♪ 无音频`、"没有保存目标"该写「尚未保存」而不是一个圆点、
@@ -9,6 +9,10 @@
 //!
 //! 纪律：面板**不锁核心、不解析路径**——显示要用的东西由调用点算好放进来
 //! （`file_badge`、网格文本都是缓存过的），面板只画与收动作。
+//!
+//! 右端那一格**帧率**也守同一条纪律：值由 [`opm_app::fps::FpsMeter`] 算好并缓存（最多 0.5 秒变一次），
+//! 面板只借一个 `&str` 去画 —— **绝不**为了刷新这个数去请求重绘（那会把"空闲 1 fps"变成
+//! "指示器要的 fps"，正是用户点名不许发生的事）。
 
 use egui::{Color32, Ui};
 
@@ -48,6 +52,11 @@ pub struct StatusView<'a> {
     /// **音符位置重算**的进度 `(已算好, 这一批总数)`；`None` = 没有在跑的活。
     /// 异步的活必须看得见：流速事件改了之后，"它之后的音符位置"是一帧补一点的。
     pub floor_rebuild: Option<(usize, usize)>,
+    /// **帧率指示**（`opm_app::fps` 算好、缓存的文本）；`None` = 还没凑满第一个 0.5 秒窗口。
+    ///
+    /// 借来的 `&str`（不是 `String`）：这一格每帧都要画，而它的值最多 0.5 秒才变一次 ——
+    /// 每帧克隆一份字符串正是"指示器自己变成开销"的那条路。
+    pub fps: Option<&'a str>,
     /// 诊断段（只有调试工作区给 `Some`）
     pub diagnostics: Option<String>,
 }
@@ -131,6 +140,16 @@ pub fn status_bar_ui(ui: &mut Ui, v: &mut StatusView) -> StatusAction {
             ui.separator();
             ui.label(d.as_str());
         }
+        // ---- 帧率指示：贴在**右端** ----
+        //
+        // 为什么右对齐、为什么放最后：
+        // ① 它是个"仪表"，不是状态叙述 —— 贴右端就不会被中间那些会说长说短的文本（提示、诊断）
+        //    推来推去；② 右对齐用掉的是**剩余空间**，前面的读数一个位置都不动。
+        if let Some(fps) = v.fps {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(fps).on_hover_text(opm_app::fps::HOVER);
+            });
+        }
     });
     act
 }
@@ -196,6 +215,7 @@ mod tests {
             show_conflicts: true,
             notice: None,
             floor_rebuild: None,
+            fps: Some("60.0 fps"),
             diagnostics: None,
         }
     }
@@ -310,6 +330,18 @@ mod tests {
         v.show_conflicts = false;
         let (_act, t) = draw(&mut v);
         assert!(!t.join("\n").contains("无事件重叠"));
+    }
+
+    /// **帧率指示**：有值就显示在底栏，没有值（还没凑满 0.5 秒的窗口）就一个字都不占
+    #[test]
+    fn the_frame_rate_indicator_shows_up_and_keeps_quiet_otherwise() {
+        let mut off = 0.0;
+        let mut v = view(&mut off);
+        let (_act, t) = draw(&mut v);
+        assert!(t.join("\n").contains("60.0 fps"), "缺帧率：{t:?}");
+        v.fps = None;
+        let (_act, t) = draw(&mut v);
+        assert!(!t.join("\n").contains("fps"), "没有值的时候不该占地方：{t:?}");
     }
 
     /// 有音频时显示**文件名**（不是整条路径）与欠载计数
