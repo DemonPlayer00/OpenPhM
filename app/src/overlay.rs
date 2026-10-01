@@ -517,6 +517,103 @@ pub fn box_hits(rects: &[(usize, egui::Rect)], sel: egui::Rect) -> Vec<usize> {
         .collect()
 }
 
+// ---------------------------------------------------------------- 音符选择框
+//
+// 用户口径（2026-10-01）：**编辑区的 note 选择框就是判定的唯一依据**。
+//   ① hold 点身体（非头部）也要能选中；
+//   ② 完全重叠的音符要能选到"被盖住的那个"（属性编辑器给一份列表）；
+//   ③ hold 的命中优先级**低于**其它类型；
+//   ④ 遮挡计算对 hold **只看头部**（长的身体既不算盖住别人，也不算被别人盖住）。
+//
+// 以前的单点命中**不看框**：它算的是"指针到音符头部点的切比雪夫距离 < 10px" ——
+// 于是 hold 只有头上那一下点得中，而重叠的两个音符永远只能选到先遍历到的那个。
+
+/// 音符选择框宽度（与画出来的一致；x 方向）
+pub const NOTE_W: f32 = 10.0;
+/// 非 hold 音符选择框高度（与画出来的一致；y 方向 = 一行）
+pub const NOTE_ROW_H: f32 = 7.0;
+
+/// **本帧画出来的一个音符选择框** —— 单点命中、框选、重叠组共用同一份几何。
+#[derive(Clone, Copy, Debug)]
+pub struct NoteBox {
+    /// 视图下标（时间序，与 `Line::notes` 一致）
+    pub index: usize,
+    /// 画出来是**竖条**（有时长）⇒ 命中优先级更低、遮挡只看头部。
+    /// 零长度的 hold 画的就是方块，因此按普通音符对待 —— 判据是"画出来的形状"。
+    pub hold: bool,
+    /// 头部框：宽度 `NOTE_W`、高度 `NOTE_ROW_H`，锚在判定时刻
+    pub head: egui::Rect,
+    /// 整框：hold = 头 → 尾的竖条；其余与 `head` 相同
+    pub full: egui::Rect,
+}
+
+/// 单点命中：**以选择框为准**（指针落在哪个 `full` 里）。
+///
+/// 优先级（用户口径）：
+/// 1. **非 hold 优先于 hold** —— "hold 的判定放在其它类型音符下方"；
+/// 2. 同类里**锚优先** —— 点在已选中的那个上不该把选区换人（重叠处每点一次都换人最烦）；
+/// 3. 其余**后画的优先**（画序 = 文档序，后画的在视觉上压在上面）。
+pub fn note_hit(boxes: &[NoteBox], pos: egui::Pos2, anchor: Option<usize>) -> Option<usize> {
+    let mut best: Option<NoteBox> = None;
+    for b in boxes.iter().filter(|b| b.full.contains(pos)) {
+        let take = match &best {
+            None => true,
+            Some(cur) => {
+                if b.hold != cur.hold {
+                    !b.hold
+                } else if (Some(b.index) == anchor) != (Some(cur.index) == anchor) {
+                    Some(b.index) == anchor
+                } else {
+                    b.index > cur.index
+                }
+            }
+        };
+        if take {
+            best = Some(*b);
+        }
+    }
+    best.map(|b| b.index)
+}
+
+/// `a` 是否**有效覆盖** `b`：交叠区在 x 或 y 上超过 `b` 的一半。
+///
+/// 一律用**头部框**比较（用户口径："对于 hold，遮挡算法只判定头部区域"）。
+/// 交叠为空**不算**覆盖 —— 同一条线上不同时刻的两个音符宽度完全相同，
+/// 只看宽度会得出"它们互相遮挡"这种显然错的结论。
+pub fn covers(a: &NoteBox, b: &NoteBox) -> bool {
+    let ov = a.head.intersect(b.head);
+    if !ov.is_positive() {
+        return false;
+    }
+    ov.width() * 2.0 > b.head.width() || ov.height() * 2.0 > b.head.height()
+}
+
+/// 锚音符所在的**重叠组**（含锚自己，按视图下标升序）。
+///
+/// 关系**不传递**：只收"与锚直接有效覆盖"的那些。传递闭包会把隔着两层的一串音符
+/// 也算进来 —— 那不是"点开被盖住的那些"，而是"这张谱面都连在一起了"。
+pub fn overlap_group(boxes: &[NoteBox], anchor: usize) -> Vec<usize> {
+    let Some(a) = boxes.iter().find(|b| b.index == anchor) else {
+        return Vec::new();
+    };
+    let mut g: Vec<usize> = boxes
+        .iter()
+        .filter(|b| b.index == anchor || covers(a, b) || covers(b, a))
+        .map(|b| b.index)
+        .collect();
+    g.sort_unstable();
+    g
+}
+
+/// 框选命中（音符）：与 [`box_hits`] 同一条规则（相交即中），数据源是 `NoteBox`
+pub fn note_box_hits(boxes: &[NoteBox], sel: egui::Rect) -> Vec<usize> {
+    boxes
+        .iter()
+        .filter(|b| sel.intersects(b.full))
+        .map(|b| b.index)
+        .collect()
+}
+
 /// **开始组拖动**：冻结抓手 → 把选区调整成"要拖的那些" → 发 `GrabStart`。
 ///
 /// 四件事都在这里，是因为它们必须同时成立：
@@ -687,7 +784,18 @@ const TRACK_COLORS: [[u8; 3]; 5] = [
     [255, 150, 150], // speed
 ];
 
-/// 画叠加层。返回本帧产生的动作。
+/// 叠加层每帧的**回执**（不是动作）：调用方拿它更新**视图状态**。
+///
+/// 为什么要有这个：锚音符的**重叠组**必须由"本帧画出来的选择框"算出来（用户口径：
+/// "以编辑区 note 选择框为准"），而选择框的几何只在这里有（缩放、窗口偏移都在这边算）。
+/// 与 `timeline::draw` 的返回值同一个套路。
+#[derive(Clone, Debug, Default)]
+pub struct OverlayOut {
+    /// 锚音符所在**重叠组**的视图下标（含锚自己；没选中音符时为空）
+    pub note_stack: Vec<usize>,
+}
+
+/// 画叠加层。返回本帧产生的动作 + 回执（见 [`OverlayOut`]）。
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
@@ -697,7 +805,7 @@ pub fn draw(
     // 现在能不能用快捷键（打字/模态期间为 false，由调用方算好 —— 门控只有一处）
     keys_enabled: bool,
     actions: &mut Vec<OverlayAction>,
-) {
+) -> OverlayOut {
     let p = ui.painter_at(rect);
     let beat_now = st.chart.tmap.beat(st.playhead);
     // 窗口：底部为 anchor，向上到 anchor + beats_visible
@@ -877,7 +985,7 @@ pub fn draw(
     }
 
     let Some(line) = st.selected() else {
-        return;
+        return OverlayOut::default();
     };
 
     // ---- 左半：音符轨道区 ----
@@ -918,9 +1026,10 @@ pub fn draw(
             egui::Stroke::new(w, col),
         );
     }
-    let row_h = 7.0_f32;
-    // 本帧画过的音符矩形：框选命中直接用它 —— "画在哪"与"选得中什么"必须是同一份几何
-    let mut note_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let row_h = NOTE_ROW_H;
+    // 本帧画过的音符选择框：**单点命中、框选、重叠组全都用它** ——
+    // "画在哪"与"选得中什么"必须是同一份几何（这一条以前只做到了框选那一半）。
+    let mut note_boxes: Vec<NoteBox> = Vec::new();
     for (i, n) in line.notes.iter().enumerate() {
         let y0 = y_of(n.time_beat(&st.chart.tmap));
         let y1 = y_of(n.end_beat(&st.chart.tmap));
@@ -937,29 +1046,36 @@ pub fn draw(
             (c[1] * 255.0) as u8,
             (c[2] * 255.0) as u8,
         );
+        // 头部框（一个方块）与整框（hold 是有时长的竖条，其余与头部框相同）
+        let head = egui::Rect::from_min_max(
+            egui::pos2(x - NOTE_W * 0.5, y0 - row_h * 0.5),
+            egui::pos2(x + NOTE_W * 0.5, y0 + row_h * 0.5),
+        );
+        let hold = (n.end - n.time).abs() > 1e-6;
+        let full = if hold {
+            egui::Rect::from_min_max(
+                egui::pos2(x - NOTE_W * 0.5, y0.min(y1)),
+                egui::pos2(x + NOTE_W * 0.5, y0.max(y1)),
+            )
+        } else {
+            head
+        };
         // Hold 用竖条表示时长，其余用方块
-        let (r, fill) = if (n.end - n.time).abs() > 1e-6 {
+        let (r, fill) = if hold {
             (
-                egui::Rect::from_min_max(
-                    egui::pos2(x - 5.0, y0.min(y1)),
-                    egui::pos2(x + 5.0, y0.max(y1)),
-                ),
+                full,
                 egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 110),
             )
         } else {
-            (
-                egui::Rect::from_min_max(
-                    egui::pos2(x - 5.0, y0 - row_h * 0.5),
-                    egui::pos2(x + 5.0, y0 + row_h * 0.5),
-                ),
-                col,
-            )
+            (full, col)
         };
         // 裁剪到音符区：平移之后，窗口外的音符会落到面板之外 —— 直接画就会糊到轴带/事件区上
         let r = r.intersect(note_pane);
         if !r.is_positive() {
             continue;
         }
+        // 框本身**不裁剪**（命中判定要用真正的框；指针在音符区内，等价于裁剪后的框）
+        note_boxes.push(NoteBox { index: i, hold, head, full });
         // **选区成员一律描边**（不是只有锚亮）：多选之后"选了几个"必须一眼看得见。
         // 锚用实线白框、其余成员用稍细的浅框 —— 检查器显示的是锚，视觉上要能分辨。
         let in_sel = st.is_note_selected(i);
@@ -989,7 +1105,6 @@ pub fn draw(
                 egui::StrokeKind::Inside,
             );
         }
-        note_rects.push((i, r));
     }
 
     // ---- 右半：事件区（5 条轨道各一列）----
@@ -1130,16 +1245,10 @@ pub fn draw(
             return Hit::Axis;
         }
         if pos.x < mid_x {
-            // 音符区：取最近的音符（窗口内通常只有几十个）
-            let mut best: Option<(usize, f32)> = None;
-            for (i, n) in line.notes.iter().enumerate() {
-                let y = y_of(n.time_beat(&st.chart.tmap));
-                let d = (x_of_lane(n.lane_x) - pos.x).abs().max((y - pos.y).abs());
-                if d < 10.0 && best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                    best = Some((i, d));
-                }
-            }
-            return best.map(|(i, _)| Hit::Note(i)).unwrap_or(Hit::Pane);
+            // 音符区：**以选择框为准**（`note_hit` 里写着优先级：非 hold > hold、锚优先、后画的优先）
+            return note_hit(&note_boxes, pos, st.selected_note())
+                .map(Hit::Note)
+                .unwrap_or(Hit::Pane);
         }
         // 事件区：命中列 → 命中块（优先头/尾把手）
         let k = (((pos.x - ev_pane.min.x) / col_w).floor() as usize).min(lanes - 1);
@@ -1573,7 +1682,7 @@ pub fn draw(
             let b = egui::Rect::from_two_pos(start, ptr.unwrap_or(start));
             match kind {
                 SelKind::Notes => {
-                    actions.push(OverlayAction::SelectNotes(box_hits(&note_rects, b)));
+                    actions.push(OverlayAction::SelectNotes(note_box_hits(&note_boxes, b)));
                 }
                 SelKind::Events => {
                     let rects: Vec<(usize, egui::Rect)> =
@@ -1626,6 +1735,19 @@ pub fn draw(
             }
         }
     }
+
+    // ---- 回执：锚音符所在的重叠组（视图状态；不进文档）----
+    //
+    // 只在"选中的是音符"时算：事件选中时锚音符会**保留**（切回去还是那一个），
+    // 但那时不该显示音符的重叠组 —— 与属性编辑器"只显示选中那一半"是同一条口径。
+    let note_stack = if st.sel_kind() == Some(SelKind::Notes) {
+        st.selected_note()
+            .map(|a| overlap_group(&note_boxes, a))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    OverlayOut { note_stack }
 }
 
 
@@ -3111,5 +3233,110 @@ mod tests {
             cursors.contains(&egui::CursorIcon::ResizeVertical),
             "指针压到头/尾时应设为双头箭头；实际光标序列：{cursors:?}"
         );
+    }
+
+    // ---------------------------------------------------------------- 选择框（命中 / 遮挡）
+
+    fn nb(index: usize, hold: bool, cx: f32, cy: f32, len: f32) -> NoteBox {
+        let head = egui::Rect::from_center_size(
+            egui::pos2(cx, cy),
+            egui::vec2(NOTE_W, NOTE_ROW_H),
+        );
+        // 竖条从头部**向上**长（与屏幕坐标相反也一样，这里只要长度）
+        let full = if hold {
+            egui::Rect::from_min_max(egui::pos2(cx - NOTE_W * 0.5, cy), egui::pos2(cx + NOTE_W * 0.5, cy + len))
+        } else {
+            head
+        };
+        NoteBox { index, hold, head, full }
+    }
+
+    /// **hold 点身体也要能选中**（用户报的那条）；但**判定排在其它类型下面**。
+    #[test]
+    fn hold_body_is_clickable_and_loses_to_other_note_types() {
+        // 只有 hold：头部、身体中段、身体末端都该命中
+        let boxes = [nb(0, true, 100.0, 200.0, 80.0)];
+        for y in [200.0, 240.0, 279.0] {
+            assert_eq!(
+                note_hit(&boxes, egui::pos2(100.0, y), None),
+                Some(0),
+                "y={y} 落在 hold 的选择框里就该选中它"
+            );
+        }
+        assert_eq!(note_hit(&boxes, egui::pos2(100.0, 300.0), None), None, "框外不选");
+
+        // hold + 一个压在它身上的 tap：**tap 赢**（hold 判定在其它类型下方）
+        let boxes = [nb(0, true, 100.0, 200.0, 80.0), nb(1, false, 100.0, 240.0, 0.0)];
+        assert_eq!(note_hit(&boxes, egui::pos2(100.0, 240.0), None), Some(1));
+        // 反过来把 tap 放前面也一样（与遍历顺序无关）
+        let boxes = [nb(1, false, 100.0, 240.0, 0.0), nb(0, true, 100.0, 200.0, 80.0)];
+        assert_eq!(note_hit(&boxes, egui::pos2(100.0, 240.0), None), Some(1));
+        // 只有 hold 的那个位置仍然选 hold
+        assert_eq!(note_hit(&boxes, egui::pos2(100.0, 270.0), None), Some(0));
+    }
+
+    /// 完全重叠的两个音符：**锚优先**（点一下不换人），否则后画的优先；
+    /// 而**重叠组**把两个都列出来 —— 这是被盖住那个的唯一入口。
+    #[test]
+    fn fully_overlapping_notes_are_reachable_through_the_group() {
+        let boxes = [nb(3, false, 100.0, 200.0, 0.0), nb(7, false, 100.0, 200.0, 0.0)];
+        let p = egui::pos2(100.0, 200.0);
+        assert_eq!(note_hit(&boxes, p, None), Some(7), "没人被选中时后画的在上");
+        assert_eq!(note_hit(&boxes, p, Some(3)), Some(3), "锚优先：点自己身上不换人");
+        assert_eq!(note_hit(&boxes, p, Some(7)), Some(7));
+        // 组：两个都在（升序），含锚自己
+        assert_eq!(overlap_group(&boxes, 3), vec![3, 7]);
+        assert_eq!(overlap_group(&boxes, 7), vec![3, 7]);
+        // 单个音符：组里就剩它自己（用户口径）
+        assert_eq!(overlap_group(&boxes[..1], 3), vec![3]);
+    }
+
+    /// **遮挡只看头部**，而且要真的交叠：
+    /// · hold 的长身体不算"盖住"别人；
+    /// · 同一条线上不同时刻的两个音符（宽度相同、y 不交叠）不算互相遮挡。
+    #[test]
+    fn occlusion_uses_heads_only_and_needs_a_real_overlap() {
+        let hold = nb(0, true, 100.0, 100.0, 120.0); // 头部 y≈100，身体一直到 220
+        let tap_under = nb(1, false, 100.0, 180.0, 0.0); // 落在 hold 的身体里
+        assert!(!covers(&hold, &tap_under), "hold 的身体不算遮挡（只看头部）");
+        assert!(!covers(&tap_under, &hold), "反过来也不算被 hold 身体挡住");
+        assert_eq!(overlap_group(&[hold, tap_under], 0), vec![0], "组里只有它自己");
+        assert_eq!(overlap_group(&[hold, tap_under], 1), vec![1]);
+
+        // 同一 lane、拍差得远：交叠为空 ⇒ 不算覆盖（否则"同线必互相遮挡"就荒唐了）
+        let a = nb(0, false, 100.0, 100.0, 0.0);
+        let b = nb(1, false, 100.0, 400.0, 0.0);
+        assert!(!covers(&a, &b));
+        assert_eq!(overlap_group(&[a, b], 0), vec![0]);
+
+        // 部分交叠：交叠高度超过被盖者的一半 ⇒ 算覆盖
+        let c = nb(2, false, 100.0, 102.0, 0.0); // 与 a 相差 2px < 3.5px
+        assert!(covers(&a, &c));
+        assert_eq!(overlap_group(&[a, c], 0), vec![0, 2]);
+        // **"或"的另一面**（用户口径就是"长度**或**宽度"）：同一条线上只要 y 上有一点点交叠，
+        // 宽度方向就是整整 10px 都在对方框里 ⇒ 也算。宁可多列一行，也别漏掉真被盖住的那个。
+        let d = nb(3, false, 100.0, 106.0, 0.0); // 相差 6px：高度只交叠 1px
+        assert!(covers(&a, &d), "宽度方向整整 10px 被盖住 ⇒ 按「或」算覆盖");
+
+        // 斜着擦到一点（两个方向都不到一半）⇒ **不算**
+        let e = nb(4, false, 106.0, 104.0, 0.0); // x 交叠 4px ≤ 5、y 交叠 3px ≤ 3.5
+        assert!(!covers(&a, &e), "两个方向都不到一半 ⇒ 不是有效覆盖");
+        assert_eq!(overlap_group(&[a, e], 0), vec![0]);
+
+        // hold 盖 hold：同样只看头部（两个头叠在一起 ⇒ 互相算覆盖）
+        let h1 = nb(0, true, 50.0, 100.0, 60.0);
+        let h2 = nb(1, true, 50.0, 100.0, 30.0);
+        assert!(covers(&h1, &h2));
+        assert_eq!(overlap_group(&[h1, h2], 0), vec![0, 1]);
+    }
+
+    /// 框选：与单点命中用**同一份选择框**（hold 的整条竖条都算在内）
+    #[test]
+    fn box_select_uses_the_same_note_boxes() {
+        let boxes = [nb(0, true, 100.0, 200.0, 80.0), nb(1, false, 300.0, 200.0, 0.0)];
+        let sel = egui::Rect::from_min_max(egui::pos2(90.0, 230.0), egui::pos2(110.0, 260.0));
+        assert_eq!(note_box_hits(&boxes, sel), vec![0], "框在 hold 身体上也要选中它");
+        let sel2 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 50.0));
+        assert!(note_box_hits(&boxes, sel2).is_empty());
     }
 }

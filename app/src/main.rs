@@ -4293,7 +4293,15 @@ impl eframe::App for App {
             // 面板**只产出命令**（见 `inspector::inspector_ui` 的注释：施加命令的那几行曾经
             // 写在"调试工作区"分支里 ⇒ 其它工作区改什么都不生效）。拖动类控件用事务包住
             //（松手才 commit），所以"拖一次 = 一个撤销步"。
-            pending_edits.extend(inspector::inspector_ui(ui, &self.state, self.insp.as_mut()));
+            let ins_out = inspector::inspector_ui(ui, &self.state, self.insp.as_mut());
+            pending_edits.extend(ins_out.commands);
+            // 重叠组里点了某个音符 ⇒ 换选区（**视图**动作，不是文档命令）。
+            // 换完立刻重建快照：列表里的"← 当前"与下面那些字段必须当场对上，
+            // 否则点了没反应（下一帧才变的界面，用户会当成点空了）。
+            if let Some(i) = ins_out.select_note {
+                self.state.select_note(i);
+                self.insp = self.build_inspector();
+            }
             if self.ws == Workspace::Debug {
             ui.separator();
             ui.label("诊断（调试工作区）");
@@ -4498,7 +4506,7 @@ impl eframe::App for App {
             if self.overlay_visible {
                 let mut acts: Vec<OverlayAction> = Vec::new();
                 // 键门控只有一处：打字/模态期间不给面板用快捷键（与空格/H 同一口径）
-                overlay::draw(
+                let out = overlay::draw(
                     ui,
                     &self.state,
                     play_rect,
@@ -4507,6 +4515,13 @@ impl eframe::App for App {
                     &mut acts,
                 );
                 self.apply_overlay_actions(acts);
+                // 回执：锚音符的重叠组（按**本帧画出来的选择框**算的那一份）。
+                // 它是视图状态 —— 属性编辑器那一份列表读的就是它。
+                self.state.set_note_stack(out.note_stack);
+            } else {
+                // 叠加层不画（播放中 / 按住 H）⇒ 这一帧根本没有"选择框"可言，
+                // 重叠组随之清空：宁可列表消失，也别留一份与画面不符的旧数据。
+                self.state.set_note_stack(Vec::new());
             }
 
             // 对齐自检：用与着色器相同的映射公式，把同一批 RPE 坐标画成十字。

@@ -149,15 +149,28 @@ pub fn beat_triple_field(
     }
 }
 
-/// 画属性编辑器，返回**要发的命令**（空 = 这一帧没改动）。
+/// 属性编辑器这一帧的产物。
+///
+/// 两条通道分开，是因为**文档**与**选区**是两回事：
+/// · `commands`：要发的文档命令（面板只产出命令，施加由调用方做）；
+/// · `select_note`：**视图**动作 —— 在重叠组列表里点了某个音符，把选区换成它。
+///   选中不属于文档，所以它不走命令通道（与编辑区里点一下音符是同一条路）。
+#[derive(Default)]
+pub struct InspectorOut {
+    pub commands: Vec<serde_json::Value>,
+    pub select_note: Option<usize>,
+}
+
+/// 画属性编辑器，返回这一帧的产物（见 [`InspectorOut`]）。
 ///
 /// 只读 `st`（网格吸附/选中项）与快照 `insp`；命令怎么拼在 `opm_app::edit`（有单测）。
 pub fn inspector_ui(
     ui: &mut Ui,
     st: &EditorState,
     insp: Option<&mut Inspector>,
-) -> Vec<serde_json::Value> {
-    let mut ec: Vec<serde_json::Value> = Vec::new();
+) -> InspectorOut {
+    let mut out = InspectorOut::default();
+    let ec = &mut out.commands;
     match insp {
         Some(v) => {
             // ---- 判定线（当前线）：可编辑 ----
@@ -187,8 +200,18 @@ pub fn inspector_ui(
             }
             ui.monospace(format!("子音符 {}   事件 {} 条", v.notes, v.events));
 
+            // ---- 属性编辑器**分两半**：选中哪一类就只显示哪一半（用户口径）----
+            //
+            // 以前两边同时显示：锚是**跨类型保留**的（点了音符，事件锚还在），于是
+            // "事件 · moveX" 和 "音符 doc#N" 一起占着右栏、改错栏是常事。
+            // 现在只看**选区类型**（`SelKind`）—— 选区本身就"同时只有一类"（音符 xor 事件），
+            // 所以这两个分支天然互斥；锚仍然保留，切回去时还是那一条。
+            let sel = st.sel_kind();
+            let show_event = sel == Some(opm_app::state::SelKind::Events);
+            let show_note = sel == Some(opm_app::state::SelKind::Notes);
+
             // ---- 事件（当前轨道选中项）：可编辑 ----
-            if let Some(e) = &v.event_edit {
+            if let Some(e) = v.event_edit.as_ref().filter(|_| show_event) {
                 ui.separator();
                 ui.label(format!("事件 · {}", v.track.key()));
                 let track_key = v.track.key();
@@ -352,10 +375,47 @@ pub fn inspector_ui(
             }
 
             // ---- 音符（当前线选中项）：可编辑 ----
-            if let Some(n) = &v.note_edit {
+            if let Some(n) = v.note_edit.as_ref().filter(|_| show_note) {
                 ui.separator();
                 ui.label(format!("音符 doc#{}", v.note.as_ref().map(|x| x.doc_index).unwrap_or(0)));
                 let idx = v.note.as_ref().map(|x| x.doc_index).unwrap_or(0);
+                // ---- **重叠组**：完全重叠的音符在这里点开（用户口径）----
+                //
+                // 判据完全来自**编辑区的选择框**（`overlay::overlap_group`：交叠区在长或宽上
+                // 超过被盖者的一半；hold 只按头部算、判定排在其它类型下面）。这里只负责列出来 ——
+                // 编辑区里点一下只能选到"最上面"那个，被盖住的没有别的入口。
+                // 没有任何音符被盖住时，列表里就剩它自己一项。
+                // 行取自**活的** `st`（编辑区每帧刷新 `note_stack`）；快照只在广播/换选区时重建，
+                // 放进快照会永远慢一拍。
+                let stack = opm_app::view::note_stack_rows(st);
+                if !stack.is_empty() {
+                    ui.label(format!("重叠组（{}）", stack.len())).on_hover_text(
+                        "与这个音符**选择框有效覆盖**的音符：交叠区在长或宽上超过被盖住那个的一半。\n\
+                         · hold 只按**头部**算（长身体既不算盖住别人、也不算被盖住），且判定排在其它类型下面；\n\
+                         · hold 盖 hold 同样按这条判据；\n\
+                         · 点一行就把选区换成它（完全重叠时这是被盖住那个的唯一入口）。\n\
+                         这条机制只关乎**编辑区怎么选**，与谱面本身无关（不进文档）。",
+                    );
+                    for row in &stack {
+                        // 右栏很窄（约 190px）：行里只放"能分辨"的三件事，细节挂 hover。
+                        // 当前锚那一行由 `selectable_label` 自己高亮，不再占文字宽度写"← 当前"。
+                        let text = format!("#{} {} {:.3} 拍", row.doc_index, row.kind, row.beat);
+                        let r = ui
+                            .selectable_label(row.is_anchor, egui::RichText::new(text).monospace())
+                            .on_hover_text(format!(
+                                "doc#{} · {} · 判定 {:.3} 拍（{:.3} s）· laneX {:.1}{}",
+                                row.doc_index,
+                                row.kind,
+                                row.beat,
+                                st.chart.tmap.sec(row.beat),
+                                row.lane_x,
+                                if row.is_anchor { " · 就是当前这个" } else { "" }
+                            ));
+                        if r.clicked() && !row.is_anchor {
+                            out.select_note = Some(row.view_index);
+                        }
+                    }
+                }
                 let mut set = serde_json::Map::new();
                 let mut kind = n.kind.clone();
                 egui::ComboBox::from_id_salt("note_kind")
@@ -421,6 +481,15 @@ pub fn inspector_ui(
                         line_doc, idx, serde_json::Value::Object(set)));
                 }
             }
+            // 什么都没选（或选区处于"等下一帧"的中间态）：说明这里为什么是空的，
+            // 而不是留一片让人猜的空白。线属性在上面 —— 它永远属于当前这条线。
+            if sel.is_none() {
+                ui.separator();
+                ui.label("（选中音符或事件，这里显示对应的编辑器）").on_hover_text(
+                    "属性编辑器分两半：**音符** / **事件**。选区同时只有一类（框选按起点在哪半区定），\n\
+                     所以点到哪一类就编辑哪一类；另一半不会占着位置。",
+                );
+            }
             ui.separator();
             ui.label("此刻表演（事件求值）");
             ui.monospace(format!("moveX  {:>8.2}", v.perf.x));
@@ -463,7 +532,7 @@ pub fn inspector_ui(
             ui.label("（没有判定线）");
         }
     }
-    ec
+    out
 }
 
 #[cfg(test)]
@@ -578,7 +647,7 @@ mod tests {
 
 
     #[test]
-    fn inspector_draws_the_line_track_event_and_note() {
+    fn inspector_draws_the_line_props_and_only_the_selected_kinds_editor() {
         let (_c, st, mut insp) = sample();
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
@@ -588,31 +657,53 @@ mod tests {
             )),
             ..Default::default()
         };
+        let draw = |st: &state::EditorState, insp: &mut Inspector, cmds: &mut Vec<serde_json::Value>| {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                *cmds = inspector_ui(ui, st, Some(insp)).commands;
+            });
+            out.textures_delta.clear();
+            drawn_texts(&out).join("\n")
+        };
         let mut cmds = Vec::new();
-        let mut out = ctx.run_ui(raw, |ui| {
-            cmds = inspector_ui(ui, &st, Some(&mut insp));
-        });
-        out.textures_delta.clear();
-        let texts = drawn_texts(&out);
-        let joined = texts.join("\n");
+        let joined = draw(&st, &mut insp, &mut cmds);
         // 注意："属性编辑器" 这个标题留在调用点（`main.rs` 的面板包装里），不在本函数里
-        for want in [
-            "线名",
-            "isCover（遮挡音符）",
-            "事件 · moveX",
-            "音符 doc#0",
-            "此刻表演（事件求值）",
-        ] {
+        for want in ["线名", "isCover（遮挡音符）", "此刻表演（事件求值）"] {
             assert!(joined.contains(want), "没画出来 {want:?}；实际画了：\n{joined}");
         }
-        // tap 不该出现 hold 才有的结束拍输入框（`note_edit.end_beat` 为 None ⇒ 不画）
-        assert!(insp.note_edit.as_ref().unwrap().end_beat.is_none());
+        // `sample()` 最后点的是**事件** ⇒ 只有事件编辑器那一半
+        assert!(joined.contains("事件 · moveX"), "选中的是事件，事件编辑器该在：\n{joined}");
         assert!(
-            !joined.contains("结束拍"),
-            "tap 不该画 hold 的结束拍字段：\n{joined}"
+            !joined.contains("音符 doc#"),
+            "选中的是事件 ⇒ 音符编辑器**不该**同时占着右栏（用户口径：拆成两半，选中哪种显示哪种）：\n{joined}"
         );
-        // **没碰任何控件 ⇒ 一条命令都不发**（面板每帧乱发命令会让撤销栈爆炸）
+        assert!(!joined.contains("laneX"), "音符那一半的字段也不该露出来：\n{joined}");
+        // 锚仍然保留（切回音符时还是那一个），只是不显示 —— 这正是"留锚 ≠ 显示"的意思
+        assert!(insp.note_edit.is_some(), "锚还在");
         assert!(cmds.is_empty(), "没有交互却产出了命令：{cmds:?}");
+
+        // 反过来：只选音符 ⇒ 音符编辑器在、事件编辑器不在
+        let (c2, mut st2) = {
+            let mut c = EditCore::new();
+            let r = c.exec(&json!({"op":"add_note","line":0,"kind":"tap","startBeat":[1,4],"laneX":100.0}));
+            assert_eq!(r["ok"], json!(true), "{r}");
+            let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+            st.selected_line = 0;
+            st.select_note(0);
+            (c, st)
+        };
+        let mut insp2 = view::inspector_of(&st2, c2.doc()).expect("有选中的线");
+        let joined2 = draw(&st2, &mut insp2, &mut cmds);
+        assert!(joined2.contains("音符 doc#0"), "选中的是音符，音符编辑器该在：\n{joined2}");
+        assert!(!joined2.contains("事件 · "), "音符选中时不该出现事件编辑器：\n{joined2}");
+        assert!(!joined2.contains("就位目标"), "就位目标是事件那一半的：\n{joined2}");
+        // 选区清空 ⇒ 两半都不画，但要说明为什么是空的（不留让人猜的空白）
+        st2.clear_selection();
+        insp2 = view::inspector_of(&st2, c2.doc()).expect("有选中的线");
+        let joined3 = draw(&st2, &mut insp2, &mut cmds);
+        assert!(joined3.contains("选中音符或事件"), "空选区要说一句：\n{joined3}");
+        assert!(!joined3.contains("音符 doc#") && !joined3.contains("事件 · "), "{joined3}");
+        // tap 不该出现 hold 才有的结束拍输入框（`note_edit.end_exact` 为 None ⇒ 不画）
+        assert!(insp2.note_edit.is_none() || insp2.note_edit.as_ref().unwrap().end_exact.is_none());
     }
 
     /// 一帧里某个文本的中心点（按文字找控件矩形 —— 按钮/字段的矩形在 `inspector_ui` 内部，
@@ -671,7 +762,7 @@ mod tests {
             let mut raw = raw.clone();
             raw.events = events;
             let mut out = ctx.run_ui(raw, |ui| {
-                cmds.extend(inspector_ui(ui, &st, Some(&mut insp)));
+                cmds.extend(inspector_ui(ui, &st, Some(&mut insp)).commands);
             });
             out.textures_delta.clear();
             out
@@ -740,7 +831,7 @@ mod tests {
         };
         let mut cmds = Vec::new();
         let mut out = ctx.run_ui(raw, |ui| {
-            cmds = inspector_ui(ui, &st, None);
+            cmds = inspector_ui(ui, &st, None).commands;
         });
         out.textures_delta.clear();
         let joined = drawn_texts(&out).join("\n");
@@ -781,7 +872,7 @@ mod tests {
         };
         let mut cmds = Vec::new();
         let mut out = ctx.run_ui(raw, |ui| {
-            cmds = inspector_ui(ui, &st, Some(&mut insp));
+            cmds = inspector_ui(ui, &st, Some(&mut insp)).commands;
         });
         out.textures_delta.clear();
         let texts = drawn_texts(&out);
@@ -844,7 +935,7 @@ mod tests {
         };
         let mut cmds = Vec::new();
         let mut out = ctx.run_ui(raw, |ui| {
-            cmds = inspector_ui(ui, &st, Some(&mut insp));
+            cmds = inspector_ui(ui, &st, Some(&mut insp)).commands;
         });
         out.textures_delta.clear();
         let joined = drawn_texts(&out).join("\n");
@@ -863,5 +954,71 @@ mod tests {
         let note = &root["judgeLineList"][0]["notes"][0];
         assert_eq!(note["startTime"], json!([0, 2, 5]), "判定时刻要精确落在 2/5 拍：{text}");
         assert_eq!(note["endTime"], json!([1, 2, 3]), "释放时刻仍是 5/3 拍");
+    }
+
+    /// **重叠组列表**：列出被盖住的音符，点一行就把选区换成它。
+    ///
+    /// 选中是**视图**动作（不属于文档）⇒ 走 `InspectorOut::select_note`，不进命令列表。
+    /// 分组本身在编辑区算（`overlay::overlap_group`，那边有选择框几何，另有一组单测）；
+    /// 这条钉的是"列表画出来了吗、点得动吗"。
+    #[test]
+    fn the_overlap_group_lists_covered_notes_and_a_click_switches_the_anchor() {
+        let mut c = EditCore::new();
+        // 两个完全重叠的 tap（同一拍、同一 lane）——正是"点一下只能选到最上面那个"的场景
+        for _ in 0..2 {
+            let r = c.exec(&json!({"op":"add_note","line":0,"kind":"tap",
+                                   "startBeat":[2,1],"laneX":100.0}));
+            assert_eq!(r["ok"], json!(true), "{r}");
+        }
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.select_note(0);
+        // 编辑区每帧会把这一份喂进来（这里直接给，几何算法不在这条测试里）
+        st.set_note_stack(vec![0, 1]);
+        let mut insp = view::inspector_of(&st, c.doc()).expect("有选中的线");
+        let rows = view::note_stack_rows(&st);
+        assert_eq!(rows.len(), 2, "两个都在组里");
+        assert!(rows[0].is_anchor, "第一行是锚");
+        assert!(!rows[1].is_anchor);
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(360.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut sel: Option<usize> = None;
+        let mut frame = |events: Vec<egui::Event>, sel: &mut Option<usize>| {
+            let mut raw = raw.clone();
+            raw.events = events;
+            let mut o = ctx.run_ui(raw, |ui| {
+                let out = inspector_ui(ui, &st, Some(&mut insp));
+                if out.select_note.is_some() {
+                    *sel = out.select_note;
+                }
+            });
+            o.textures_delta.clear();
+            o
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![], &mut sel);
+        let out = frame(vec![], &mut sel);
+        let joined = drawn_texts(&out).join("\n");
+        assert!(joined.contains("重叠组（2）"), "列表头没画出来：\n{joined}");
+        assert!(joined.contains("#0 Tap") && joined.contains("#1 Tap"), "两行都要列出来：\n{joined}");
+        assert!(sel.is_none(), "没点不该换选区");
+
+        // 点**非锚那一行**（doc#1，视图下标 1 —— 锚是 #0）⇒ 换选区到它
+        let row = text_center(&out, "#1 Tap").expect("非锚那一行画出来了");
+        frame(vec![egui::Event::PointerMoved(row), click(row, true)], &mut sel);
+        frame(vec![click(row, false)], &mut sel);
+        assert_eq!(sel, Some(1), "点那一行要把选区换成它（视图下标 1）");
     }
 }

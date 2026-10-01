@@ -1111,6 +1111,18 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// **这一批选的是哪一类**（音符 xor 事件；空选区 = `None`）。
+    ///
+    /// 属性编辑器按它决定显示哪一半（用户口径：拆成音符/事件两个编辑器，选中哪种就显示哪种）。
+    pub fn kind(&self) -> Option<SelKind> {
+        if !self.notes.is_empty() {
+            Some(SelKind::Notes)
+        } else if !self.events.is_empty() {
+            Some(SelKind::Events)
+        } else {
+            None
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty() && self.events.is_empty()
     }
@@ -1149,8 +1161,10 @@ impl Selection {
 
     /// 用一批音符**替换**整个选区（框选音符；空集 = 清空）。锚取最小的那个。
     ///
-    /// **不碰事件那一类的锚**：选区同时只有一类，但"检查器显示哪一条事件"是另一件事 ——
-    /// 点了音符就把事件编辑器收起来，是用户没要求的退化（老的界面两边同时显示）。
+    /// **不碰事件那一类的锚**：选区同时只有一类，但"检查器该显示哪一条事件"是另一件事 ——
+    /// 锚留着，是为了"点回事件时还是刚才那一条"。**显示哪一半由 [`Selection::kind`] 决定**
+    /// （用户口径 2026-10-01：属性编辑器拆成音符/事件两个，选中哪种就只显示哪种）——
+    /// 留锚 ≠ 让另一边的编辑器占着位置。
     pub fn set_notes(&mut self, notes: impl IntoIterator<Item = usize>) {
         self.events.clear();
         self.notes = notes.into_iter().collect();
@@ -1266,6 +1280,12 @@ pub struct EditorState {
     /// 把音符区显示的 laneX 区间平移（`[off−675, off+675]`），用来查看/编辑**窗口外**的音符。
     /// 只影响编辑区怎么显示与吸附，不影响演奏区（预览永远显示真实窗口）。
     pub window_offset_x: f32,
+    /// **锚音符所在的重叠组**（视图下标，含锚自己，升序）。
+    ///
+    /// 由**编辑区每帧**算出来（`overlay::draw` 的回执）—— 只有那边有"本帧画出来的选择框"，
+    /// 而这条机制的依据正是那些框（用户口径："以编辑区 note 选择框为准"）。
+    /// **它属于界面状态**：不进文档、不影响保存，也不参与任何谱面语义。
+    pub note_stack: Vec<usize>,
     /// 边界外压暗的 alpha（**目标色彩空间下的名义值**）。
     /// 若渲染目标是 sRGB，混合发生在线性空间，同样的名义 alpha 观感会弱得多 ——
     /// 调用方用 [`crate::render::dim_alpha_for`] 按目标格式换算，保证 GUI 与无头出图观感一致。
@@ -1314,6 +1334,7 @@ impl EditorState {
             // "最细的线画明显"这件事只有在放得足够大时才真的有意义。
             overlay_beats: Self::DEFAULT_OVERLAY_BEATS,
             window_offset_x: 0.0,
+            note_stack: Vec::new(),
             boundary_dim: crate::render::DIM_ALPHA_DEFAULT,
             started: None,
             start_playhead: 0.0,
@@ -1360,7 +1381,11 @@ impl EditorState {
         &self.sel
     }
 
-    /// 锚音符（检查器/树/时间轴高亮的那一个）
+    /// **选区类型**（音符 / 事件 / 空）—— 属性编辑器按它决定显示哪一半
+    pub fn sel_kind(&self) -> Option<SelKind> {
+        self.sel.kind()
+    }
+    /// 锚音符（检查器/树/时间轴高亮的那一个；当前线里的下标）
     pub fn selected_note(&self) -> Option<usize> {
         self.sel.anchor_note()
     }
@@ -1409,6 +1434,14 @@ impl EditorState {
     /// 清空选区
     pub fn clear_selection(&mut self) {
         self.sel.clear();
+    }
+    /// 锚音符的重叠组（编辑区每帧算出来的那一份；见字段注释）
+    pub fn note_stack(&self) -> &[usize] {
+        &self.note_stack
+    }
+    /// 由编辑区回执更新重叠组（`main.rs` 在 `overlay::draw` 之后调）
+    pub fn set_note_stack(&mut self, stack: Vec<usize>) {
+        self.note_stack = stack;
     }
     /// **按文档下标**选中判定线；返回是否找到。
     ///

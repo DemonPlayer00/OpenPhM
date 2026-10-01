@@ -77,6 +77,21 @@ pub struct Inspector {
     pub note: Option<NoteView>,
 }
 
+/// 重叠组里的一行（属性编辑器那份列表用）
+#[derive(Clone, Debug)]
+pub struct NoteStackRow {
+    /// 视图下标（**选中用的就是它**：`select_note` 吃的是时间序下标）
+    pub view_index: usize,
+    /// 文档下标（命令用；显示也用）
+    pub doc_index: usize,
+    pub kind: &'static str,
+    /// 判定时刻（拍）
+    pub beat: f64,
+    pub lane_x: f32,
+    /// 是不是当前锚（列表里高亮它）
+    pub is_anchor: bool,
+}
+
 /// 「就位目标」草稿：块末那一刻线该在哪儿（x/y 是 RPE 单位、angle 是度、alpha 0–1）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TargetEdit {
@@ -251,6 +266,28 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         event,
         note,
     })
+}
+
+/// **重叠组的显示行**（属性编辑器那份列表用）。
+///
+/// 为什么是函数、不是快照里的字段：`note_stack` 由**编辑区每帧**按"本帧画出来的选择框"刷新，
+/// 而检查器快照只在广播/换选区时重建 —— 放进快照就会永远慢一拍（列表要等你再点一下才出现）。
+pub fn note_stack_rows(st: &EditorState) -> Vec<NoteStackRow> {
+    let Some(line) = st.selected() else {
+        return Vec::new();
+    };
+    st.note_stack()
+        .iter()
+        .filter_map(|i| line.notes.get(*i).map(|n| (*i, n)))
+        .map(|(view_index, n)| NoteStackRow {
+            view_index,
+            doc_index: n.doc_index,
+            kind: n.kind.label(),
+            beat: st.chart.tmap.beat(n.time),
+            lane_x: n.lane_x,
+            is_anchor: st.selected_note() == Some(view_index),
+        })
+        .collect()
 }
 
 #[cfg(test)]
