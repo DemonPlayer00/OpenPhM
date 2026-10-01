@@ -2677,8 +2677,8 @@ impl App {
     ///
     /// 用户口径（2026-10-01）：「只要画面没有需要更新的东西就停止发帧，包括所有页面」——
     /// 空闲不再是"每秒一帧心跳"，而是**一帧都不主动出**。这份判据同时管三件事：
-    /// 底栏那格显示 `IDLE` 还是数字、帧末要不要 `request_repaint`、
-    /// 以及"**为什么没进 IDLE**"的那个说法（`ui_stats.busy` / 调试工作区的底栏）。
+    /// 帧末要不要 `request_repaint`、以及"**为什么还在出帧**"的那个说法
+    /// （`ui_stats.busy` / 调试工作区的底栏；底栏那格的字现在**只显示帧率**，不显示状态词）。
     /// **判据里没有一项是"为了刷新某个读数"**（那正是要防的：控件自己变成心跳源）。
     ///
     /// 能把它叫醒的外因（不是心跳，所以不在这里）：输入事件、EditCore 广播（唤醒器）、
@@ -2686,7 +2686,7 @@ impl App {
     fn busy_reason(&self, ctx: &egui::Context) -> Option<&'static str> {
         // `egui_is_using_pointer()` 读的是 egui 的**交互记忆**（`potential_click_id`/`potential_drag_id`）：
         // 万一那面记忆与真实按键不一致（丢了一次 release 事件、按下之后窗口被抢了焦点…），
-        // 它就会一直为真 ⇒ 永远进不了 IDLE。所以再核一眼**真实按键状态**——
+        // 它就会一直为真 ⇒ 界面永远满帧重绘（"空闲停下"再也发生不了）。所以再核一眼**真实按键状态**——
         // 一个键都没按着，就不算"正在拖拽"（这一条专治"旗帜和事实不一致"）。
         let using_pointer = ctx.egui_is_using_pointer() && ctx.input(|i| i.pointer.any_down());
         busy_reason_of(BusyFlags {
@@ -2868,9 +2868,9 @@ impl App {
         };
         let mut s = self.stats.lock().unwrap();
         s.frames = self.frames as u64;
-        // 底栏那格此刻的字（`Some` 才有；空闲时是 "IDLE"）—— 外面据此核实"空闲到底显示什么"
+        // 底栏那格此刻的字（`Some` 才有，永远是一个帧率；空闲时它**停住不变**）
         s.fps_text = self.fps.text().unwrap_or("").to_owned();
-        // **为什么没进 IDLE**（空串 = 没活、就该是 IDLE）。用户报"手动测试里进不去"时，
+        // **为什么还在出帧**（空串 = 没活、就该停下）。用户报"手动测试里停不下来"时，
         // 这一个字段就能把责任指到具体哪一条（播放中 / 等广播 / 补音符位置 / 欠帧 / …）。
         s.busy = self.busy_reason(&ctx).unwrap_or("").to_owned();
         s.broadcasts = self.applied_broadcasts;
@@ -3881,14 +3881,6 @@ impl eframe::App for App {
                     self.adapter,
                 )
             });
-            // ---- 底栏那格的字：**画之前就定下来** ----
-            //
-            // `set_sleeping` 只是换文本（屏幕内容本来就该更新），**不产生任何一帧**；
-            // 反过来，如果等帧末才改成 IDLE，屏幕会永远留着睡前的数字（屏幕只在出帧时才变），
-            // 而要补一帧去改它，就等于让指示器自己发帧（用户口径：fps 控件更新不能影响总体帧）。
-            let busy_here = self.busy(&ctx);
-            self.fps.set_sleeping(!busy_here && self.args.idle_fps <= 0.0);
-
             let mut view = statusbar::StatusView {
                 playhead: self.state.playhead,
                 beat: self.state.chart.tmap.beat(self.state.playhead),
@@ -4658,7 +4650,10 @@ impl eframe::App for App {
         // 底栏的 IDLE 是**画之前**就写好的，所以这里再也不需要"补一帧去改字"。
         let busy = self.busy(&ctx);
         let sleeping = !busy && self.args.idle_fps <= 0.0;
-        self.fps.note_frame(now, delta_ms);
+        // 空闲的边界都交给帧率表自己处理（`note_frame(.., idle)`）：
+        // 睡下那一帧**强制发布**一个真实读数（屏幕要冻住了，不能留空格），
+        // 之后空闲帧不记账，醒来第一帧换新数。
+        self.fps.note_frame(now, delta_ms, sleeping);
 
         if sleeping {
             // 睡下之后不会再出帧 ⇒ 把统计**强制**写一次，否则外面读到的 playing/pending 是旧值
