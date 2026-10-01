@@ -2658,6 +2658,30 @@ mod tests {
         assert_eq!(c.revision(), rev_before, "查询不该改文档");
     }
 
+    /// **失败的命令既不推进 revision、也不广播** —— GUI 的"等广播"旗子就是靠这条判断该不该立。
+    ///
+    /// 为什么值得钉住：`App::dispatch` 用"revision 有没有推进"来决定要不要进入"等广播"态，
+    /// 而那面旗算**工作态**（`busy_reason_of`）。早先它无条件立旗 ⇒ 只要有一条失败的面板命令
+    /// （检查器提交非法值、拖动被拒、删除越界……），旗子就永远摘不掉 ⇒ 界面永远满帧重绘、
+    /// **再也进不了 IDLE**（用户 2026-10-01 报的"手动测试里无论如何都不会进入 IDLE"）。
+    #[test]
+    fn a_failed_command_neither_bumps_revision_nor_broadcasts() {
+        let mut c = EditCore::new();
+        let sub = c.subscribe(TopicFilter::all());
+        let rev_before = c.revision();
+        // 越界删除：一定失败
+        let resp = c.exec(&json!({"op":"del_note","line":0,"index":9999999}));
+        assert_eq!(resp["ok"], json!(false), "越界删除应当失败：{resp}");
+        assert_eq!(c.revision(), rev_before, "失败的命令不该推进 revision");
+        assert!(sub.rx.try_recv().is_err(), "失败的命令不该广播");
+        // 对照：成功的命令**必须**推进 revision 并广播（否则"等广播"就永远等不到）
+        let resp = c.exec(&json!({"op":"add_note","line":0,"kind":"tap","startBeat":[4,1],"laneX":0.0}));
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        assert!(c.revision() > rev_before, "成功的命令要推进 revision");
+        let b = sub.rx.try_recv().expect("成功的命令要广播");
+        assert!(b.revision > rev_before, "{b:?}");
+    }
+
     /// 反过来：**普通广播仍然要过过滤器**（全量话题只用在"不知道变了什么"的时候）
     #[test]
     fn ordinary_broadcasts_still_respect_topic_filters() {

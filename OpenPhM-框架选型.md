@@ -4653,3 +4653,73 @@ socket 上的消息照旧派发：
 - fps 单测 8 条（改写为 `set_sleeping` + `note_frame` 两个入口；新增"换 IDLE 不需要任何一帧"这条断言）；
   lib 229 + bin 40 + 各集成套件全绿；4 套配置 0 warning；
 - 上表来自 `--control` 读 `ui_stats`（含新增的 `fps_text`）、`OPM_IDLE_TRACE=1` 逐帧原因、以及 `--shot` 截图比对哈希。
+
+---
+
+## 7.81 「手动测试里无论如何都不会进入 IDLE」：一面**摘不掉的**"等广播"旗（用户报）（2026-10-01）
+
+用户原话：「空闲机制效果有问题：你的测试中无论如何显示FPS为IDLE，我的手动测试中无论如何都不会进入IDLE」。
+这条差异本身就是线索：IDLE 只在**没有任何一条"忙"的判据成立**时出现（§7.80），
+所以"无论如何都不进"只能是**某一条判据被永久地挂住了**。查下来有一条真的会：
+
+### 根因：失败的面板命令把 `pending_dispatch` 立死
+
+`App::dispatch`（GUI 面板发命令的唯一入口）过去**无条件**立"等广播"这面旗：
+
+```rust
+self.pending_dispatch = Some(started);   // 旧代码：命令已受理，界面还停在旧状态
+```
+
+而它只由**广播到达**时摘掉（`pump_broadcasts`）。问题是**失败的命令一条广播都不发** ——
+`core::exec` 里 `Err` 分支只回滚自己那几条改动（不推进 `revision`、不广播，见那里的注释与
+`a_failed_command_neither_bumps_revision_nor_broadcasts` 这条测试）。于是：
+
+> 只要有**一条**失败的面板命令（检查器里提交一个非法值、拖动被拒、删除越界、命令参数坏掉……），
+> 这面旗就**永远挂在那儿** ⇒ `busy_reason_of` 一直返回"命令已交出，等广播" ⇒
+> **界面永远满帧重绘、永远不进 IDLE** —— 而且此后不管做什么都一样（"无论如何"）。
+
+这条也回头解释了用户更早的那个问题（"为什么我没看到空闲时 fps 变成 1"）：同一个旗子在旧口径里
+同样算工作态。
+
+**修法**：立旗之前先看"这批命令到底会不会有广播回来" —— 成功才推进 `revision`、才广播，
+所以判据就是 **`revision` 有没有推进**（在同一个锁内前后各读一次）：
+
+```rust
+let before = c.revision();
+let (resps, failed) = c.exec_batch(cmds);
+let will_broadcast = c.revision() != before;
+...
+self.pending_dispatch = will_broadcast.then_some(started);
+```
+
+**兜底**：广播也可能**丢**（订阅缓冲溢出之类）。所以再加一条时间上限 ——
+`PENDING_TIMEOUT = 1 s`（正常一帧内就落地，实测 p50 4.56 ms），超过就当它没来过（延迟照旧记一笔）。
+"等广播"这面旗算工作态，挂着不摘就再也进不了 IDLE，不能让它无限期挂着。
+
+### 顺带加固的一条：交互记忆与真实按键不一致
+
+`egui_is_using_pointer()` 读的是 egui 的**交互记忆**（`potential_click_id` / `potential_drag_id`），
+不是"现在有没有键按着"。万一那面记忆与事实不一致（丢了一次 release、按下之后窗口被抢焦点……），
+它就会一直为真 ⇒ 同样永远进不了 IDLE。现在两者**都要成立**才算"正在拖拽"：
+
+```rust
+let using_pointer = ctx.egui_is_using_pointer() && ctx.input(|i| i.pointer.any_down());
+```
+
+### 让"为什么没进 IDLE"看得见（这次的另一半工作）
+
+用户报障时只有一个"永远显示 fps"的现象，而判据有八条 —— 没有说法就只能猜。所以：
+
+- `busy_reason_of(BusyFlags)` 是**纯函数**（有单测：每条旗子单独成立时都说得出自己；逐条清掉能走到 `None`），
+  `App::busy_reason()` 只负责把这一刻的旗子凑齐；
+- **`ui_stats.busy`**：`opm-ctl --attach … --cmd '{"op":"ui_stats"}'` 直接读到
+  `""`（没活）/`播放中`/`命令已交出，等广播`/`音符位置还在补`/`欠着按帧号的活（自截屏/按键注入/关窗）`……
+- **调试工作区的底栏**也印一句 `忙因 X`（不用开控制通道也能看）。
+
+### 验收
+
+- 新增测试：`core::tests::a_failed_command_neither_bumps_revision_nor_broadcasts`（失败不推进 revision、不广播；
+  成功必须推进并广播 —— 这正是新判据赖以成立的不变量）、`busy_tests` 两条（判据纯函数）；
+- 脚本化"手动会话"实测（`add/set/del` 音符与事件、undo/redo、失败命令、play/pause）：
+  每一步之后都回到 `忙因="" 底栏=IDLE`（帧数冻住），只有**真的**在按住鼠标/播放时才是 `播放中` / `正在按住/拖拽`；
+- lib 230 + bin 42 + 各集成套件全绿；4 套配置 0 warning。

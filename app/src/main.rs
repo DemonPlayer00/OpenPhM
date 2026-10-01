@@ -121,6 +121,10 @@ const LIST_ROWS_MAX_AGE: u64 = 30;
 /// 没必要每帧排一次序、抢几次锁（见 `App::publish_stats`）。
 const STATS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// "等广播"这面旗最多挂多久（兜底）。正常情况下一帧内就落地（实测 p50 4.56 ms）；
+/// 超过这个数还挂着，只可能是广播丢了 —— 那就别让它把空闲策略永远堵死。
+const PENDING_TIMEOUT: Duration = Duration::from_millis(1000);
+
 /// 编辑期把文档快照写回解压缓存的**最短间隔**（见 `App::maybe_snapshot`）。
 ///
 /// 2 秒是个取舍：被强杀时最多只丢两秒的操作，而写的是**谱面 JSON**（几十 KB 级，资源不动），
@@ -1294,16 +1298,26 @@ impl App {
     /// 这就是"向 editcore 发送更新后等待 update 广播"的字面实现。
     fn dispatch(&mut self, cmds: &[serde_json::Value]) {
         let started = Instant::now();
-        let (resps, _failed) = {
+        let (resps, _failed, will_broadcast) = {
             let mut c = self.core.lock().unwrap();
-            c.exec_batch(cmds)
+            let before = c.revision();
+            let (resps, failed) = c.exec_batch(cmds);
+            // **这批命令会不会有广播回来**：成功的命令才推进 revision 并广播（`core::exec`）；
+            // 失败的命令只回滚自己 —— 一条广播都不发（见那里的注释）。
+            (resps, failed, c.revision() != before)
         };
         for resp in &resps {
             let ok = resp.get("ok").and_then(|v| v.as_bool()) == Some(true);
             self.console_log.push((ok, cmd::response_line(resp)));
         }
-        // 命令已受理，但界面还停在旧状态：等广播
-        self.pending_dispatch = Some(started);
+        // 命令已受理，但界面还停在旧状态：等广播。
+        //
+        // **只有"真的会有广播回来"才立这面旗**：它算工作态（`busy_reason_of`），
+        // 而立了却永远等不到广播 ⇒ 那面旗永远摘不掉 ⇒ **再也进不了 IDLE**、一直满帧重绘。
+        // 用户 2026-10-01 报的"手动测试里无论如何都不会进入 IDLE"就是这条：
+        // 只要有**一条失败的面板命令**（检查器提交非法值、拖动被拒、删除越界…），
+        // 旧代码就把旗立死在那儿。失败的命令不发广播，所以这里按 revision 是否推进来判断。
+        self.pending_dispatch = will_broadcast.then_some(started);
     }
 
     /// 施加编辑区叠加层产出的动作（面板本身不碰数据）
@@ -2650,24 +2664,37 @@ impl App {
         self.key_auto.first().is_some_and(|(n, _)| u64::from(self.frames) < u64::from(*n))
     }
 
-    /// **这一帧还有活要干吗**（"要不要继续发帧"的**唯一**判据）。
+    /// **这一帧还有活要干吗**；有的话说出**是什么活**（第一个说得清的）。
     ///
     /// 用户口径（2026-10-01）：「只要画面没有需要更新的东西就停止发帧，包括所有页面」——
-    /// 空闲不再是"每秒一帧心跳"，而是**一帧都不主动出**。这份判据同时管两件事：
-    /// 底栏那格显示 `IDLE` 还是数字、帧末要不要 `request_repaint`。
+    /// 空闲不再是"每秒一帧心跳"，而是**一帧都不主动出**。这份判据同时管三件事：
+    /// 底栏那格显示 `IDLE` 还是数字、帧末要不要 `request_repaint`、
+    /// 以及"**为什么没进 IDLE**"的那个说法（`ui_stats.busy` / 调试工作区的底栏）。
     /// **判据里没有一项是"为了刷新某个读数"**（那正是要防的：控件自己变成心跳源）。
     ///
     /// 能把它叫醒的外因（不是心跳，所以不在这里）：输入事件、EditCore 广播（唤醒器）、
     /// 缓存快照的截止时刻、音频/播放推进、以及"文字会过期"的显式 `request_repaint_after`。
+    fn busy_reason(&self, ctx: &egui::Context) -> Option<&'static str> {
+        // `egui_is_using_pointer()` 读的是 egui 的**交互记忆**（`potential_click_id`/`potential_drag_id`）：
+        // 万一那面记忆与真实按键不一致（丢了一次 release 事件、按下之后窗口被抢了焦点…），
+        // 它就会一直为真 ⇒ 永远进不了 IDLE。所以再核一眼**真实按键状态**——
+        // 一个键都没按着，就不算"正在拖拽"（这一条专治"旗帜和事实不一致"）。
+        let using_pointer = ctx.egui_is_using_pointer() && ctx.input(|i| i.pointer.any_down());
+        busy_reason_of(BusyFlags {
+            playing: self.state.playing,
+            using_pointer,
+            pending: self.pending_dispatch.is_some(),
+            dirty: self.dirty.any(),
+            floor_pending: self.state.floor_pending(),
+            layout_anim: self.pending_layout_anim,
+            frames_owed: self.frames_owed(),
+            bench: self.args.bench > 0 && self.frames < self.args.bench,
+        })
+    }
+
+    /// 只是"忙不忙"
     fn busy(&self, ctx: &egui::Context) -> bool {
-        self.state.playing                        // 播放中：墙钟/音频在推进
-            || ctx.egui_is_using_pointer()        // 正在按住/拖拽（**悬停不算**，见 README 的教训）
-            || self.pending_dispatch.is_some()    // 命令已交给 EditCore，等广播落地
-            || self.dirty.any()                   // 还有脏位没应用
-            || self.state.floor_pending() > 0     // 音符位置还在异步补
-            || self.pending_layout_anim           // 首帧布局还没稳
-            || self.frames_owed()                 // 按帧号排的活（自截屏 / 按键注入 / 关窗）
-            || (self.args.bench > 0 && self.frames < self.args.bench) // bench 活跃阶段
+        self.busy_reason(ctx).is_some()
     }
 
     /// 请求下一帧（启动页/阻断页的节奏策略）。**早退分支必须调它**，否则那些分支会停在半路。
@@ -2811,7 +2838,7 @@ impl App {
     /// 什么时候必须 `force`：**决定睡下的那一帧**。休眠之后不会再出帧，节流窗口会把
     /// "最后的真实状态"（playing / pending / 播放头…）永远留在旧值上 ——
     /// 外面用 `opm-ctl` 读 `ui_stats` 会以为它还在播（实测踩过：暂停之后 `playing` 仍是 true）。
-    fn publish_stats(&mut self, force: bool) {
+    fn publish_stats(&mut self, ctx: &egui::Context, force: bool) {
         let now = Instant::now();
         let fresh_broadcast = self.applied_broadcasts != self.stats_published_broadcasts;
         if !force && !fresh_broadcast && now.duration_since(self.stats_at) < STATS_MIN_INTERVAL {
@@ -2834,6 +2861,9 @@ impl App {
         s.frames = self.frames as u64;
         // 底栏那格此刻的字（`Some` 才有；空闲时是 "IDLE"）—— 外面据此核实"空闲到底显示什么"
         s.fps_text = self.fps.text().unwrap_or("").to_owned();
+        // **为什么没进 IDLE**（空串 = 没活、就该是 IDLE）。用户报"手动测试里进不去"时，
+        // 这一个字段就能把责任指到具体哪一条（播放中 / 等广播 / 补音符位置 / 欠帧 / …）。
+        s.busy = self.busy_reason(&ctx).unwrap_or("").to_owned();
         s.broadcasts = self.applied_broadcasts;
         s.builds_structure = self.builds_structure;
         s.builds_props = self.builds_props;
@@ -3121,7 +3151,7 @@ impl App {
     /// 少调一个就会出现"截屏永远超时 / 统计不动 / 页面卡住不再重绘"这类难查的毛病。
     fn finish_launch_frame(&mut self, ctx: &egui::Context) {
         self.handle_shot(ctx);
-        self.publish_stats(false);
+        self.publish_stats(&ctx, false);
         self.frames += 1;
         // 启动页同样守"没有需要更新的东西就不发帧"：不欠帧时，这一帧的**原因**值得记一笔
         // （`OPM_IDLE_TRACE=1`），因为此刻它只可能来自输入或 egui 自己的动画。
@@ -3825,10 +3855,12 @@ impl eframe::App for App {
                 let (lo, hi) = self.state.window_lane_range();
                 (self.state.window_offset_x, lo, hi)
             });
+            let busy_now = self.busy_reason(&ctx).unwrap_or("空闲");
             let diagnostics = (self.ws == Workspace::Debug).then(|| {
                 format!(
-                    "实例 {inst_count} 构建 {build_ms:.3} ms 帧 {} ｜ 广播 {} 重建 整表{}/属性{}/音符{}/轨道{} 跳过 整表{}/音符{}/轨道{} ｜ {}",
+                    "实例 {inst_count} 构建 {build_ms:.3} ms 帧 {} ｜ 忙因 {} ｜ 广播 {} 重建 整表{}/属性{}/音符{}/轨道{} 跳过 整表{}/音符{}/轨道{} ｜ {}",
                     self.frames,
+                    busy_now,
                     self.applied_broadcasts,
                     self.builds_structure,
                     self.builds_props,
@@ -4527,7 +4559,7 @@ impl eframe::App for App {
         }
 
         // ---- 帧计时与限帧 ----
-        self.publish_stats(false);
+        self.publish_stats(&ctx, false);
         let ui_ms = t_ui.elapsed().as_secs_f64() * 1000.0;
         self.ui_ms.push(ui_ms);
         self.build_ms.push(build_ms);
@@ -4605,6 +4637,13 @@ impl eframe::App for App {
         //
         // ---- 帧末：记账 + 节奏 ----
         //
+        // **兜底**：广播可能丢（订阅缓冲溢出之类）。"等广播"这面旗挂着就是工作态，
+        // 挂着不摘就再也进不了 IDLE —— 超过 `PENDING_TIMEOUT` 就当它没来过（延迟照旧记一笔）。
+        if let Some(t0) = self.pending_dispatch.filter(|t| t.elapsed() >= PENDING_TIMEOUT) {
+            self.pending_dispatch = None;
+            self.latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        //
         // 判据与底栏那格用的是同一份（`busy`）—— 这一帧里可能刚派了命令/改了状态，所以帧末再算一次。
         // `sleeping` 为真时**什么都不请求**：默认（`--idle-fps 0`）空闲就是"直接停下"。
         // 底栏的 IDLE 是**画之前**就写好的，所以这里再也不需要"补一帧去改字"。
@@ -4614,7 +4653,7 @@ impl eframe::App for App {
 
         if sleeping {
             // 睡下之后不会再出帧 ⇒ 把统计**强制**写一次，否则外面读到的 playing/pending 是旧值
-            self.publish_stats(true);
+            self.publish_stats(&ctx, true);
             // 这一帧是个"不该存在"的帧（没有需要更新的东西，却还是出了）—— 记下是谁要的
             self.trace_repaint_causes(&ctx);
         }
@@ -4642,6 +4681,52 @@ impl eframe::App for App {
             self.pending_layout_anim = false;
         }
     }
+}
+
+/// "这一帧有哪些活"的全部输入（纯数据 ⇒ [`busy_reason_of`] 可以单测）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BusyFlags {
+    playing: bool,
+    using_pointer: bool,
+    pending: bool,
+    dirty: bool,
+    floor_pending: usize,
+    layout_anim: bool,
+    frames_owed: bool,
+    bench: bool,
+}
+
+/// **要不要继续发帧**的判据（纯函数）：`None` = 没活 ⇒ 一帧都不要；`Some(说法)` = 有活，而且说得出是什么。
+///
+/// 为什么要把"说法"一起返回：用户报"手动测试里无论如何都不会进入 IDLE"时，
+/// 光看"忙/不忙"没法定位 —— 得能一眼看到**是哪一条**把它拦下的（`ui_stats.busy`）。
+/// 顺序按"最可能持续挂着"排：pending 在最后排查出过真 bug（见 `App::dispatch`）。
+fn busy_reason_of(f: BusyFlags) -> Option<&'static str> {
+    if f.playing {
+        return Some("播放中");
+    }
+    if f.using_pointer {
+        return Some("正在按住/拖拽");
+    }
+    if f.layout_anim {
+        return Some("首帧布局");
+    }
+    if f.frames_owed {
+        return Some("欠着按帧号的活（自截屏/按键注入/关窗）");
+    }
+    if f.bench {
+        return Some("bench 活跃阶段");
+    }
+    if f.floor_pending > 0 {
+        return Some("音符位置还在补");
+    }
+    if f.dirty {
+        return Some("还有脏位没应用");
+    }
+    if f.pending {
+        return Some("命令已交出，等广播");
+    }
+    None
 }
 
 /// 解析该用哪个音频文件：`--audio FILE` 优先，其次谱面 `meta.audio`（相对谱面目录），
@@ -4679,3 +4764,74 @@ fn resolve_audio(args: &Args, core: &core::SharedCore) -> Result<Option<audio::A
 
 
 
+
+/// 空闲判据的单测（纯函数 `busy_reason_of`）：**没有活就该停下**，有活要说得出是哪一条。
+///
+/// 为什么值得单测：用户报"手动测试里无论如何都不会进入 IDLE"时，全靠这一份判据加上
+/// `ui_stats.busy` 把责任指到具体一条；漏掉任何一条旗子，那种报障就只能靠猜。
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    #[test]
+    fn busy_reason_names_the_first_thing_that_keeps_us_drawing() {
+        assert_eq!(busy_reason_of(BusyFlags::default()), None, "全 false 就该停下");
+        let cases = [
+            (BusyFlags { playing: true, ..Default::default() }, "播放中"),
+            (BusyFlags { using_pointer: true, ..Default::default() }, "正在按住/拖拽"),
+            (BusyFlags { layout_anim: true, ..Default::default() }, "首帧布局"),
+            (
+                BusyFlags { frames_owed: true, ..Default::default() },
+                "欠着按帧号的活（自截屏/按键注入/关窗）",
+            ),
+            (BusyFlags { bench: true, ..Default::default() }, "bench 活跃阶段"),
+            (BusyFlags { floor_pending: 1, ..Default::default() }, "音符位置还在补"),
+            (BusyFlags { dirty: true, ..Default::default() }, "还有脏位没应用"),
+            (BusyFlags { pending: true, ..Default::default() }, "命令已交出，等广播"),
+        ];
+        for (f, want) in cases {
+            assert_eq!(busy_reason_of(f), Some(want), "{f:?}");
+        }
+        // 多条同时成立：报**第一条**（顺序即优先级）
+        let f = BusyFlags { playing: true, pending: true, dirty: true, ..Default::default() };
+        assert_eq!(busy_reason_of(f), Some("播放中"));
+    }
+
+    #[test]
+    fn turning_every_flag_off_one_by_one_reaches_idle() {
+        let mut f = BusyFlags {
+            playing: true,
+            using_pointer: true,
+            pending: true,
+            dirty: true,
+            floor_pending: 1,
+            layout_anim: true,
+            frames_owed: true,
+            bench: true,
+        };
+        // 逐条清掉，每清一条就必须换下一条说法；全清空 ⇒ None
+        for want in [
+            "播放中",
+            "正在按住/拖拽",
+            "首帧布局",
+            "欠着按帧号的活（自截屏/按键注入/关窗）",
+            "bench 活跃阶段",
+            "音符位置还在补",
+            "还有脏位没应用",
+            "命令已交出，等广播",
+        ] {
+            assert_eq!(busy_reason_of(f), Some(want), "剩下的活：{f:?}");
+            f = match want {
+                "播放中" => BusyFlags { playing: false, ..f },
+                "正在按住/拖拽" => BusyFlags { using_pointer: false, ..f },
+                "首帧布局" => BusyFlags { layout_anim: false, ..f },
+                "欠着按帧号的活（自截屏/按键注入/关窗）" => BusyFlags { frames_owed: false, ..f },
+                "bench 活跃阶段" => BusyFlags { bench: false, ..f },
+                "音符位置还在补" => BusyFlags { floor_pending: 0, ..f },
+                "还有脏位没应用" => BusyFlags { dirty: false, ..f },
+                _ => BusyFlags { pending: false, ..f },
+            };
+        }
+        assert_eq!(busy_reason_of(f), None, "全清干净了就该停下");
+    }
+}
