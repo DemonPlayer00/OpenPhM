@@ -77,6 +77,11 @@ pub struct Staged {
     pub fid: Fidelity,
     /// 保存目标（**继续编辑时写回哪儿**）：容器/裸文件 = 输入路径；崩溃缓存 = 元数据里记的原文件
     pub target: Option<PathBuf>,
+    /// 输入是**用户的文件夹**时给出那个目录（`None` = 输入是文件，或那是我们自己摊的缓存目录）。
+    ///
+    /// 光看保存目标分不出形态：文件夹形态下目标是目录里的 `opm.json`/`chart.json`，
+    /// 按扩展名判会被当成"一个 `.json` 单文件"。
+    pub folder: Option<PathBuf>,
     /// 缓存里有**未保存的改动**（只有"从崩溃缓存继续"会为真）
     pub unsaved: bool,
 }
@@ -449,6 +454,7 @@ impl EditCore {
                 format: codec::Format::parse(&fid.source).unwrap_or(codec::Format::Opm),
                 fid,
                 target: Some(path.to_path_buf()),
+                folder: None, // 裸 JSON 是文件，不是文件夹
                 unsaved: false,
             });
         }
@@ -472,6 +478,7 @@ impl EditCore {
             format,
             fid,
             target: Some(path.to_path_buf()),
+            folder: None, // 包（zip）不是文件夹
             unsaved: false,
         })
     }
@@ -541,6 +548,8 @@ impl EditCore {
             format,
             fid,
             target,
+            // 用户的工程文件夹（不是我们摊的缓存）⇒ 记下来：**第一次**保存就得回到"文件夹"形态
+            folder: (!ours).then(|| dir.to_path_buf()),
             unsaved,
         })
     }
@@ -617,7 +626,7 @@ impl EditCore {
     ///
     /// **换谱面时上一份解压目录立刻删掉** ⇒ 一个进程至多留一份（缓存是进程独占的）。
     pub fn load_staged(&mut self, staged: Staged) -> Result<codec::Fidelity, String> {
-        let Staged { dir, doc, assets, fid, format, target, unsaved } = staged;
+        let Staged { dir, doc, assets, fid, format, target, folder, unsaved } = staged;
         let origin = self.origin;
         self.doc = doc;
         self.assets = assets;
@@ -631,6 +640,19 @@ impl EditCore {
         self.asset_dir = dir;
         self.path = target;
         self.source_format = format;
+        if let Some(folder) = folder {
+            // 从**用户的文件夹**载入 ⇒ 形态当场定下来，**第一次**保存就写回同一个文件夹。
+            // 不这么做的后果实测过（2026-10-01）：`opm-ctl --file <opm 文件夹> --cmd … --save`
+            // 走 `Auto`、只看扩展名，把目录里的 `opm.json` 当成"一个 `.json` 单文件" ⇒
+            // 用 RPE 写回，**那份工程下次连打开都打不开**（`format 必须是 "opm"`）。
+            // 同时这也修掉"第一次 Ctrl+S 不刷新音乐/曲绘"（扩展名判不出文件夹形态）。
+            let shape = if format == codec::Format::Rpe {
+                SaveShape::RpeFolder
+            } else {
+                SaveShape::OpmFolder
+            };
+            self.last_save = Some((shape, folder));
+        }
         if self.source_format == codec::Format::Rpe {
             // 沿用来源文件的版本档位（`META.RPEVersion` 不可信，但作为"写回哪一档"的依据可用）
             let n = fid

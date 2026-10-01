@@ -4853,3 +4853,96 @@ if idle { let entering = !self.idle; self.idle = true; if !entering { return fal
 
 - fps 单测 9 条（新增 "空闲帧照常计数 ⇒ 滚动会刷新" 这条回归；心跳那一秒一个的帧也钉住了）；
   lib 231 + bin 42 + 各集成套件全绿；4 套配置 0 warning。
+
+---
+
+## 7.84 pez 怎么存「1/3」这类值：**时间是精确三元组、数值是浮点**；顺带修掉 6 处"默认值顶掉来源值"（用户："检查 pez 如何存储类似 1/3 的数值"）（2026-10-01）
+
+### 先量：12 份真实 pez 包（RPEVersion 140/160/170，Phira 公开谱面库，15 996 个音符）
+
+| 量 | 实测 |
+|---|---|
+| 时间字段总数（音符 start/end、事件 start/end、BPMList） | **269 033 处** |
+| 其中写成**整数三元组** `[整拍, 分子, 分母]`（语义 `b0 + b1/b2`） | **269 033（100%）** |
+| 写成浮点的 | **0** |
+| 分母含非 2 因子（二进制浮点表示不了） | **10.68%** —— 分母 3 有 11 073 处，还有 5/6/7/12/25/48/1000/3000… |
+| 浮点 token（978 117 个）中恰好是 f32 可表示的 | 96.28%（其余是别的工具留下的 f64 精度值） |
+| 「n/3」形状的浮点值 | 13 处，**全在事件的值字段**（`rotateEvents` 的 start/end）：`2.3333333333333335`、`0.3333333333333335`… |
+
+⇒ **1/3 只有作为"时间"才是精确的**：pez 里它就是一个三元组 `[0, 1, 3]`（`[25,2,3]` = 25⅔ 拍）。
+作为**数值**（positionX/size/speed/yOffset/visibleTime、事件的 start/end 值、bpm）pez 没有有理表示，
+写出来必然是 `0.3333333333333335`（f64）或 `0.33333334`（f32）——**没有第三种可能**。
+
+### 再查我们这边：时间没问题，**辅助字段在丢**
+
+拿真谱面跑 `pez → opm → pez`，发现导出把"来源里有、opm 没建模"的字段**一律用默认值顶掉**，
+而保真度报告还写着"原样写回"。六处同一个根因（先无条件写默认值 → foreign 循环"见键已存在就跳过"）：
+
+| 字段 | 修前 | 真实数据 |
+|---|---|---|
+| `BPMList[].startTime` | 无条件写浮点（`[78,1,2]` → `78.5`） | 19/19 **全是三元组** |
+| 根 `chartTime` | 写成"内容末端拍数"（88237.46 → **327.0**） | 11/12 有；40272~128027，**编辑器时长**（141 起才写，与音频时长/内容末端都对不上） |
+| 根 `multiScale`/`xybind`/`judgeLineGroup`/`multiLineString`/`timeTags` | 默认值覆盖（标量 0.334 → `[1,1]`、布尔 false → `[]`） | 12/12、10/12、12/12、12/12、3/12 有 |
+| 判定线 `father`/`rotateWithFather` | 覆盖成 `-1`/`false`（**嵌套结构被拍平**） | 63/505 条 `father != -1`、360/505 是 `true` |
+| 音符 `visibleTime` | 覆盖成 `999999.0` | 真有人写 `0.1`（79506，音符从"0.1 秒后可见"变成"永远可见"） |
+| 事件 `easingLeft`/`easingRight`/`linkgroup` | 覆盖成 `0`/`1`/`0` | 27 条 `easingLeft≠0`、99 条 `easingRight≠1`、10 条 `linkgroup=1` |
+
+**统一改成"来源优先"**：来源里有就原样写回，只有来源没有才补默认值；且**只补真实谱面里 12/12
+都在的字段**（根 `judgeLineGroup`/`multiLineString`/`multiScale`、判定线 `Group`/`Texture`/`father`、
+音符 `visibleTime`）；`chartTime`/`timeTags`/`xybind`/`rotateWithFather` 缺了就不写（真实谱面本来就常缺）。
+
+### 顺带修掉一个 1 ULP 漂移：`serde_json` 的 `float_roundtrip`
+
+79619 的 `chartTime` 从 `128027.70309200211` 出去变成 `128027.70309200212` —— 不是我们的算术，
+是 `serde_json` **默认**浮点解析偶尔差 1 ULP。开 `features = ["float_roundtrip"]` 后逐位一致。
+"原样写回"不能有这种漂移：一份谱面里 978k 个浮点，偶尔错一位是查不出来的。
+
+### 事件编辑器：拍改成 **【整拍数】 + 【分子】 / 【分母】**（用户给定的排布）
+
+检查器里事件的 `起`/`止` 原来是**一个浮点框**，写回还要按当前网格 `beat_json` 取整 ⇒
+用户编 `1/3` 会落到 `1/4`，或写文件时变成 `333333/1000000`。现在换成三个整数控件
+（`inspector::beat_triple_field`）：编出来的就是 `Beat::new(整拍×分母 + 分子, 分母)`，
+命令走新的 `edit::event_resize_command_exact`（发**既约**分数，不吸附、不过浮点），
+导出到 pez 直接是 `[整拍, 分子, 分母]`；显示取规范形（约分，整数部分 `div_euclid` ⇒ `-1/2` 写作 `-1 + 1/2`）。
+命令语言仍然只有 `[分子, 分母]` 一种拍形状（`cmd::parse_beat`）—— 三元组是**文件**的形状，不是命令的形状。
+
+### 验收（改完再量一遍）
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 12 份真实谱面 `pez→opm→pez`：六个根辅助字段 / 判定线 `father`·`rotateWithFather` / BPMList / 音符时间 | 128 处差异 | **0 处差异** |
+| 音符时间（15 996 个，按精确分数比） | 0 失配 | 0 失配 |
+| 残余：音符数值字段被 f32 收窄（positionX/size/speed/yOffset） | 2676 / 93 704（2.86%），最大相对误差 6e-8（≈1 个 f32 ULP） | 同上（**未改**，理由见下） |
+
+- 单测：codec 19 条（新增"编辑器辅助根字段原样写回""新建文档只补 12/12 的默认值"
+  "`father`/`rotateWithFather` 原样写回""BPMList `startTime` 是三元组"
+  "音符/事件的 `visibleTime`/`easingLeft` 不被默认值顶掉"）、bin 43 条
+  （新增"事件时间用三元组编辑"整条链：控件 → 命令 → 文档 → 导出 pez = `[0,1,3]`）。
+- 4 套配置 0 warning。
+
+**未做（说清楚）**：
+- 音符几何字段（`positionX`/`size`/`speed`/`yOffset`/`judgeArea`）在 opm 里是 **f32**，来源若是 f64
+  精度值会被收窄（2.86%、≤1 个 f32 ULP；RPE 文档里这些字段本身就是 `float`）。`bezierPoints` 同理
+  （`[f32; 4]`）。要逐位一致得把模型换成 f64 —— 那是模型级改动，本轮不动。
+- **未知的根字段**（六个辅助字段以外的新键）导入时会被丢掉（`Foreign` 只收那六个）；12 份真实谱面里
+  没出现过，暂不动。
+
+### 附带修掉：`--file <opm 文件夹> --cmd … --save` 会把工程写成 RPE JSON（做上面那组实验时踩到的）
+
+为了让截图里的事件真的落在 1/3 拍上，我用 `opm-ctl new --out demo` 造了一份谱面 → 加事件 → `--save`。
+**存完那份工程就打不开了**：`载入 demo 失败: format 必须是 "opm"（当前 None）` —— 目录里的
+`opm.json` 被写成了 RPE JSON（还能看到刚加进去的 `judgeLineGroup: ["Default"]`）。
+
+根因链：载入文件夹（`stage_folder`）把保存目标记成**目录里的谱面文件** `demo/opm.json`；
+同路径保存走 `SaveFormat::Auto` → `resolve` 只看**扩展名** → `opm.json` 只以 `.json` 结尾（不是
+`.opm.json`）⇒ 判成 `RpeSingle` ⇒ 按 RPE 写回同一个文件名。于是"RPE 进 RPE 出"这条规则，
+在**opm 文件夹**上把 opm 写成了 RPE。同一处也解释了"从文件夹打开的谱面，第一次 Ctrl+S 不刷新
+音乐/曲绘"（注释里承认了这个隐患，但只用 `last_save` 兜住第二次之后的保存）。
+
+修法：**形态在载入时就定下来，不猜**。`Staged` 增加 `folder: Option<PathBuf>`（输入是用户文件夹时
+给出那个目录；我们自己的解压缓存不算），`load_staged` 据此把 `last_save` 设成
+`(OpmFolder|RpeFolder, <目录>)` —— 第一次保存就写回同一形态、同一目录。
+回归测试 `a_folder_load_saves_back_to_the_same_folder_on_the_very_first_save`
+（opm/RPE 两种文件夹各跑一遍：载入 → 改一处 → `save(None)` → 必须还能按原格式读回来）。
+命令行复核：`new --out fresh` → `--file fresh --cmd add_line --save` → 文件仍是 `"format": "opm"`、
+`summary` 可读；RPE 文件夹那条 `info.yml` 也还在。

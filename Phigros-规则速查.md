@@ -349,13 +349,21 @@ p_k = p_{k−1} + v_{k−1} × (t_k − t_{k−1}) × 1.875 / BPM      (k ≥ 2)
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `BPMList` | JsonArray | `[{ bpm, startTime(beat) }]`，多 BPM 支持 |
+| `BPMList` | JsonArray | `[{ bpm, startTime(beat) }]`，多 BPM 支持。**`startTime` 与音符/事件同一形状**（三元组） |
 | `META` | JsonObject | `RPEVersion`(100~160)、`offset`(**毫秒**)、`name`、`id`(string)、`song`、`background`、`composer`、`charter`、`illustration`、`level` |
-| `chartTime` | double | 谱面编辑时长（秒），141 加入；模拟器不需要 |
-| `judgeLineGroup` | string[] | 判定线组；模拟器不需要 |
+| `chartTime` | double | **编辑器时长**，141 加入；量级是秒的千倍（12 份真实谱面实测 40272~128027，与音频时长、内容末端**都对不上**）——模拟器不需要，本项目只在来源里有它时原样写回 |
+| `judgeLineGroup` | string[] | 判定线组（真实谱面里都是 `["Default"]`）；模拟器不需要 |
 | `judgeLineList` | JsonArray | 判定线数组 |
 | `multiLineString` | string | 多线编辑选择串（如 `1:20`、`all`）；模拟器不需要 |
-| `multiScale` / `timeTags` / `xybind` | — | 编辑器辅助字段；模拟器不需要 |
+| `multiScale` | double | 标量（实测 0.107~1.0），**不是数组** |
+| `timeTags` / `xybind` | — | 编辑器辅助字段（`timeTags` 3/12、`xybind` 10/12 的谱面才有；`xybind` 是布尔） |
+
+**时间的存储形状（12 份 RPEVersion 140/160/170 真实谱面、269 033 处实测）**：
+音符/事件/BPMList 的时间**全是整数三元组** `[整拍, 分子, 分母] = b0 + b1/b2`（`[25,2,3]` = 25⅔），
+**0 个浮点**；其中 **10.68% 的分母含非 2 因子**（3/5/6/7/12/25/48/1000/3000…）——二进制浮点表示不了，
+所以三元组不是"可选写法"而是必需。而**数值**（`positionX`/`size`/`speed`/`yOffset`/`visibleTime`、
+事件的 `start`/`end`、`bpm`）是浮点、没有有理表示：`1/3` 在那里只能是 `0.3333333333333335`（f64）
+或 `0.33333334`（f32）。
 
 - `META.offset` 符号语义：负 → 音乐在谱面开始前 `-offset` ms 播放；正 → 谱面开始后 `offset` ms 播放。
 - RPE 1.5.0 ~ 1.6.0（不含 1.6.0）`RPEVersion` 固定写 `150`；1.6.1 固定写 `160`——**不能拿它当版本判据**。

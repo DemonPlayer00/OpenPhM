@@ -141,6 +141,10 @@ pub struct NoteEdit {
 pub struct EventEdit {
     pub start_beat: f64,
     pub end_beat: f64,
+    /// 头/尾的**精确有理拍**（事件编辑器按 `[整拍] + [分子] / [分母]` 三个整数编辑，
+    /// 不走浮点：1/3 这类拍在二进制浮点里留不住，而 pez 里它本来就是三元组）
+    pub start_exact: crate::doc::Beat,
+    pub end_exact: crate::doc::Beat,
     pub start_value: f64,
     pub end_value: f64,
     pub easing: String,
@@ -213,6 +217,8 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
         sv.map(|sv| EventEdit {
             start_beat: ev.start_beat,
             end_beat: ev.end_beat,
+            start_exact: ev2.start,
+            end_exact: ev2.end,
             start_value: sv,
             end_value: ev2.end_value.as_f64().unwrap_or(0.0),
             easing: ev.easing.clone(),

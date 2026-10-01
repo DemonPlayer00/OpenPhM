@@ -19,7 +19,10 @@ egui-wgpu = "0.36"
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`：**必须开**。默认的浮点解析偶尔会差 1 ULP（实测：谱面 79619 的
+# `"chartTime": 128027.70309200211` 读进来变成 f64 …332 而不是 …331，写回去成了
+# `128027.70309200212`）—— 一个"原样写回"的编辑器不能有这种漂移。
+serde_json = { version = "1", features = ["float_roundtrip"] }
 png = "0.18"
 pollster = "0.4"
 log = "0.4"

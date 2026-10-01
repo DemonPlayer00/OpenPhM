@@ -178,14 +178,27 @@ GUI 侧另有一条硬约束：**同一时刻只允许一个会话**（缓存根
 
 ### RPE 支持范围
 
-- 根：`BPMList`（时间三元组或浮点都吃）、`META`（`offset` 是**毫秒**；`song`→`audio`、
+- 根：`BPMList`（**读**：时间三元组或浮点都吃；**写**：默认三元组 `[整拍,分子,分母]`，只有
+  `RpeTarget{triple_time:false}` 才写浮点）、`META`（`offset` 是**毫秒**；`song`→`audio`、
   `illustration`→`illustrator`；`RPEVersion` 只作记录并保留）、`judgeLineList`；
-  `chartTime`/`judgeLineGroup`/`multiLineString` 等编辑器字段原样保留。
+  编辑器辅助字段（`chartTime`/`judgeLineGroup`/`multiLineString`/`multiScale`/`timeTags`/`xybind`
+  与判定线的 `father`/`rotateWithFather`/`Texture`/`Group`）**来源里有就原样写回**；
+  只有 `judgeLineGroup`/`multiLineString`/`multiScale`（真实谱面 12/12 都有）在**来源缺失时**补默认值，
+  `chartTime`/`timeTags`/`xybind`/`rotateWithFather` 缺了就不写（真实谱面本来就常缺）。
 - 音符：`type` 走 `spec/note-types.json`（**RPE 2=Hold、3=Flick**，与官谱相反）、
   `alpha` 0~255（**>255 不截断**）、`above`、`isFake`、`speed`、`size`→`widthScale`、`yOffset`、`judgeArea`。
-- 事件：5 条轨道 + 29 种 `easingType`（表来自 `spec/easing.json`）、`bezier`/`bezierPoints`；
-  时间写成**整数三元组** `[整拍,分子,分母]`（实测真实谱面 2591 个音符时间全是数组）。
+- 事件与时间：5 条轨道 + 29 种 `easingType`（表来自 `spec/easing.json`）、`bezier`/`bezierPoints`；
+  **音符、事件、BPMList 的时间一律写整数三元组** `[整拍,分子,分母]`（`beat = b0 + b1/b2`）。
+  实测 12 份真实谱面（RPEVersion 140/160/170）共 **269033 处时间全是三元组、0 个浮点**，
+  其中 **10.68% 的分母含非 2 因子**（3/5/6/7/12/25/48/1000/3000…）—— 二进制浮点根本表示不了，
+  所以三元组不是"可选写法"而是必需；而**数值**（`positionX`/`size`/`speed`/事件 `start`/`end` 值/
+  `bpm`）是浮点，没有有理表示（`1/3` 在那里就是 `0.3333333333333335`）。
+- 浮点解析开了 `serde_json` 的 `float_roundtrip`：默认解析偶尔差 1 ULP（实测真实谱面的
+  `chartTime` 128027.70309200211 → 写回 128027.70309200212），"原样写回"不能有这种漂移。
 - 目标版本档位可切换：`--rpe-version 150|160` 或 `RpeTarget{version}`（`META.RPEVersion` 不可信，只作记录）。
+- **保存形态跟着"载入的是什么"走**：从文件夹打开就写回那个文件夹（`OpmFolder`/`RpeFolder`），
+  从 `.opm`/`.pez` 打开就写回那个包，从裸 JSON 打开就写回那个文件。第一次保存也如此
+  （曾经只看扩展名：目录里的 `opm.json` 被判成"一个 `.json`"，`--save` 会把 opm 工程写成 RPE JSON）。
 
 ## 音频格式**wav / flac / mp3 / ogg-vorbis / m4a-aac / alac / adpcm**（symphonia 解码，识别不出时给明确原因）。
 查一个文件能不能用（不解码输出流、不需要音频设备、不开窗口）：

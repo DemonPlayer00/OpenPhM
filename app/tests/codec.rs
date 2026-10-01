@@ -216,7 +216,7 @@ fn rpe_roundtrip_preserves_modeled_data() {
     let root: Value = serde_json::from_str(&text).expect("导出的必须是合法 JSON");
     assert_eq!(root["META"]["RPEVersion"], json!(160));
     assert_eq!(root["META"]["offset"], json!(-35));
-    assert_eq!(root["BPMList"][1]["startTime"], json!(8.0));
+    assert_eq!(root["BPMList"][1]["startTime"], json!([8, 0, 1]), "8 拍写成三元组");
     // 事件时间写成三元组、音符写浮点（可查到的 RPE 约定）。
     // 注意下标：导入时给"首事件晚于拍 0"补了一条常量事件，所以原来的第一条现在排在第 2 位 ——
     // 按**值**去找（start == 200）而不是按固定下标，免得规范化的细节一变测试就假红。
@@ -458,38 +458,157 @@ fn load_into_broadcasts_all_topics() {
 }
 
 
-/// **RPE 导出的 `chartTime` 取"全部事件的最大终点"**，而不是"每条轨道起点最晚那条的终点"。
+/// **编辑器辅助根字段按来源原样写回**（`chartTime` / `multiScale` / `xybind` / …）。
 ///
-/// 后者曾是这个文件里的第二份实现（`rpe::chart_end`，只取 `list.last()`）：一条轨道上
-/// "起点最晚的事件"不一定是"结束最晚的事件"（长事件后面又放了一条短事件就会这样），
-/// 于是导出的 `chartTime` 比真实谱面短 —— 播放器按它截断，末尾的表演就没了。
+/// 这里曾经是"导出时先无条件写默认值，再跑 foreign 循环"，而那个循环见键已存在就跳过 ——
+/// 于是六个字段永远是默认值：`chartTime` 88237.46（编辑器时长）变 327.0（拍数）、
+/// `multiScale` 0.334（标量）变 `[1,1]`、`xybind` false 变 `[]`。
+/// 而导入侧写着"保留（不建模，但别丢）"、保真度报告写着"按原名写回" —— 代码与声明脱节。
+/// 真实数据（12 份 RPE 140/160/170 谱面）：`chartTime` 11/12 有、`judgeLineGroup` 全是
+/// `["Default"]`、`multiScale` 全是标量、`xybind` 是布尔。
 #[test]
-fn exported_chart_time_is_the_max_end_not_the_last_by_start() {
-    let mut doc = Document::default();
-    // 一条**长**事件在前，一条**短**的在后（起点更晚、终点更早）
-    let mut l = opm_app::doc::JudgeLine::default();
-    l.layers[0].move_x.push(opm_app::doc::Event::new(
-        opm_app::doc::Beat::zero(),
-        opm_app::doc::Beat::new(16, 1),
-        json!(0.0),
-        json!(100.0),
-        "linear",
-    ));
-    l.layers[0].move_x.push(opm_app::doc::Event::new(
-        opm_app::doc::Beat::new(4, 1),
-        opm_app::doc::Beat::new(6, 1),
-        json!(50.0),
-        json!(50.0),
-        "linear",
-    ));
-    doc.judge_lines.push(l);
-    assert_eq!(doc.chart_end(), opm_app::doc::Beat::new(16, 1), "文档口径就是最大终点");
+fn editor_helper_root_fields_are_written_back_verbatim() {
+    let mut src = messy_rpe();
+    let src = src.as_object_mut().unwrap();
+    src.insert("chartTime".into(), json!(88237.46398370003_f64));
+    src.insert("judgeLineGroup".into(), json!(["Default"]));
+    src.insert("multiLineString".into(), json!("4 5 6 7 8 9"));
+    src.insert("multiScale".into(), json!(0.334_f64));
+    src.insert("timeTags".into(), json!([{"name": "intro", "time": [2, 0, 1]}]));
+    src.insert("xybind".into(), json!(false));
 
+    let src = Value::Object(src.clone());
+    let (doc, _) = import(src.clone());
     let (text, _fid) = rpe::save_str(&doc, rpe::RpeTarget::default());
     let root: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        root["chartTime"],
-        json!(16.0_f64),
-        "chartTime 要跟 `Document::chart_end` 一致（实际 {text}）"
+    for k in [
+        "chartTime",
+        "judgeLineGroup",
+        "multiLineString",
+        "multiScale",
+        "timeTags",
+        "xybind",
+    ] {
+        assert_eq!(root[k], src[k], "`{k}` 必须原样写回（实际 {text}）");
+    }
+}
+
+/// **音符/事件里"来源有、opm 没建模"的字段同样不许被默认值顶掉**。
+///
+/// 与根字段是同一个 bug 的另一半：导出先写默认值，再跑 foreign 循环（那个循环"见键已存在
+/// 就跳过"）⇒ `visibleTime` 一律变 `999999.0`、`easingLeft/Right` 变 `0.0`/`1.0`、
+/// `linkgroup` 变 `0`，而保真度报告还写着"`easingLeft/Right` 原样写回"。
+/// 真实数据里这些值**确实不是**默认值：`visibleTime` 0.1、`easingLeft` 0.337095、
+/// `easingRight` 0.5773、`linkgroup` 1（12 份谱面统计）。
+#[test]
+fn note_and_event_foreign_fields_are_not_shadowed_by_defaults() {
+    let (doc, _) = import(messy_rpe());
+    let (text, _) = rpe::save_str(&doc, rpe::RpeTarget::default());
+    let root: Value = serde_json::from_str(&text).unwrap();
+    let notes = root["judgeLineList"][0]["notes"].as_array().unwrap();
+    let hit = notes
+        .iter()
+        .find(|n| n.get("visibleTime").and_then(|v| v.as_f64()) == Some(3.0))
+        .unwrap_or_else(|| panic!("fixture 里那个 visibleTime=3.0 的音符没了：{text}"));
+    assert_eq!(hit["hitsound"], json!("hit.wav"), "来源字段要与它一起留下");
+    let layers = root["judgeLineList"][0]["eventLayers"][0].as_object().unwrap();
+    let all: Vec<&Value> = layers
+        .iter()
+        .filter(|(k, _)| k.ends_with("Events"))
+        .flat_map(|(_, v)| v.as_array().unwrap().iter())
+        .collect();
+    let ev = all
+        .iter()
+        .find(|e| e.get("easingLeft").and_then(|v| v.as_f64()) == Some(0.25))
+        .unwrap_or_else(|| panic!("`easingLeft=0.25` 的那条事件没了：{text}"));
+    assert_eq!(ev["easingRight"], json!(0.75), "{ev}");
+    assert_eq!(ev["linkgroup"], json!(2), "{ev}");
+    // 而**来源没有**的时候，默认值照旧要补上（不然 RPE 读到的是缺字段）
+    let empty = opm_app::doc::Note::new(opm_app::doc::NoteKind::Tap, opm_app::doc::Beat::zero(), 0.0);
+    let mut d2 = Document::default();
+    d2.judge_lines[0].notes.push(empty);
+    let (text2, _) = rpe::save_str(&d2, rpe::RpeTarget::default());
+    let root2: Value = serde_json::from_str(&text2).unwrap();
+    assert_eq!(root2["judgeLineList"][0]["notes"][0]["visibleTime"], json!(999999.0));
+}
+
+/// 新建（或来源里没有）的文档：只补**真实谱面里 12/12 都在**的字段，其余不编。
+///
+/// `chartTime`（11/12）、`timeTags`（3/12）、`xybind`（10/12）在真实谱面里本来就会缺
+/// ⇒ RPE 容得下缺失，编一个出来反而是往文件里塞假数据（`chartTime` 尤其明显：
+/// 它是 RPE 编辑器的时长，141 起才写，量级是秒的千倍 —— 既不是内容末端也不是音频长度）。
+#[test]
+fn fresh_document_gets_real_shaped_defaults_and_invents_nothing_else() {
+    let doc = Document::default();
+    let (text, _fid) = rpe::save_str(&doc, rpe::RpeTarget::default());
+    let root: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(root["judgeLineGroup"], json!(["Default"]), "真实谱面里都是 [\"Default\"]");
+    assert_eq!(root["multiScale"], json!(1.0_f64), "真实谱面里是标量，不是 [1,1]");
+    assert_eq!(root["multiLineString"], json!(""));
+    for k in ["chartTime", "timeTags", "xybind"] {
+        assert!(root.get(k).is_none(), "`{k}` 编不出来就不写：{text}");
+    }
+}
+
+/// **判定线的 `father` / `rotateWithFather` 原样写回**（同样从"默认值顶掉来源值"修过来的）。
+///
+/// 真实数据：12 份谱面 505 条线里 63 条 `father != -1`（父子嵌套）、360 条 `rotateWithFather`
+/// 为 true。导出写 `-1`/`false` 再"跳过已有键"，等于把嵌套结构悄悄拍平 ——
+/// 而保真度报告里还写着"`father` 只是原样写回"。这条钉住它与声明一致。
+#[test]
+fn line_father_and_rotate_with_father_are_written_back() {
+    let mut src = messy_rpe();
+    let lines = src["judgeLineList"].as_array_mut().unwrap();
+    lines[0]["father"] = json!(24);
+    lines[0]["rotateWithFather"] = json!(true);
+    // 再加一条**平**的线：来源里 father = -1 也要原样写回（不能靠"默认值恰好也是 -1"蒙对）
+    let mut flat = lines[0].clone();
+    flat["father"] = json!(-1);
+    flat["rotateWithFather"] = json!(false);
+    lines.push(flat);
+    let (doc, _) = import(src);
+    let (text, _fid) = rpe::save_str(&doc, rpe::RpeTarget::default());
+    let root: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(root["judgeLineList"][0]["father"], json!(24), "{text}");
+    assert_eq!(root["judgeLineList"][0]["rotateWithFather"], json!(true));
+    assert_eq!(root["judgeLineList"][1]["father"], json!(-1));
+    assert_eq!(root["judgeLineList"][1]["rotateWithFather"], json!(false));
+}
+
+/// **BPM 换点与音符/事件同一形状**：`startTime` 是三元组 `[整拍, 分子, 分母]`。
+///
+/// 这里曾经无条件写浮点：`[78,1,2]` 出去变 `78.5`，`1/3` 拍变 `0.3333333333333333` ——
+/// BPM 换点落不到谱面作者写的位置上。真实数据：12 份谱面 19 个 BPM 条目**全是三元组**。
+#[test]
+fn bpm_start_time_is_a_triple_like_everything_else() {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![
+        opm_app::doc::BpmEntry {
+            start: opm_app::doc::Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        },
+        opm_app::doc::BpmEntry {
+            start: opm_app::doc::Beat::new(157, 2),
+            bpm: 180.0,
+            foreign: Default::default(),
+        },
+        opm_app::doc::BpmEntry {
+            start: opm_app::doc::Beat::new(1, 3),
+            bpm: 200.0,
+            foreign: Default::default(),
+        },
+    ];
+    let (text, _fid) = rpe::save_str(&doc, rpe::RpeTarget::default());
+    let root: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(root["BPMList"][0]["startTime"], json!([0, 0, 1]));
+    assert_eq!(root["BPMList"][1]["startTime"], json!([78, 1, 2]), "78.5 拍要写成 78 + 1/2");
+    assert_eq!(root["BPMList"][2]["startTime"], json!([0, 1, 3]), "1/3 拍要精确落在 1/3：{text}");
+    // 只有显式要求"只吃浮点"的工具才走浮点那条路
+    let (text2, _) = rpe::save_str(
+        &doc,
+        rpe::RpeTarget { triple_time: false, note_triple_time: false, ..Default::default() },
     );
+    let root2: Value = serde_json::from_str(&text2).unwrap();
+    assert_eq!(root2["BPMList"][1]["startTime"], json!(78.5));
 }

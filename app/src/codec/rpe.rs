@@ -690,7 +690,12 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
         .map(|e| {
             let mut o = Map::new();
             o.insert("bpm".to_owned(), num_value(e.bpm as f64));
-            o.insert("startTime".to_owned(), json!(bf(e.start)));
+            // BPM 表的 `startTime` 与音符/事件**同一形状**：真实谱面里它也是三元组
+            // （12 份 RPE 140/160/170 的谱面里 19 个 BPM 条目 **0 个**浮点）。
+            // 这里曾经无条件写浮点 —— 于是 `[78,1,2]` 出去变成 `78.5`，
+            // 而 1/3 拍这类值会退化成 `0.3333333333333333`（BPM 换点落不到谱面作者想要的位置）。
+            let st = if target.triple_time { beat_to_triple(e.start) } else { json!(bf(e.start)) };
+            o.insert("startTime".to_owned(), st);
             for (k, v) in &e.foreign {
                 o.insert(k.clone(), v.clone());
             }
@@ -699,20 +704,27 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
         .collect();
 
     // ---- 判定线 ----
-    // 谱面时长**用文档自己的那一份**（`Document::chart_end` = 全部音符与事件的 max）：
-    // 这里曾另有一份"取每条轨道最后一条事件"的计算，而"最后一条"按**起点**排序 ——
-    // 一旦某条轨道上"起点最晚的那条"不是"结束最晚的那条"，导出的 `chartTime` 就比真实谱面短。
-    let last_beat = doc.chart_end();
     let mut lines: Vec<Value> = Vec::with_capacity(doc.judge_lines.len());
     for (li, line) in doc.judge_lines.iter().enumerate() {
         let mut o = Map::new();
-        o.insert("Group".to_owned(), json!(0));
         o.insert("Name".to_owned(), json!(line.name));
-        o.insert("Texture".to_owned(), json!("line.png"));
         o.insert("zOrder".to_owned(), json!(line.z_order));
         o.insert("isCover".to_owned(), json!(if line.is_cover { 1 } else { 0 }));
-        o.insert("father".to_owned(), json!(-1));
-        o.insert("rotateWithFather".to_owned(), json!(false));
+        // 这几项 opm 没建模：**来源里有就原样写回**（导入时它们进了 `line.foreign`），
+        // 没有才补默认值。以前是先写默认值、再跑 foreign 循环，而那个循环"见键已存在就跳过"
+        // ⇒ 来源值被默认值顶掉：嵌套 `father`（12 份真实谱面 505 条线里 63 条不是 -1）
+        // 与 `rotateWithFather`（360 条是 true）就这么丢了，而保真度报告还写着"原样写回"。
+        // `Group`/`Texture`/`father` 是 505/505 都有的 ⇒ 补默认；`rotateWithFather` 只有
+        // 389/505 有（真实谱面里就能缺）⇒ 不编，来源没有就不写。
+        for (k, default) in [
+            ("Group", json!(0)),
+            ("Texture", json!("line.png")),
+            ("father", json!(-1)),
+        ] {
+            if !line.foreign.contains_key(k) {
+                o.insert(k.to_owned(), default);
+            }
+        }
         o.insert("bpmfactor".to_owned(), num_value(line.bpm_factor as f64));
 
         let mut layers: Vec<Value> = Vec::new();
@@ -769,19 +781,31 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
     let mut root = Map::new();
     root.insert("BPMList".to_owned(), Value::Array(bpm));
     root.insert("META".to_owned(), Value::Object(meta));
-    root.insert("chartTime".to_owned(), json!(bf(last_beat)));
-    root.insert("judgeLineGroup".to_owned(), json!([""]));
     root.insert("judgeLineList".to_owned(), Value::Array(lines));
-    root.insert("multiLineString".to_owned(), json!(""));
-    root.insert("multiScale".to_owned(), json!([1.0, 1.0]));
-    root.insert("timeTags".to_owned(), json!([]));
-    root.insert("xybind".to_owned(), json!([]));
+    // 编辑器辅助根字段（`chartTime`/`multiScale`/`xybind`…）：**来源里有就原样写回**。
+    // 它们导入时进了 `doc.foreign`，但下面那段 foreign 循环"见键已存在就跳过" ——
+    // 而这一版之前是先无条件写默认值，于是六个字段永远被默认值顶掉：
+    // `chartTime` 88237.46（编辑器时长）→ 327.0（拍数）、`multiScale` 0.334（标量）→ [1,1]、
+    // `xybind` false → []。导入侧写着"保留（不建模，但别丢）"，报告也写着"按原名写回"，
+    // 而实际全都丢了 —— 现在由来源决定，缺了才补默认值。
     for (k, v) in &doc.foreign {
-        if root.contains_key(k) {
-            continue;
+        if !root.contains_key(k) {
+            root.insert(k.clone(), v.clone());
         }
-        root.insert(k.clone(), v.clone());
     }
+    // 只给**真实谱面里 12/12 都在**的字段补默认值；`timeTags`（3/12）、`xybind`（10/12）、
+    // `chartTime`（11/12）**不编** —— 来源有就原样写回，没有就不写。
+    // 依据是"RPE 自己也会缺这些字段"，所以缺了它是安全的；编一个出来则是往里塞假数据。
+    for (k, default) in [
+        ("judgeLineGroup", json!(["Default"])),
+        ("multiLineString", json!("")),
+        ("multiScale", json!(1.0)),
+    ] {
+        root.entry(k.to_owned()).or_insert(default);
+    }
+    // `chartTime` 刻意**没有默认值**：它是 RPE 编辑器的时长（141 起才写，双精度、量级是
+    // 秒的千倍级），既不是内容末端也不是音频长度 —— 12 份真实谱面里 11 份有、1 份没有。
+    // 编不出来就别编：来源有就原样写回，新建的谱面不写这个字段（RPE 自己也这么干）。
     // 未建模的字段一律报告（不许"悄悄丢"）
     let mut unmodeled: Vec<String> = Vec::new();
     for (k, _) in &doc.foreign {
@@ -837,9 +861,20 @@ fn export_event(
             None => json!([0.0, 0.0, 1.0, 1.0]),
         },
     );
-    o.insert("easingLeft".to_owned(), json!(0.0));
-    o.insert("easingRight".to_owned(), json!(1.0));
-    o.insert("linkgroup".to_owned(), json!(0));
+    // `easingLeft`/`easingRight`/`linkgroup` opm v1 没建模（在 `e.foreign` 里）：
+    // **来源有就原样写回**，只有来源没有才补默认。它们不是"常量装饰"——
+    // 实测 12 份真实谱面里 `easingLeft` 有 27 条不是 0、`easingRight` 有 99 条不是 1
+    // （0.337095 / 0.5773 / 0.5…），`linkgroup` 有 10 条是 1；以前一律写默认值再"跳过已有键"，
+    // 等于把这些值按 0/1/0 覆盖掉，而报告还写着"`easingLeft/Right` 原样写回"。
+    for (k, default) in [
+        ("easingLeft", json!(0.0)),
+        ("easingRight", json!(1.0)),
+        ("linkgroup", json!(0)),
+    ] {
+        if !e.foreign.contains_key(k) {
+            o.insert(k.to_owned(), default);
+        }
+    }
     for (k, v) in &e.foreign {
         if o.contains_key(k) {
             continue;
@@ -871,7 +906,13 @@ fn export_note(n: &Note, target: RpeTarget, fid: &mut Fidelity) -> Value {
     o.insert("isFake".to_owned(), json!(if n.is_fake { 1 } else { 0 }));
     o.insert("speed".to_owned(), num_value(n.speed as f64));
     o.insert("size".to_owned(), num_value(n.width_scale as f64));
-    o.insert("visibleTime".to_owned(), json!(999999.0));
+    // `visibleTime` opm 没建模（它在 `n.foreign` 里）：**来源有就原样写回**。
+    // 这里曾经无条件写 999999.0 再"跳过已有键" —— 真实谱面里真有人写
+    // `"visibleTime": 0.1`（实测 79506 里就有一个），导出后变成 999999 = 音符可见时间从 0.1 秒
+    // 变成"永远可见"，而这一步连报告都不提。
+    if !n.foreign.contains_key("visibleTime") {
+        o.insert("visibleTime".to_owned(), json!(999999.0));
+    }
     o.insert("yOffset".to_owned(), num_value(n.y_offset as f64));
     if n.judge_area_scale != 1.0 {
         o.insert("judgeArea".to_owned(), json!(n.judge_area_scale));

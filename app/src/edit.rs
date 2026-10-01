@@ -68,6 +68,34 @@ pub fn event_resize_command(
     })
 }
 
+/// 事件头/尾 → `resize_event`，**精确有理拍**（事件编辑器的三元组控件走这条）。
+///
+/// 与上面那条的区别就是**不吸附、不经过浮点**：控件编出来的是 `【整拍】+【分子】/【分母】`，
+/// 这里直接算成既约分数 `[分子, 分母]` 交给命令层（命令语言只有这一种拍形状，见
+/// `cmd::parse_beat`）。走浮点那条在 1/3、1/6 这类拍上会先被舍入到最近的 f64、
+/// 再按网格取整 —— 用户明明按 1/3 编的，落到的却是别的位置。
+pub fn event_resize_command_exact(
+    st: &EditorState,
+    track: TrackId,
+    at: EventRef,
+    edge: crate::state::EventEdge,
+    beat: crate::doc::Beat,
+) -> Value {
+    let edge = match edge {
+        crate::state::EventEdge::Start => "start",
+        crate::state::EventEdge::End => "end",
+    };
+    json!({
+        "op": "resize_event",
+        "line": st.selected_doc_line(),
+        "layer": at.layer,
+        "track": track.key(),
+        "index": at.index,
+        "edge": edge,
+        "toBeat": [beat.n, beat.d],
+    })
+}
+
 /// 组拖动中的一条事件 → `set_event`：整块挪到 `[start, end]`（时长不变）。
 pub fn event_move_command(
     st: &EditorState,

@@ -91,6 +91,64 @@ pub fn text_field(ui: &mut Ui, key: &str, current: &str, width: f32) -> Option<S
     None
 }
 
+/// **拍的三元组编辑器**：`【整拍数】 + 【分子】 / 【分母】`（用户口径，与 RPE/pez 的存储形状一致）。
+///
+/// 为什么不是一个浮点框：opm 的拍是**精确有理数**，而 `1/3` 用 f64 存下来是
+/// `0.3333333333333333` —— 写回 pez 要么变成 `[0,333333,1000000]`（浮点噪声进文件），
+/// 要么被网格吸附到别的位置（用户编 1/3，落到 1/4）。三个整数控件没有这一步：
+/// 编出来的就是 `Beat::new(整拍 × 分母 + 分子, 分母)`，导出时按 `[整拍, 分子, 分母]` 原样落盘。
+///
+/// 显示的是**规范形**：`Beat` 已经约分，整数部分取 `div_euclid`、分子取 `rem_euclid`
+/// （所以 `-1/2` 显示成 `-1 + 1/2`，与 `codec::beat_to_triple` 写出去的三元组一致）。
+///
+/// 提交时机与 [`value_field`] 同一套（**回车/失焦**才写回，拖动实时）；判据是
+/// "三元组真的变了没有"，不用 `Response::changed()`（理由见 `value_field` 的注释）。
+pub fn beat_triple_field(
+    ui: &mut Ui,
+    key: &str,
+    label: &str,
+    beat: opm_app::doc::Beat,
+) -> Option<opm_app::doc::Beat> {
+    let (whole, num, den) = (beat.n.div_euclid(beat.d), beat.n.rem_euclid(beat.d), beat.d);
+    let (mut w, mut n, mut d) = (whole, num, den);
+    ui.push_id(("opm_insp_beat", key), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.add(
+                egui::DragValue::new(&mut w)
+                    .update_while_editing(false)
+                    .speed(1.0)
+                    .range(-1_000_000..=1_000_000),
+            );
+            ui.label("+");
+            ui.add(
+                egui::DragValue::new(&mut n)
+                    .update_while_editing(false)
+                    .speed(1.0)
+                    .range(0..=1_000_000),
+            );
+            ui.label("/");
+            ui.add(
+                egui::DragValue::new(&mut d)
+                    .update_while_editing(false)
+                    .speed(1.0)
+                    .range(1..=1_000_000),
+            );
+        })
+        .response
+        .on_hover_text(format!(
+            "拍 = 整拍数 + 分子/分母（现在是 {whole} + {num}/{den} = {:.4} 拍）\n\
+             三个整数分别编辑 —— 1/3 这类拍因此是精确的，导出到 RPE 就是 [整拍, 分子, 分母]",
+            beat.to_f64()
+        ));
+    });
+    if (w, n, d) != (whole, num, den) {
+        Some(opm_app::doc::Beat::new(w * d + n, d))
+    } else {
+        None
+    }
+}
+
 /// 画属性编辑器，返回**要发的命令**（空 = 这一帧没改动）。
 ///
 /// 只读 `st`（网格吸附/选中项）与快照 `insp`；命令怎么拼在 `opm_app::edit`（有单测）。
@@ -145,13 +203,23 @@ pub fn inspector_ui(
                     .and_then(|tv| tv.origin(idx))
                     .unwrap_or(opm_app::doc::EventRef::new(0, idx));
                 let mut changed = false;
-                let mut sb = e.start_beat;
-                let mut eb = e.end_beat;
                 let mut sv = e.start_value;
                 let mut ev = e.end_value;
                 let mut easing = e.easing.clone();
-                changed |= value_field(ui, &mut sb, "起 ", 0.05, Some(0.0..=1e6)).changed;
-                changed |= value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed;
+                // ---- 头/尾：**【整拍数】 + 【分子】 / 【分母】**（三个整数，不经过浮点）----
+                // 走 `event_resize_command_exact`：不发吸附过的浮点拍，直接发三元组。
+                for (key, label, edge, was) in [
+                    ("ev_start", "起 ", opm_app::state::EventEdge::Start, e.start_exact),
+                    ("ev_end", "止 ", opm_app::state::EventEdge::End, e.end_exact),
+                ] {
+                    if let Some(b) = beat_triple_field(ui, key, label, was) {
+                        if b.n != was.n || b.d != was.d {
+                            ec.push(opm_app::edit::event_resize_command_exact(
+                                st, v.track, at, edge, b,
+                            ));
+                        }
+                    }
+                }
                 changed |= value_field(ui, &mut sv, "值起 ", 0.5, None).changed;
                 changed |= value_field(ui, &mut ev, "值止 ", 0.5, None).changed;
                 // ---- 缓动选择：**五条轨道都一样**（流速也认缓动了 —— 缓动按"折线"实现，
@@ -192,16 +260,9 @@ pub fn inspector_ui(
                 }
                 if changed {
                     // 头尾改时间走 resize_event（**只改这一个事件**；它早先会同步邻块，
-                    // 用户明确否掉了那个语义，见 core.rs 的 `resize_event` 注释）；
+                    // 用户明确否掉了那个语义，见 core.rs 的 `resize_event` 注释）——
+                    // 但**在控件那里就发出去了**（三元组控件用精确有理拍，不经过这里的浮点比较）；
                     // 值/缓动走 set_event
-                    if (sb - e.start_beat).abs() > 1e-9 {
-                        ec.push(opm_app::edit::event_resize_command(
-                            &st, v.track, at, opm_app::state::EventEdge::Start, sb));
-                    }
-                    if (eb - e.end_beat).abs() > 1e-9 {
-                        ec.push(opm_app::edit::event_resize_command(
-                            &st, v.track, at, opm_app::state::EventEdge::End, eb));
-                    }
                     let mut set = serde_json::Map::new();
                     if (sv - e.start_value).abs() > 1e-9 {
                         set.insert("startValue".into(), serde_json::json!(sv));
@@ -661,8 +722,7 @@ mod tests {
 
     /// 没有选中判定线时画的是"（没有判定线）"，而不是空白（用户要知道为什么右边是空的）
     #[test]
-    fn inspector_says_so_when_nothing_is_selected() {
-        let ctx = egui::Context::default();
+    fn inspector_says_so_when_nothing_is_selected() {        let ctx = egui::Context::default();
         let st = {
             let c = EditCore::new();
             EditorState::new(state::chart_from_doc(c.doc()))
@@ -682,5 +742,70 @@ mod tests {
         let joined = drawn_texts(&out).join("\n");
         assert!(joined.contains("（没有判定线）"), "{joined}");
         assert!(cmds.is_empty());
+    }
+
+    /// **事件时间用三元组编辑**：控件是 `【整拍数】 + 【分子】 / 【分母】`，命令里发的是精确三元组。
+    ///
+    /// 这条钉的是"从界面到文件"整条链：控件编出来的拍 → `resize_event` 的 `toBeat` → 导出为 pez
+    /// 时的 `startTime`。以前这条链上有两处浮点：检查器的 `起`/`止` 是 f64 框、命令走
+    /// `beat_json`（按当前网格取整）—— 用户编 `1/3`，落到的可能是 `1/4`，或者写文件时变成
+    /// `333333/1000000`。
+    #[test]
+    fn event_time_is_edited_as_a_whole_plus_fraction_triple() {
+        let mut c = EditCore::new();
+        let r = c.exec(&json!({"op":"add_event","line":0,"layer":0,"track":"moveX",
+                               "startBeat":[0,1],"endBeat":[4,1],
+                               "startValue":0.0,"endValue":100.0}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.selected_track = state::TrackId::MoveX;
+        st.select_event(state::TrackId::MoveX, 0);
+        let mut insp = view::inspector_of(&st, c.doc()).expect("有选中的线");
+        let ev = insp.event_edit.as_ref().expect("有选中的事件");
+        assert_eq!((ev.start_exact.n, ev.start_exact.d), (0, 1), "起点的精确拍进快照");
+        assert_eq!((ev.end_exact.n, ev.end_exact.d), (4, 1));
+
+        // ① 三个控件真的画出来了（整拍 / 分子 / 分母 + 两个分隔符），且没交互就不发命令
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut cmds = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            cmds = inspector_ui(ui, &st, Some(&mut insp));
+        });
+        out.textures_delta.clear();
+        let texts = drawn_texts(&out);
+        let joined = texts.join("\n");
+        for want in ["起", "止", "+", "/"] {
+            assert!(joined.contains(want), "三元组控件没画全，缺 {want:?}：\n{joined}");
+        }
+        assert!(cmds.is_empty(), "没交互却发了命令：{cmds:?}");
+
+        // ② 精确命令 → 施加 → 导出 pez：`startTime` 就是 `[0, 1, 3]`
+        let cmd = opm_app::edit::event_resize_command_exact(
+            &st,
+            state::TrackId::MoveX,
+            opm_app::doc::EventRef::new(0, 0),
+            state::EventEdge::Start,
+            opm_app::doc::Beat::new(1, 3),
+        );
+        assert_eq!(cmd["toBeat"], json!([1, 3]), "命令里是**既约**有理拍，不经过浮点：{cmd}");
+        let r = c.exec(&cmd);
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let (text, _fid) = opm_app::codec::rpe::save_str(c.doc(), Default::default());
+        let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mx = root["judgeLineList"][0]["eventLayers"][0]["moveXEvents"]
+            .as_array()
+            .unwrap();
+        assert!(
+            mx.iter().any(|e| e["startTime"] == json!([0, 1, 3])),
+            "导出的 pez 里应有 startTime = [0,1,3]：{text}"
+        );
     }
 }

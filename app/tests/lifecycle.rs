@@ -365,6 +365,50 @@ fn every_save_shape_can_be_loaded_back() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// **从文件夹形态载入后，第一次保存就要写回同一个文件夹**（不是"一个 `.json` 单文件"）。
+///
+/// 这条是真踩出来的（2026-10-01）：`opm-ctl --file <opm 文件夹> --cmd … --save` 走 `Auto`、
+/// 只看扩展名 —— 目录里的谱面叫 `opm.json`，于是被判成"一个 `.json` 单文件"、按 **RPE** 写回，
+/// 那份工程**下次连打开都打不开**（`format 必须是 "opm"（当前 None）`）。
+/// 同一处也解释了"第一次 Ctrl+S 不刷新音乐/曲绘"：扩展名判不出文件夹形态。
+/// 判据改成"载入时就知道自己是文件夹"（`Staged::folder`），不猜。
+#[test]
+fn a_folder_load_saves_back_to_the_same_folder_on_the_very_first_save() {
+    use opm_app::codec::Format;
+
+    let dir = tmpdir("folder-first-save");
+    for (shape, folder) in [
+        (SaveFormat::OpmFolder, dir.join("proj.opm.d")),
+        (SaveFormat::RpeFolder, dir.join("proj.pez.d")),
+    ] {
+        let mut maker = EditCore::new();
+        maker.exec(&json!({"op":"add_line","name":"L1"}));
+        maker.save_as(&folder, shape).unwrap_or_else(|e| panic!("{shape:?}: {e}"));
+
+        // 重新打开这个文件夹，随便改一下，然后**第一次**保存（不给新路径）
+        let mut core = EditCore::load(&folder).unwrap_or_else(|e| panic!("{shape:?} 读不回来：{e}"));
+        assert_eq!(core.source_format(), if shape == SaveFormat::OpmFolder { Format::Opm } else { Format::Rpe });
+        core.exec(&json!({"op":"add_line","name":"L2"}));
+        let want_lines = core.doc().judge_lines.len();
+        let written = core.save(None).unwrap_or_else(|e| panic!("{shape:?} 第一次保存失败：{e}"));
+        assert_eq!(
+            written.parent(),
+            Some(folder.as_path()),
+            "{shape:?} 要写回那个文件夹里的谱面文件"
+        );
+        // 关键断言：**还能按同一种形态读回来**（写错格式的话这里会报 `format 必须是 "opm"`）
+        let back = EditCore::load(&folder)
+            .unwrap_or_else(|e| panic!("{shape:?} 第一次保存之后读不回来了：{e}"));
+        assert_eq!(back.source_format(), core.source_format(), "{shape:?} 格式被换掉了");
+        assert_eq!(back.doc().judge_lines.len(), want_lines, "{shape:?} 改动要落盘");
+        // 文件夹形态的**陪衬文件**也要还在（RPE 文件夹少了 `info.yml` 就不再是一份谱面包）
+        if shape == SaveFormat::RpeFolder {
+            assert!(folder.join("info.yml").is_file(), "RPE 文件夹里的 info.yml 不该消失");
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// **别人认领的缓存目录，一次性读取不许碰**。
 ///
 /// 缓存按**容器内容**分目录，而 `session.json` 与那份 `opm.json` 快照是**会话**状态：
