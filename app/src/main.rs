@@ -884,6 +884,14 @@ struct App {
     idle_frames: u32,
     /// 首帧布局稳定前视为"工作中"，避免启动瞬间就被判定为空闲
     pending_layout_anim: bool,
+    /// **编辑器页**画了几帧（与进程帧号 `self.frames` 分开）。
+    ///
+    /// 为什么必须分开：从**启动页**打开谱面时，进程帧号早就越过 2 了 ——
+    /// 若用 `self.frames == 2` 去清"首帧布局"，那面旗**永远清不掉**，
+    /// 编辑器就永远算工作态：满帧重绘、不进 IDLE，而且 `--autoplay` 也永远不开始
+    /// （用户 2026-10-01 报的"手动测试里无论如何都不会进入 IDLE"就是这条：
+    ///  他是在启动页里打开谱面的，而我的测试一直带 `--doc` 直接进编辑页）。
+    editor_frames: u32,
     /// 共享编辑会话（GUI 与控制通道线程共同持有）
     core: core::SharedCore,
     /// **订阅句柄**：EditCore 改动后通过它投递 update 广播（只有 GUI 关心的话题会到达）
@@ -1137,6 +1145,7 @@ impl App {
             idle_start: None,
             idle_frames: 0,
             pending_layout_anim: true,
+            editor_frames: 0,
             core,
             sub: Some(sub),
             dirty: Dirty::default(),
@@ -4676,8 +4685,9 @@ impl eframe::App for App {
             st.working_frames = self.working_frames_total;
             st.idle_frames = self.idle_frames_total;
         }
-        if self.frames == 2 {
-            // 首帧之后用于判断"布局是否还在动画"
+        // 首帧之后用于判断"布局是否还在动画" —— 数的是**编辑器页自己的帧**，不是进程帧号
+        self.editor_frames = self.editor_frames.saturating_add(1);
+        if self.editor_frames >= 2 {
             self.pending_layout_anim = false;
         }
     }

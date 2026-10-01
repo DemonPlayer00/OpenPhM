@@ -4696,6 +4696,40 @@ self.pending_dispatch = will_broadcast.then_some(started);
 `PENDING_TIMEOUT = 1 s`（正常一帧内就落地，实测 p50 4.56 ms），超过就当它没来过（延迟照旧记一笔）。
 "等广播"这面旗算工作态，挂着不摘就再也进不了 IDLE，不能让它无限期挂着。
 
+### 真正的根因（用户手动路径）：`pending_layout_anim` 拿**进程帧号**去清
+
+上面那条 `pending_dispatch` 是真 bug，但**不是用户这次的原因**。真正的根因在"首帧布局"这面旗上：
+
+```rust
+// 旧代码（编辑器页收尾）
+if self.frames == 2 { self.pending_layout_anim = false; }   // self.frames = **进程**帧号
+```
+
+`self.frames` 是**进程级**帧号。而启动页是**同一进程的另一个页面**：
+用户双击图标起程序（无 `--doc`）⇒ 前若干帧画的是**启动页** ⇒ 等他从启动页里打开谱面时，
+`self.frames` 早就越过 2 了 ⇒ 那个 `== 2` **再也不会成立** ⇒ `pending_layout_anim` 永远为真
+⇒ `busy_reason_of` 永远返回"首帧布局" ⇒ **满帧重绘、永远不进 IDLE**（而且 `--autoplay` 也永远不开始，
+因为它要等 `!pending_layout_anim`）。
+
+**为什么我的测试全都没发现**：我的每一次验证都带 `--doc`（直接进编辑页）⇒ 编辑页从第 1 帧就是它
+⇒ 第 2 帧清旗 ✓ ⇒ IDLE ✓。**用户是"起程序 → 从启动页打开谱面"** ⇒ 永远不清 ✓。
+这就是"你的测试无论如何都是 IDLE、我的手动测试无论如何都不进 IDLE"的全部原因。
+
+**修法**：按**页面自己的帧数**清（新增 `App::editor_frames`，只在编辑器页里 `+= 1`）：
+
+```rust
+self.editor_frames = self.editor_frames.saturating_add(1);
+if self.editor_frames >= 2 { self.pending_layout_anim = false; }
+```
+
+**复现与验证**（`OPM_LAUNCH_AUTO=open:<谱面>` 就是"从启动页打开谱面"这条路的自动化入口）：
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| 启动页 → 打开 5 万音符压力谱 | `忙因=[首帧布局]`、底栏 `45.4 fps`、6 秒 **269 帧** | `忙因=[]`、底栏 `IDLE`、8 秒 **0 帧** |
+| `--doc` 直接进编辑页（我的老路子） | `忙因=[]`、`IDLE` ✓ | `忙因=[]`、`IDLE`、6 秒 0 帧 ✓ |
+| 启动页打开 + `--autoplay` | **不播**（等一个永远不成立的 `!pending_layout_anim`） | 开播：`忙因=[播放中]`、播放头 4.0 s ✓ |
+
 ### 顺带加固的一条：交互记忆与真实按键不一致
 
 `egui_is_using_pointer()` 读的是 egui 的**交互记忆**（`potential_click_id` / `potential_drag_id`），
