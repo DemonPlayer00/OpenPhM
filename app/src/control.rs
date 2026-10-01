@@ -87,6 +87,12 @@ pub struct UiStats {
     pub wakes: u64,
     pub wake_p50_ms: f64,
     pub wake_last_ms: f64,
+    /// 底栏右端那一格**此刻显示的文本**（`"60.0 fps"` / `"IDLE"` / `""` = 还没有值）。
+    ///
+    /// 为什么要暴露它：那一格是"编辑器到底还在不在出帧"的**唯一可见读数**，
+    /// 而它只在出帧时才会变 —— 想从外面核实"空闲时显示的是 IDLE"，靠截图得挑对帧，
+    /// 靠这个字段一行就能读（`ui_stats` 由控制线程直接回答，不惊动 GUI）。
+    pub fps_text: String,
     /// 播放状态与播放头（视图命令的效果靠这些观察）
     pub playing: bool,
     pub playhead_sec: f64,

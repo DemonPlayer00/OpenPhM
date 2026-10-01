@@ -2639,12 +2639,67 @@ impl App {
 /// 检查器快照：**当前判定线 + 当前轨道 + 当前事件 + 当前音符**（线优先）。
 /// 自由函数：初始快照与广播后的重建走同一条路径，避免两份实现漂移。
 impl App {
-    /// 请求下一帧（帧率策略）。**启动页与编辑页共用**：早退分支漏掉它就会"只出几帧然后卡住"。
+    /// **还欠着"按帧号"的活吗**：自截屏（`--shot-frame N`）、按键注入（`OPM_KEY_AUTO=30:…`）、
+    /// 关窗（`OPM_CLOSE_AUTO=N`）。这些都是"不到第 N 帧就不会发生"的事 ——
+    /// 所以它们算**工作态**，不算心跳：停下它们就永远等不到。
+    fn frames_owed(&self) -> bool {
+        if self.args.shot.is_some() || self.close_auto.is_some() {
+            return true;
+        }
+        // 下一个按键注入还没到点（没写帧号的那种解析成第 1 帧 ⇒ 立刻就到，不算欠）
+        self.key_auto.first().is_some_and(|(n, _)| u64::from(self.frames) < u64::from(*n))
+    }
+
+    /// **这一帧还有活要干吗**（"要不要继续发帧"的**唯一**判据）。
+    ///
+    /// 用户口径（2026-10-01）：「只要画面没有需要更新的东西就停止发帧，包括所有页面」——
+    /// 空闲不再是"每秒一帧心跳"，而是**一帧都不主动出**。这份判据同时管两件事：
+    /// 底栏那格显示 `IDLE` 还是数字、帧末要不要 `request_repaint`。
+    /// **判据里没有一项是"为了刷新某个读数"**（那正是要防的：控件自己变成心跳源）。
+    ///
+    /// 能把它叫醒的外因（不是心跳，所以不在这里）：输入事件、EditCore 广播（唤醒器）、
+    /// 缓存快照的截止时刻、音频/播放推进、以及"文字会过期"的显式 `request_repaint_after`。
+    fn busy(&self, ctx: &egui::Context) -> bool {
+        self.state.playing                        // 播放中：墙钟/音频在推进
+            || ctx.egui_is_using_pointer()        // 正在按住/拖拽（**悬停不算**，见 README 的教训）
+            || self.pending_dispatch.is_some()    // 命令已交给 EditCore，等广播落地
+            || self.dirty.any()                   // 还有脏位没应用
+            || self.state.floor_pending() > 0     // 音符位置还在异步补
+            || self.pending_layout_anim           // 首帧布局还没稳
+            || self.frames_owed()                 // 按帧号排的活（自截屏 / 按键注入 / 关窗）
+            || (self.args.bench > 0 && self.frames < self.args.bench) // bench 活跃阶段
+    }
+
+    /// 请求下一帧（启动页/阻断页的节奏策略）。**早退分支必须调它**，否则那些分支会停在半路。
+    ///
+    /// 但"调它"不等于"要帧"：与编辑页同一条口径 —— **没有需要更新的东西就不发帧**。
+    /// 启动页没有动画，它的帧只能来自输入、egui 自己的动画、或"欠着的按帧号活"；
+    /// `--idle-fps N`（诊断）仍按原样要心跳。
     fn pace(&self, ctx: &egui::Context) {
-        // 启动页没有动画：事件驱动（egui 收到输入会自动出帧）+ 一个低频心跳，
-        // 与编辑页空闲时的策略一致。**早退分支必须调它**，否则 egui 出几帧就彻底停下。
-        let fps = if self.args.idle_fps > 0.0 { self.args.idle_fps } else { 1.0 };
-        ctx.request_repaint_after(Duration::from_secs_f64(1.0 / fps));
+        if self.args.idle_fps > 0.0 {
+            ctx.request_repaint_after(Duration::from_secs_f64(1.0 / self.args.idle_fps));
+        } else if self.frames_owed() || self.args.bench > 0 {
+            ctx.request_repaint();
+        }
+        // 否则什么都不做：启动页是事件驱动的（egui 收到输入/动画自己会要帧）
+    }
+
+    /// `OPM_IDLE_TRACE=1`：**这一帧到底是谁在要**（启动页与编辑页共用，上限 80 行）。
+    /// 空闲策略是"没有需要更新的东西就停下"，所以每一个空闲帧背后必有一个外部原因 ——
+    /// 这一行把那原因从"猜"变成"看"。与 `OPM_TL_TRACE` / `OPM_FRAME_LOG` 同一族。
+    fn trace_repaint_causes(&self, ctx: &egui::Context) {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        static LEFT: AtomicU32 = AtomicU32::new(80); // 有上限，免得把 stderr 灌满
+        if std::env::var_os("OPM_IDLE_TRACE").is_none() || LEFT.load(AtomicOrdering::Relaxed) == 0 {
+            return;
+        }
+        LEFT.fetch_sub(1, AtomicOrdering::Relaxed);
+        let why: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
+        eprintln!(
+            "[idle] 帧 {} ⇒ {}",
+            self.frames,
+            if why.is_empty() { "（没有原因？！）".to_owned() } else { why.join(" ｜ ") }
+        );
     }
 
     /// 自截屏（`--shot`）：**启动页与编辑页都要能截**，所以从 UI 主体里抽出来单独调用。
@@ -2696,10 +2751,18 @@ impl App {
     }
 
     /// 只在"超龄"时重算（`now - built_at >= LIST_ROWS_MAX_AGE`）。判据是**秒**，不是帧号。
-    fn refresh_list_rows_if_stale(&mut self) {
-        if recents::now_secs().saturating_sub(self.list_rows_at) >= LIST_ROWS_MAX_AGE {
+    ///
+    /// 参数里的 `ctx` 只用来**排一次未来的帧**：那一行"多久以前"到点**真的会变**，
+    /// 所以它不是心跳 —— 按用户口径（"没有需要更新的东西就不发帧"），
+    /// 有东西要更新就该把那一帧排上；30 秒一帧，其余时间启动页一帧都不出。
+    fn refresh_list_rows_if_stale(&mut self, ctx: &egui::Context) {
+        let age = recents::now_secs().saturating_sub(self.list_rows_at);
+        if age >= LIST_ROWS_MAX_AGE {
             self.refresh_list_rows();
+            return;
         }
+        let wait = (LIST_ROWS_MAX_AGE - age) as f64;
+        ctx.request_repaint_after(Duration::from_secs_f64(wait));
     }
 
     /// 处理"回启动页并摆出「新建谱面」模态"的待办（换标题要 `Context`，只能在帧里做）。
@@ -2743,10 +2806,15 @@ impl App {
     /// **不是每帧都写**：这里面 p50 要对最多 512 个样本排序，另有几次锁与字符串克隆，
     /// 而它们是**诊断量**。判据两条：收到了新广播（有真实更新就立刻反映，别让
     /// "等广播被应用"的轮询多等一拍）或距上次已过 [`STATS_MIN_INTERVAL`]。
-    fn publish_stats(&mut self) {
+    /// 把 GUI 侧的统计写进 `ui_stats`（`force` = 跳过 10 Hz 节流）。
+    ///
+    /// 什么时候必须 `force`：**决定睡下的那一帧**。休眠之后不会再出帧，节流窗口会把
+    /// "最后的真实状态"（playing / pending / 播放头…）永远留在旧值上 ——
+    /// 外面用 `opm-ctl` 读 `ui_stats` 会以为它还在播（实测踩过：暂停之后 `playing` 仍是 true）。
+    fn publish_stats(&mut self, force: bool) {
         let now = Instant::now();
         let fresh_broadcast = self.applied_broadcasts != self.stats_published_broadcasts;
-        if !fresh_broadcast && now.duration_since(self.stats_at) < STATS_MIN_INTERVAL {
+        if !force && !fresh_broadcast && now.duration_since(self.stats_at) < STATS_MIN_INTERVAL {
             return;
         }
         self.stats_at = now;
@@ -2764,6 +2832,8 @@ impl App {
         };
         let mut s = self.stats.lock().unwrap();
         s.frames = self.frames as u64;
+        // 底栏那格此刻的字（`Some` 才有；空闲时是 "IDLE"）—— 外面据此核实"空闲到底显示什么"
+        s.fps_text = self.fps.text().unwrap_or("").to_owned();
         s.broadcasts = self.applied_broadcasts;
         s.builds_structure = self.builds_structure;
         s.builds_props = self.builds_props;
@@ -3051,8 +3121,13 @@ impl App {
     /// 少调一个就会出现"截屏永远超时 / 统计不动 / 页面卡住不再重绘"这类难查的毛病。
     fn finish_launch_frame(&mut self, ctx: &egui::Context) {
         self.handle_shot(ctx);
-        self.publish_stats();
+        self.publish_stats(false);
         self.frames += 1;
+        // 启动页同样守"没有需要更新的东西就不发帧"：不欠帧时，这一帧的**原因**值得记一笔
+        // （`OPM_IDLE_TRACE=1`），因为此刻它只可能来自输入或 egui 自己的动画。
+        if !self.frames_owed() && self.args.idle_fps <= 0.0 {
+            self.trace_repaint_causes(ctx);
+        }
         self.pace(ctx);
     }
 
@@ -3121,7 +3196,7 @@ impl App {
         let native = filedialog::availability();
         let msg = self.file_message.clone();
         // 行快照只在"列表变了"或"时刻走远了（30 秒）"时重算 —— 不是每帧
-        self.refresh_list_rows_if_stale();
+        self.refresh_list_rows_if_stale(ctx);
         // 缺 7z = 一道**关不掉的门槛**（`.opm` 容器靠它打包/解包，没它交付不出正式格式）
         let gated = self.seven_zip_missing.is_some();
         let mut action = opm_app::recents::start_screen_ui(
@@ -3765,6 +3840,14 @@ impl eframe::App for App {
                     self.adapter,
                 )
             });
+            // ---- 底栏那格的字：**画之前就定下来** ----
+            //
+            // `set_sleeping` 只是换文本（屏幕内容本来就该更新），**不产生任何一帧**；
+            // 反过来，如果等帧末才改成 IDLE，屏幕会永远留着睡前的数字（屏幕只在出帧时才变），
+            // 而要补一帧去改它，就等于让指示器自己发帧（用户口径：fps 控件更新不能影响总体帧）。
+            let busy_here = self.busy(&ctx);
+            self.fps.set_sleeping(!busy_here && self.args.idle_fps <= 0.0);
+
             let mut view = statusbar::StatusView {
                 playhead: self.state.playhead,
                 beat: self.state.chart.tmap.beat(self.state.playhead),
@@ -4444,7 +4527,7 @@ impl eframe::App for App {
         }
 
         // ---- 帧计时与限帧 ----
-        self.publish_stats();
+        self.publish_stats(false);
         let ui_ms = t_ui.elapsed().as_secs_f64() * 1000.0;
         self.ui_ms.push(ui_ms);
         self.build_ms.push(build_ms);
@@ -4514,75 +4597,40 @@ impl eframe::App for App {
             return;
         }
 
-        // ---- 节奏控制：画面无更新时降到 1 帧，工作时按屏幕帧率 ----
+        // ---- 节奏控制（判据只有一份：`App::busy`）----
+        //
         // egui 本身是事件驱动的：不主动 request_repaint 就不会出帧（输入仍会触发重绘）。
-        // 「工作」= 播放中 / 正在拖拽或滚轮交互 / 有动画；此时连续请求重绘，由 vsync 封顶到屏幕刷新率。
-        // 注意：`egui_wants_pointer_input()` 的语义是「egui 想接收指针事件」（鼠标悬停即为真），
-        // **不能**当作「用户正在操作」的活动信号 —— 那样会让空闲态在鼠标停靠时被判为工作态。
-        // 只认「正在按住/拖拽」。
-        let interacting = ctx.egui_is_using_pointer();
-        // 「等广播」也是工作态：命令已交给 EditCore，界面要保持出帧才能及时应用更新
-        // 「还在补音符位置」也是工作态：不主动出帧的话它会在别人看的时候停在那儿不动
-        let awaiting =
-            self.pending_dispatch.is_some() || self.dirty.any() || self.state.floor_pending() > 0;
-        // bench 的活跃阶段本身就是「持续出帧」的测量场景，需强制视为工作态，
-        // 否则事件驱动下帧数永远到不了目标值（实测踩过：进程直接被 timeout 杀掉）。
-        let bench_active = self.args.bench > 0 && self.frames < self.args.bench;
-        // 「还有一次自截屏没走完」也是工作态：`--shot-frame N` 要一直出帧到第 N 帧。
-        // 不加这一条，空闲策略改成"直接停下"之后 `--shot-frame 30` 会**永远等不到第 30 帧**
-        // （编辑器三五帧就睡下了）—— 截图是明确的活，不是心跳。
-        let shot_pending = self.args.shot.is_some();
-        let working = self.state.playing
-            || interacting
-            || awaiting
-            || self.pending_layout_anim
-            || bench_active
-            || shot_pending;
-
-        // ---- 帧率表 + 空闲策略 ----
+        // 用户口径：「只要画面没有需要更新的东西就停止发帧，包括所有页面」——
+        // 所以这里**没有心跳**：不忙就一帧都不要。`--idle-fps N` 只作诊断。
         //
-        // `sleeping` = "空闲、而且我们自己不再要帧"。默认（`--idle-fps 0`）空闲就是**直接停下**：
-        // 一帧都不主动出。要帧的四条路都不是心跳 —— 输入事件、EditCore 广播（唤醒器）、
-        // 快照的截止时刻（`ctx.request_repaint_after`）、音频/播放。指示器**从不**加进这四条里。
+        // ---- 帧末：记账 + 节奏 ----
         //
-        // `--idle-fps N`（诊断用）时空闲仍会自己出帧 ⇒ 那时不叫 sleeping，底栏照旧报心跳的真实速率。
-        let sleeping = !working && self.args.idle_fps <= 0.0;
-        // `paint_idle` = "需要多要一帧"，只为把底栏的 IDLE 写上屏幕（**只在刚睡下那一次**，不是新心跳）
-        let step = self.fps.note_frame(now, delta_ms, sleeping);
+        // 判据与底栏那格用的是同一份（`busy`）—— 这一帧里可能刚派了命令/改了状态，所以帧末再算一次。
+        // `sleeping` 为真时**什么都不请求**：默认（`--idle-fps 0`）空闲就是"直接停下"。
+        // 底栏的 IDLE 是**画之前**就写好的，所以这里再也不需要"补一帧去改字"。
+        let busy = self.busy(&ctx);
+        let sleeping = !busy && self.args.idle_fps <= 0.0;
+        self.fps.note_frame(now, delta_ms);
 
-        // `OPM_IDLE_TRACE=1`：**空闲时到底是谁在要帧**。空闲策略是"直接停下"，于是每一个空闲帧
-        // 背后必有一个外部原因（输入、广播、快照截止时刻，或者某个控件自己的动画）——
-        // 这一行把那原因连同帧间隔打出来（最多 80 行，免得刷屏）。
-        // 与 `OPM_TL_TRACE` / `OPM_FRAME_LOG` 同一族：把"猜"换成"看一行数"。
-        if sleeping && std::env::var_os("OPM_IDLE_TRACE").is_some() {
-            use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-            static LEFT: AtomicU32 = AtomicU32::new(80); // 有上限，免得把 stderr 灌满
-            if LEFT.load(AtomicOrdering::Relaxed) > 0 {
-                LEFT.fetch_sub(1, AtomicOrdering::Relaxed);
-                let why: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
-                eprintln!(
-                    "[idle] 帧 {} 距上一帧 {:.1} ms ⇒ {}",
-                    self.frames,
-                    delta_ms.unwrap_or(f64::NAN),
-                    if why.is_empty() { "（没有原因？！）".to_owned() } else { why.join(" ｜ ") }
-                );
-            }
+        if sleeping {
+            // 睡下之后不会再出帧 ⇒ 把统计**强制**写一次，否则外面读到的 playing/pending 是旧值
+            self.publish_stats(true);
+            // 这一帧是个"不该存在"的帧（没有需要更新的东西，却还是出了）—— 记下是谁要的
+            self.trace_repaint_causes(&ctx);
         }
 
-        if working {
+        if busy {
             self.working_frames_total += 1;
             ctx.request_repaint();
         } else {
             self.idle_frames_total += 1;
             if self.args.idle_fps > 0.0 {
-                // 空闲心跳（默认关）：仅用于让状态栏/诊断保持可见，不是连续渲染
+                // 空闲心跳（默认关，只作诊断）：不是连续渲染，只是让读数保持新鲜
                 ctx.request_repaint_after(Duration::from_secs_f64(1.0 / self.args.idle_fps));
-            } else if step.paint_idle {
-                // **只补一帧**：把底栏的 IDLE 写上屏幕。写完这一帧就真的停下 ——
-                // 下一次醒来一定是"有人/有事"叫我们（见 `opm_app::fps` 的文件头：
-                // ping/pong 走事件循环，与重绘无关，所以桌面不会因此认为窗口无响应）。
-                ctx.request_repaint();
             }
+            // 否则：**一帧都不要**。下一次醒来一定是"有人/有事"叫我们 —— 输入、广播唤醒器、
+            // 快照截止时刻、音频/播放、文字过期（`request_repaint_after`）。
+            // 桌面不会因此认为窗口无响应：ping/pong 走事件循环，与重绘无关（见 `opm_app::fps` 文件头）。
         }
 
         if let Ok(mut st) = self.stats.lock() {
