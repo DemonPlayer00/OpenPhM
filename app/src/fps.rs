@@ -16,7 +16,9 @@
 //! 4. **永远显示帧率数字**（用户口径 2026-10-01：先要 IDLE，看过之后改成"移除 IDLE，全部显示 fps"）。
 //!    空闲时编辑器**一帧都不出**，于是那个数字会**停在那儿不再变** —— 这是"屏幕冻结"的必然结果，
 //!    不是它坏掉了。`set_idle` 只负责"睡过去的那段时长不算进帧率"，**不换文本**：
-//!    读数照旧是"最近这一段（不少于 0.5 秒）实际出帧的平均"，只是不再有人刷新它。
+//!    读数照旧是"最近这一段（不少于 0.5 秒）实际出帧的平均"。
+//!    **但"空闲"不等于"没有帧"**：滚动/鼠标/动画引起的帧照常计数（详见 `note_frame`），
+//!    只有真的睡过去（间隔 ≥ [`SLEEP_GAP`]）那一帧才作废重开。
 //!    **它从不产生帧**（模块拿不到 `egui::Context`）—— 用户另一条口径："fps 控件更新不能影响总体帧"。
 //!
 //! 与 `--bench` 的分工：`--bench` 给整段的 p50/p99（"总体多快"），这一格给**此刻**多快，
@@ -33,6 +35,13 @@ use std::time::{Duration, Instant};
 ///
 /// 注意它约束的是**显示值**，不是重绘频率 —— 指示器自己不产生任何一帧。
 pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 一个帧间隔**大过**它，就不算"帧间隔"了 —— 那是"睡了一大觉之后的第一帧"。
+///
+/// 取值与 [`MIN_INTERVAL`] 一致：显示值本来就最多 0.5 秒刷新一次，比这更长的"间隔"没有帧率意义。
+/// 反过来，**小于它的空闲帧必须照常计数**：滚动、鼠标移动、控件动画引起的都是**真实的帧**
+/// （用户 2026-10-01 报的"滚动时帧率不刷新"就是漏了这一条）。
+pub const SLEEP_GAP: Duration = MIN_INTERVAL;
 
 /// 底栏那格的悬停说明（文案只有一处）
 pub const HOVER: &str = "最近这一段（不少于 0.5 秒）**实际出帧**的平均帧率。\n\
@@ -63,36 +72,49 @@ impl FpsMeter {
         Self::default()
     }
 
-    /// **帧末调用**（空闲策略的边界都在这里）：`idle` = 这一帧之后我们不再要帧。
+    /// **帧末调用**：`idle` = 这一帧之后我们自己不再要帧（判据见 `main::busy_reason_of`）。
     ///
-    /// - **从"忙"切到"空闲"**：这一帧还算数 ⇒ 记账并**立刻发布**（不等 0.5 秒节流）。
-    ///   屏幕接下来会冻住，所以停在上面的必须是一个真实帧率（窗口可能不满 0.5 秒 —— 照现有窗口算）。
-    ///   没有这一步，界面上会留一个**空格**（还没凑满第一个窗口就睡下了，见 2026-10-01 的实测）。
-    /// - **一直空闲**：什么都不做（空闲帧的 delta 是"睡过去的时长"，不是帧间隔）。
-    /// - **从"空闲"切到"忙"**：窗口作废，下一帧立刻给个新数（不让睡前的旧值久留）。
+    /// 三条边界，都在这一个入口里：
+    ///
+    /// 1. **"空闲"不等于"没有帧"**：滚动、鼠标移动、控件动画都会引起**真实的帧**（只是不是我们要的），
+    ///    它们**照常计数** —— 否则滚轮一转，那一格就冻住了（用户 2026-10-01 报的正是这个）。
+    /// 2. **刚睡下那一帧强制发布**：屏幕接下来会冻住，停在上面的必须是一个真实读数
+    ///    （不发布的话，启动后马上空闲的程序会留一个**空格**，实测踩到过）。
+    /// 3. **"睡了一大觉之后的第一帧"例外**：空闲着、而且间隔 ≥ [`SLEEP_GAP`] ⇒ 中间根本没有帧，
+    ///    它的 delta 是睡过去的时长而不是帧间隔 ⇒ 作废重开，下一帧立刻给新数
+    ///    （否则会算出 0.02 fps 那种荒谬值）。有心跳（`--idle-fps 1`，帧本来一秒一个）时不算睡眠。
     ///
     /// 返回值 = 是否发布了新读数（给单测数刷新次数）。**从不请求帧**（模块碰不到 `egui::Context`）。
     pub fn note_frame(&mut self, now: Instant, delta_ms: Option<f64>, idle: bool) -> bool {
-        if idle {
-            let entering = !self.idle;
-            self.idle = true;
-            if !entering {
-                return false; // 一直空闲：不记账、不发布
-            }
-            self.accumulate(delta_ms);
-            let published = self.publish(now);
-            self.reset_window();
-            return published;
-        }
-        if std::mem::take(&mut self.idle) {
-            // 刚醒：这一帧的 delta 是睡过去的时长，丢掉；窗口作废，下一帧立刻给数
+        let entering_idle = idle && !self.idle;
+        let waking = !idle && self.idle;
+        self.idle = idle;
+        // 间隔大过 SLEEP_GAP **而且我们本来就没在要帧** ⇒ 中间根本没有帧（睡过去了），
+        // 不是"一帧画得慢"。有心跳（`--idle-fps 1`，帧本来就一秒一个）时不算睡眠 —— 那是真帧。
+        let after_sleep = idle
+            && delta_ms.is_some_and(|ms| ms >= SLEEP_GAP.as_secs_f64() * 1000.0);
+
+        if waking {
+            // 忙起来的第一帧：它的 delta 跨过了整个睡眠 ⇒ 丢掉，下一帧给数
             self.reset_window();
             self.wake = true;
             return false;
         }
+        if entering_idle {
+            // 刚睡下：这一帧还算数 —— 记进去并**强制发布**，屏幕上要停住的是一个真实读数
+            self.accumulate(delta_ms);
+            return self.publish(now);
+        }
+        if after_sleep {
+            // 空闲期间隔了很久才来的那一帧（输入把它叫醒的那一刻）：作废重开
+            self.reset_window();
+            self.wake = true;
+            return false;
+        }
+        // 其余的空闲帧 = 输入/动画驱动的真实帧：和"忙"的时候一样记账
         self.accumulate(delta_ms);
         let due = match self.last {
-            // 开窗：起步时先攒够一个窗口（单个帧间隔不足以代表帧率，启动帧还带着建表的代价）；
+            // 开窗：起步先攒够一个窗口（单个帧间隔不足以代表帧率，启动帧还带着建表的代价）；
             // 但**刚睡醒**时不等 —— 屏幕上挂着的是睡前那个数，先给个新的比"再等半秒"重要
             None => {
                 self.last = Some(now);
@@ -241,6 +263,45 @@ mod tests {
         assert!(m.note_frame(at(base, t + 60_016.0), Some(16.6667), false), "下一帧立刻给新数");
         let fresh: f64 = m.text().unwrap().trim_end_matches(" fps").parse().unwrap();
         assert!((fresh - 60.0).abs() < 2.0, "{:?}", m.text());
+    }
+
+    /// **回归测试（用户报的"滚动工作区时帧率不刷新"）**：空闲帧也是**真实的帧** ——
+    /// 滚轮、鼠标移动、控件动画引起的帧都要照常计数，否则转一下滚轮那一格就冻住了。
+    ///
+    /// 复现口径（实测）：空闲状态下用 80 条视图命令造出 80 个"输入驱动的帧"
+    /// （`ui_stats` 里 `frames` 从 6 涨到 166、`busy` 一直是空），修前 `fps_text` 从头到尾是 `33.2 fps`，
+    /// 修后每一段都会刷新。
+    #[test]
+    fn idle_frames_still_count_so_scrolling_updates_the_readout() {
+        let base = Instant::now();
+        let mut m = FpsMeter::new();
+        // 先干一会儿活：拿到一个读数，然后睡下（这一帧强制发布）
+        let mut t = 0.0;
+        for _ in 0..6 {
+            t += 16.6667;
+            m.note_frame(at(base, t), Some(16.6667), false);
+        }
+        assert!(m.note_frame(at(base, t), Some(16.6667), true), "睡下那一帧要发布");
+        let first = m.text().unwrap().to_owned();
+        assert!(first.ends_with("fps"), "{first}");
+
+        // 睡了一觉（比如 30 秒没人动）之后开始"滚动"：第一帧跨过睡眠 ⇒ 作废重开、不发布
+        t += 30_000.0;
+        assert!(!m.note_frame(at(base, t), Some(30_000.0), true), "跨过睡眠那一帧不发布");
+        assert_eq!(m.text(), Some(first.as_str()), "屏幕上暂时还是睡前那个数");
+
+        // 接着是**连续的输入驱动帧**（滚动就是这么来的）：2 秒、50 fps
+        let mut published = 0;
+        for _ in 1..=100 {
+            t += 20.0;
+            if m.note_frame(at(base, t), Some(20.0), true) {
+                published += 1;
+            }
+        }
+        assert!(published >= 3, "2 秒里至少该刷新 3 次（0.5 秒一次），实际 {published}");
+        let now = m.shown().unwrap();
+        assert!((now - 50.0).abs() < 2.0, "输入驱动的帧也要算进帧率：{now}");
+        assert_ne!(m.text(), Some(first.as_str()), "读数必须**动过**（这就是用户报的那条）");
     }
 
     /// 空闲但**有心跳**（`--idle-fps N`，诊断用）时照旧报帧率：那时确实还在自己出帧
