@@ -288,7 +288,15 @@ fn main() -> eframe::Result<()> {
         args.scale,
         args.bench
     );
-    println!("  空闲重绘={} fps（0=纯事件驱动）  bench 空闲测量={}s", args.idle_fps, args.idle_seconds);
+    println!(
+        "  空闲重绘={}  bench 空闲测量={}s",
+        if args.idle_fps > 0.0 {
+            format!("{:.1} fps 心跳", args.idle_fps)
+        } else {
+            "直接停下（纯事件驱动）".to_owned()
+        },
+        args.idle_seconds
+    );
 
     // --audio-probe：只解码，不开窗口。给 agent 一条"这个文件能不能用、是什么格式"的路。
     if let Some(p) = &args.audio_probe {
@@ -4449,10 +4457,6 @@ impl eframe::App for App {
         if let Some(d) = delta_ms {
             self.deltas.push(d);
         }
-        // 底栏那一格帧率：**只记账**。它不返回"要不要重绘"，也不碰 `ctx` ——
-        // 指示器一旦参与请求重绘，就会把"空闲 1 fps"变成"指示器要的 fps"（用户口径：不影响帧刷新策略）。
-        // 显示值自己节流到 0.5 秒一次（`fps::MIN_INTERVAL`）。
-        self.fps.note_frame(now, delta_ms);
         self.last_frame = Some(now);
         self.frames += 1;
         self.frame_log(delta_ms, ui_ms, build_ms, inst_count);
@@ -4524,8 +4528,46 @@ impl eframe::App for App {
         // bench 的活跃阶段本身就是「持续出帧」的测量场景，需强制视为工作态，
         // 否则事件驱动下帧数永远到不了目标值（实测踩过：进程直接被 timeout 杀掉）。
         let bench_active = self.args.bench > 0 && self.frames < self.args.bench;
-        let working =
-            self.state.playing || interacting || awaiting || self.pending_layout_anim || bench_active;
+        // 「还有一次自截屏没走完」也是工作态：`--shot-frame N` 要一直出帧到第 N 帧。
+        // 不加这一条，空闲策略改成"直接停下"之后 `--shot-frame 30` 会**永远等不到第 30 帧**
+        // （编辑器三五帧就睡下了）—— 截图是明确的活，不是心跳。
+        let shot_pending = self.args.shot.is_some();
+        let working = self.state.playing
+            || interacting
+            || awaiting
+            || self.pending_layout_anim
+            || bench_active
+            || shot_pending;
+
+        // ---- 帧率表 + 空闲策略 ----
+        //
+        // `sleeping` = "空闲、而且我们自己不再要帧"。默认（`--idle-fps 0`）空闲就是**直接停下**：
+        // 一帧都不主动出。要帧的四条路都不是心跳 —— 输入事件、EditCore 广播（唤醒器）、
+        // 快照的截止时刻（`ctx.request_repaint_after`）、音频/播放。指示器**从不**加进这四条里。
+        //
+        // `--idle-fps N`（诊断用）时空闲仍会自己出帧 ⇒ 那时不叫 sleeping，底栏照旧报心跳的真实速率。
+        let sleeping = !working && self.args.idle_fps <= 0.0;
+        // `paint_idle` = "需要多要一帧"，只为把底栏的 IDLE 写上屏幕（**只在刚睡下那一次**，不是新心跳）
+        let step = self.fps.note_frame(now, delta_ms, sleeping);
+
+        // `OPM_IDLE_TRACE=1`：**空闲时到底是谁在要帧**。空闲策略是"直接停下"，于是每一个空闲帧
+        // 背后必有一个外部原因（输入、广播、快照截止时刻，或者某个控件自己的动画）——
+        // 这一行把那原因连同帧间隔打出来（最多 80 行，免得刷屏）。
+        // 与 `OPM_TL_TRACE` / `OPM_FRAME_LOG` 同一族：把"猜"换成"看一行数"。
+        if sleeping && std::env::var_os("OPM_IDLE_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+            static LEFT: AtomicU32 = AtomicU32::new(80); // 有上限，免得把 stderr 灌满
+            if LEFT.load(AtomicOrdering::Relaxed) > 0 {
+                LEFT.fetch_sub(1, AtomicOrdering::Relaxed);
+                let why: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
+                eprintln!(
+                    "[idle] 帧 {} 距上一帧 {:.1} ms ⇒ {}",
+                    self.frames,
+                    delta_ms.unwrap_or(f64::NAN),
+                    if why.is_empty() { "（没有原因？！）".to_owned() } else { why.join(" ｜ ") }
+                );
+            }
+        }
 
         if working {
             self.working_frames_total += 1;
@@ -4533,9 +4575,14 @@ impl eframe::App for App {
         } else {
             self.idle_frames_total += 1;
             if self.args.idle_fps > 0.0 {
-                // 空闲心跳：仅用于让状态栏/诊断保持可见（默认 1 fps），不是连续渲染
+                // 空闲心跳（默认关）：仅用于让状态栏/诊断保持可见，不是连续渲染
                 ctx.request_repaint_after(Duration::from_secs_f64(1.0 / self.args.idle_fps));
-            } // idle_fps == 0 ⇒ 纯事件驱动，不主动重绘
+            } else if step.paint_idle {
+                // **只补一帧**：把底栏的 IDLE 写上屏幕。写完这一帧就真的停下 ——
+                // 下一次醒来一定是"有人/有事"叫我们（见 `opm_app::fps` 的文件头：
+                // ping/pong 走事件循环，与重绘无关，所以桌面不会因此认为窗口无响应）。
+                ctx.request_repaint();
+            }
         }
 
         if let Ok(mut st) = self.stats.lock() {

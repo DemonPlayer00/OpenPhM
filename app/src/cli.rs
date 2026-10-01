@@ -92,7 +92,9 @@ pub struct Args {
     pub width: f32,
     pub height: f32,
     pub verify_align: bool,
-    /// 空闲时的重绘频率（0 = 完全不主动重绘，纯事件驱动）
+    /// 空闲时的重绘频率（**默认 0 = 直接停下**：不主动重绘，纯事件驱动）。
+    ///
+    /// 非 0 只作诊断用：那时空闲也会按这个频率自己醒一次，底栏因此报心跳的真实速率而不是 IDLE。
     pub idle_fps: f64,
     /// bench 模式：活跃阶段之后转入空闲阶段并测量秒数（0 = 跳过）
     pub idle_seconds: f64,
@@ -165,7 +167,7 @@ impl Default for Args {
             width: 1600.0,
             height: 900.0,
             verify_align: false,
-            idle_fps: 1.0,
+            idle_fps: 0.0,
             idle_seconds: 0.0,
             ws: None,
             doc: None,
@@ -377,7 +379,7 @@ OpenPhM —— Phigros 谱面编辑器（GUI）
   --shot-frame N        第几帧截（默认 30）
   --shot-exit           截完退出
   --control [PATH]      开控制通道（不写路径 = 自动路径）
-  --idle-fps F          空闲重绘频率（0 = 纯事件驱动）
+  --idle-fps F          空闲重绘频率（默认 0 = 直接停下、不主动出帧；N>0 = 心跳，诊断用）
   --idle-seconds S      bench：活跃阶段后转空闲并测量 S 秒
   --bench N             跑 N 帧基准后打印报告
   --stress              极限负载（全量实例）

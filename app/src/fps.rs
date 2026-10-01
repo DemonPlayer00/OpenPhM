@@ -1,21 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 DemonPlayer
 //! **帧率指示**（底栏那一格读数）。用户口径：「在底栏添加帧率指示，不要影响帧刷新策略。
-//! 刷新最低时间间隔为 0.5 秒」。
+//! 刷新最低时间间隔为 0.5 秒」，以及「修改空闲策略，从每秒一帧改为直接停下。帧率显示器从
+//! fps 显示变为 IDLE」。
 //!
-//! 三条纪律，缺一条它就会变成"另一个性能问题"：
+//! 四条纪律，缺一条它就会变成"另一个性能问题"：
 //!
 //! 1. **不改帧刷新策略**：它只在**已经出帧**的时候记账 —— 整个模块不碰 `egui::Context`、
-//!    不 `request_repaint`（连 `Instant` 都是调用方给的）。于是空闲时它显示的就是心跳的真实帧率
-//!    （默认 1 fps），而不是"被指示器抬起来"的帧率；`--idle-fps 0`（纯事件驱动）下它甚至不会更新 ——
-//!    没有帧就没有新读数，屏幕上留着上一个值，直到下一次真的出帧。
+//!    不 `request_repaint`（连 `Instant` 都是调用方给的）。指示器一旦参与请求重绘，
+//!    "空闲直接停下"就变成"指示器要的帧率"。
 //! 2. **显示值最多每 [`MIN_INTERVAL`] 更新一次**：否则屏幕上的数字每帧都在抖，而且
 //!    **每帧重建字符串 = 每帧重新排版**（白做的工作）。值没变时连文本都不重建（缓存着）。
 //! 3. 取的是**这一段窗口的平均**（帧数 / 窗口时长），不是 `1 / 最后一帧` —— vsync 下单帧倒数会在
 //!    16.7 / 33.3 之间来回跳，而"帧率"要回答的是"这一段跑了多快"。
+//! 4. **空闲 = [`IDLE_TEXT`]，不是"帧率很低"**：空闲策略现在是**直接停下**（不再每秒一帧心跳），
+//!    所以空闲时根本没有帧 —— 报一个 fps 数字是在报告一个不存在的量。这一格必须是 IDLE。
+//!    而"决定睡下"的那一帧画的还是上一帧的读数 ⇒ 需要**多要一帧**把 IDLE 写上去（只这一次，
+//!    见 [`FpsMeter::note_frame`] 的返回值），之后真的不再要帧。
 //!
 //! 与 `--bench` 的分工：`--bench` 给整段的 p50/p99（"总体多快"），这一格给**此刻**多快，
 //! 而且它是用户在真机上唯一不借助命令行/环境变量就能看到的那个数。
+//!
+//! **为什么桌面不会认为窗口无响应**：ping/pong 走的是**事件循环**，不是重绘。
+//! X11 侧 `_NET_WM_PING` 由 winit 自己应答（`winit/src/platform_impl/linux/x11/event_processor.rs`），
+//! Wayland 侧 `xdg_wm_base.ping` 由 SCTK 自动回 `pong`（`smithay-client-toolkit/src/shell/xdg/mod.rs`）——
+//! 两者都在 socket 事件到达时被派发，而我们"停下"只是不再 `request_repaint`，事件循环照旧在跑。
 
 use std::time::{Duration, Instant};
 
@@ -24,12 +33,25 @@ use std::time::{Duration, Instant};
 /// 注意它约束的是**显示值**，不是重绘频率 —— 指示器自己不产生任何一帧。
 pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 空闲时那一格的字：空闲不是"帧率低"，而是**没有帧**。
+pub const IDLE_TEXT: &str = "IDLE";
+
 /// 底栏那格的悬停说明（文案只有一处）
 pub const HOVER: &str = "最近这一段（不少于 0.5 秒）**实际出帧**的平均帧率。\n\
-     它只统计已经发生的帧、从不主动要求重绘：空闲时那是心跳的真实帧率（默认 1 fps），\n\
-     纯事件驱动（--idle-fps 0）下要等下一次真的出帧才会变。";
+     它只统计已经发生的帧、从不主动要求重绘。\n\
+     空闲（没有播放、没有拖动、没有待应用的改动）时显示 IDLE：那时编辑器**完全停下**，\n\
+     自己一帧都不出 —— 你看到的每一帧都是输入、广播或快照截止时刻把它叫醒的。";
 
-/// 帧率表：喂帧间隔，吐出"最多每 0.5 秒更新一次"的显示值。
+/// 一次记账的结果。**两件事分开报** —— 用一个 `bool` 兼两义正是上一版测试写错的原因。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    /// 发布了新的显示值（最多每 [`MIN_INTERVAL`] 一次）
+    pub published: bool,
+    /// **需要多要一帧**：只为把底栏那一格改成 IDLE（只在"刚睡下"那一次为 true）
+    pub paint_idle: bool,
+}
+
+/// 帧率表：喂每帧的间隔与"这一帧算不算在干活"，吐出底栏那一格的文本。
 #[derive(Debug, Default)]
 pub struct FpsMeter {
     /// 本窗口累计的帧数与时长（窗口 = 上一次发布之后的那些帧）
@@ -37,10 +59,14 @@ pub struct FpsMeter {
     span: f64,
     /// 开窗时刻 / 上一次发布的时刻
     last: Option<Instant>,
-    /// 当前显示值（fps）
+    /// 当前显示值（fps；空闲时是 `None` —— 没有帧率可言）
     shown: Option<f64>,
-    /// 当前显示文本（只在发布时重建；空串 = 还没有值）
+    /// 当前显示文本（只在发布/切换状态时重建；空串 = 还没有值）
     text: String,
+    /// 上一帧算不算"睡下"（空闲且我们不再要帧）
+    sleeping: bool,
+    /// 刚从睡眠里醒来：下一帧立刻给个新读数（别让屏幕上挂着 IDLE）
+    wake: bool,
 }
 
 impl FpsMeter {
@@ -48,11 +74,38 @@ impl FpsMeter {
         Self::default()
     }
 
-    /// 记一帧。`delta_ms` = 与上一帧的间隔（毫秒；第一帧没有 ⇒ `None`）。
+    /// 记一帧并定下这一刻的状态。
     ///
-    /// 返回 `true` 表示这一帧**发布了新显示值**（单测用它数"刷新了几次"）。
-    /// 坏值（`NaN` / 非正 / 无穷）被丢掉：它们既不该污染读数，也不该触发发布。
-    pub fn note_frame(&mut self, now: Instant, delta_ms: Option<f64>) -> bool {
+    /// - `delta_ms`：与上一帧的间隔（毫秒；第一帧没有 ⇒ `None`）。坏值（`NaN`/非正/无穷）丢掉。
+    /// - `sleeping`：这一帧**空闲、而且我们自己不再要帧**（`--idle-fps 0` 的空闲态）⇒ 文本变 IDLE。
+    ///   `--idle-fps N`（诊断用）时空闲但仍会自己出帧，那时照旧报帧率（心跳的真实速率）。
+    ///
+    /// 返回值见 [`Step`]：`published` = 发布了新读数；`paint_idle` = **需要多要一帧**
+    /// （只为了把 IDLE 画到屏幕上，且**只在刚睡下时**为 true，所以不会变成新的心跳）。
+    pub fn note_frame(&mut self, now: Instant, delta_ms: Option<f64>, sleeping: bool) -> Step {
+        if sleeping {
+            let just_fell_asleep = !self.sleeping;
+            self.sleeping = true;
+            self.frames = 0;
+            self.span = 0.0;
+            self.last = None;
+            self.wake = false;
+            self.shown = None;
+            if self.text != IDLE_TEXT {
+                self.text = IDLE_TEXT.to_owned();
+            }
+            // 决定睡下的这一帧，屏幕上画的还是上一帧那个 fps ⇒ 多要一帧把它改成 IDLE
+            return Step { published: false, paint_idle: just_fell_asleep };
+        }
+        if std::mem::take(&mut self.sleeping) {
+            // 从睡眠里醒来：这一帧的 delta 是**睡过去的时长**，不是帧间隔 —— 不能算进帧率，
+            // 否则醒来后的第一个读数会是个荒谬的低值（睡 60 秒 ⇒ 0.02 fps）
+            self.frames = 0;
+            self.span = 0.0;
+            self.last = None;
+            self.wake = true;
+            return Step::default();
+        }
         if let Some(ms) = delta_ms {
             let secs = ms / 1000.0;
             if secs.is_finite() && secs > 0.0 {
@@ -60,18 +113,18 @@ impl FpsMeter {
                 self.span += secs;
             }
         }
-        match self.last {
-            // 第一个能统计的帧只**开窗**：单个帧间隔（启动帧还可能带着建表/首帧布局的代价）
-            // 不足以代表"帧率"，等凑满一个 MIN_INTERVAL 再说
+        let due = match self.last {
+            // 开窗：起步时先攒够一个窗口（单个帧间隔不足以代表帧率，启动帧还带着建表的代价）；
+            // 但**刚睡醒**时不等 —— 屏幕上挂着 IDLE，先给个数比"再等半秒"重要
             None => {
                 self.last = Some(now);
-                return false;
+                self.frames > 0 && self.wake
             }
-            Some(t) if now.saturating_duration_since(t) < MIN_INTERVAL => return false,
-            Some(_) => {}
-        }
-        if self.frames == 0 || !(self.span > 0.0) {
-            return false;
+            Some(_) if self.wake => true,
+            Some(t) => now.saturating_duration_since(t) >= MIN_INTERVAL,
+        };
+        if !due || self.frames == 0 || !(self.span > 0.0) {
+            return Step::default();
         }
         let fps = self.frames as f64 / self.span;
         self.shown = Some(fps);
@@ -79,12 +132,18 @@ impl FpsMeter {
         self.frames = 0;
         self.span = 0.0;
         self.last = Some(now);
-        true
+        self.wake = false;
+        Step { published: true, paint_idle: false }
     }
 
-    /// 当前显示值（还没凑满第一个窗口时是 `None`）
+    /// 当前显示值（空闲时是 `None`；还没凑满第一个窗口时也是 `None`）
     pub fn shown(&self) -> Option<f64> {
         self.shown
+    }
+
+    /// 现在是不是"睡下了"（空闲且不再要帧）
+    pub fn is_sleeping(&self) -> bool {
+        self.sleeping
     }
 
     /// 底栏那一格的文本（值不变时返回缓存的那一份 —— 帧里不重建字符串）
@@ -97,6 +156,11 @@ impl FpsMeter {
 mod tests {
     use super::*;
 
+    /// 造一个"从 base 起每 step_ms 一帧"的时刻
+    fn at(base: Instant, ms: f64) -> Instant {
+        base + Duration::from_secs_f64(ms / 1000.0)
+    }
+
     /// **0.5 秒才刷新一次**：5 秒里 16.7 ms 一帧（300 帧）最多发布 10 次，且两次间隔 ≥ 0.5s
     #[test]
     fn the_displayed_value_updates_at_most_every_half_second() {
@@ -105,11 +169,15 @@ mod tests {
         let mut published_at: Vec<f64> = Vec::new();
         for i in 0..300 {
             let ms = 16.6667 * i as f64;
-            if m.note_frame(base + Duration::from_secs_f64(ms / 1000.0), Some(16.6667)) {
+            if m.note_frame(at(base, ms), Some(16.6667), false).published {
                 published_at.push(ms);
             }
         }
-        assert!(published_at.len() <= 10, "5 秒里发布了 {} 次：{published_at:?}", published_at.len());
+        assert!(
+            published_at.len() <= 10,
+            "5 秒里发布了 {} 次：{published_at:?}",
+            published_at.len()
+        );
         assert!(published_at.len() >= 9, "发布得太少：{published_at:?}");
         for w in published_at.windows(2) {
             assert!(w[1] - w[0] >= 500.0 - 16.7, "两次刷新间隔不足 0.5s：{published_at:?}");
@@ -124,31 +192,60 @@ mod tests {
     fn the_value_is_the_window_average_not_the_last_frame() {
         let base = Instant::now();
         let mut m = FpsMeter::new();
-        m.note_frame(base, None); // 开窗
+        m.note_frame(base, None, false); // 开窗
         let mut t = 0.0;
         for _ in 0..10 {
             t += 10.0;
-            assert!(!m.note_frame(base + Duration::from_secs_f64(t / 1000.0), Some(10.0)), "还没到 0.5s");
+            assert!(!m.note_frame(at(base, t), Some(10.0), false).published, "还没到 0.5s");
         }
         let mut published = false;
         for _ in 0..10 {
             t += 40.0;
-            published |= m.note_frame(base + Duration::from_secs_f64(t / 1000.0), Some(40.0));
+            published |= m.note_frame(at(base, t), Some(40.0), false).published;
         }
         assert!(published, "凑满 0.5 秒就该发布");
         let fps = m.shown().unwrap();
         assert!((fps - 40.0).abs() < 0.5, "窗口平均是 20 帧 / 0.5s = 40 fps，实际 {fps}");
     }
 
-    /// 空闲心跳（1 fps）要**照实**显示 1.0 —— 指示器不许把它抬起来
+    /// **空闲 = IDLE**（用户口径）：空闲时不再报 fps —— 那时根本没有帧
     #[test]
-    fn an_idle_heartbeat_shows_the_heartbeat_rate() {
+    fn idle_reads_as_idle_not_as_a_low_frame_rate() {
         let base = Instant::now();
         let mut m = FpsMeter::new();
-        assert!(!m.note_frame(base, None), "第一帧只开窗");
+        // 先干一会儿活，攒出一个真读数
+        let mut t = 0.0;
+        while m.shown().is_none() {
+            t += 16.6667;
+            m.note_frame(at(base, t), Some(16.6667), false);
+        }
+        assert!(m.text().unwrap().ends_with("fps"), "{:?}", m.text());
+        // 决定睡下（空闲 + 不再要帧）
+        let step = m.note_frame(at(base, t + 16.6667), Some(16.6667), true);
+        assert!(step.paint_idle, "决定睡下的那一帧要多要一帧，才能把 IDLE 写上去");
+        assert!(!step.published, "睡下这一帧不发布读数");
+        assert_eq!(m.text(), Some(IDLE_TEXT));
+        assert_eq!(m.shown(), None, "空闲时没有帧率可言");
+        assert!(m.is_sleeping());
+        // 睡下之后**每帧都不再要**（否则就成了新的心跳）
+        for i in 0..5 {
+            assert!(
+                !m.note_frame(at(base, t + 1000.0 * i as f64), Some(1000.0), true).paint_idle,
+                "睡下之后不该再要帧"
+            );
+            assert_eq!(m.text(), Some(IDLE_TEXT));
+        }
+    }
+
+    /// 空闲但**有心跳**（`--idle-fps N`，诊断用）时照旧报帧率：那时确实还在自己出帧
+    #[test]
+    fn an_idle_heartbeat_still_reports_its_own_rate() {
+        let base = Instant::now();
+        let mut m = FpsMeter::new();
+        assert_eq!(m.note_frame(base, None, false), Step::default(), "第一帧只开窗");
         let mut published = 0;
         for i in 1..=5 {
-            if m.note_frame(base + Duration::from_millis(1000 * i), Some(1000.0)) {
+            if m.note_frame(at(base, 1000.0 * i as f64), Some(1000.0), false).published {
                 published += 1;
             }
         }
@@ -162,13 +259,39 @@ mod tests {
     fn nothing_is_displayed_before_a_full_window() {
         let base = Instant::now();
         let mut m = FpsMeter::new();
-        m.note_frame(base, None);
+        m.note_frame(base, None, false);
         assert_eq!(m.text(), None);
         for i in 1..10 {
-            assert!(!m.note_frame(base + Duration::from_millis(16 * i), Some(16.0)));
+            assert!(!m.note_frame(at(base, 16.0 * i as f64), Some(16.0), false).published);
         }
         assert_eq!(m.text(), None, "0.16 秒还不到一个窗口");
         assert_eq!(m.shown(), None);
+    }
+
+    /// **醒来要立刻给数**，而且睡过去的时长不能算进帧率
+    /// （否则睡 60 秒醒来会算出 0.02 fps 这种荒谬值）
+    #[test]
+    fn waking_up_ignores_the_nap_and_publishes_a_fresh_value() {
+        let base = Instant::now();
+        let mut m = FpsMeter::new();
+        let mut t = 0.0;
+        while m.shown().is_none() {
+            t += 16.6667;
+            m.note_frame(at(base, t), Some(16.6667), false);
+        }
+        m.note_frame(at(base, t + 16.6667), Some(16.6667), true); // 睡下
+        t += 60_000.0; // 睡了一分钟（屏幕上一直是 IDLE）
+        // 醒来那一帧：`delta` 是睡过去的时长，必须丢掉
+        assert!(!m.note_frame(at(base, t), Some(60_000.0), false).published);
+        assert_eq!(m.shown(), None, "醒来那一帧还没数出值");
+        // 下一帧：立刻发布（不等 0.5 秒），值来自**新鲜**的帧间隔
+        assert!(
+            m.note_frame(at(base, t + 16.6667), Some(16.6667), false).published,
+            "醒来后该立刻给个数"
+        );
+        let fps = m.shown().unwrap();
+        assert!((fps - 60.0).abs() < 2.0, "60 fps 上下，实际 {fps}");
+        assert_eq!(m.text(), Some("60.0 fps"));
     }
 
     /// 坏值（NaN / 负 / 0 / 无穷）既不污染读数也不触发发布
@@ -176,15 +299,38 @@ mod tests {
     fn bad_deltas_are_ignored() {
         let base = Instant::now();
         let mut m = FpsMeter::new();
-        m.note_frame(base, None);
+        m.note_frame(base, None, false);
         for bad in [f64::NAN, -5.0, 0.0, f64::INFINITY] {
-            assert!(!m.note_frame(base + Duration::from_secs(1), Some(bad)), "{bad} 不该发布");
+            assert!(!m.note_frame(at(base, 1000.0), Some(bad), false).published, "{bad} 不该发布");
         }
         assert_eq!(m.shown(), None, "全是坏值，没有可显示的数");
         assert_eq!(m.text(), None);
         // 掺一个真值就该正常发布
-        assert!(m.note_frame(base + Duration::from_secs(2), Some(100.0)));
+        assert!(m.note_frame(at(base, 2000.0), Some(100.0), false).published);
         assert!((m.shown().unwrap() - 10.0).abs() < 1e-9, "{:?}", m.shown());
+    }
+
+    /// 文本是**缓存**的：值没变就不重建字符串（帧里不做无谓的格式化/排版）
+    #[test]
+    fn the_text_is_cached_between_refreshes() {
+        let base = Instant::now();
+        let mut m = FpsMeter::new();
+        m.note_frame(base, None, false);
+        let mut t = 0.0;
+        while !m.note_frame(at(base, t), Some(20.0), false).published {
+            t += 20.0;
+        }
+        let first = m.text().unwrap().to_owned();
+        assert_eq!(first, "50.0 fps");
+        let mut published = 0;
+        for _ in 0..10 {
+            t += 20.0;
+            if m.note_frame(at(base, t), Some(20.0), false).published {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 0, "0.2 秒内不该再发布");
+        assert_eq!(m.text(), Some(first.as_str()));
     }
 
     /// **记账本身的代价**（微基准，手动跑）：
@@ -203,35 +349,12 @@ mod tests {
         for i in 0..n {
             // 16.67 ms 一帧（60 fps）的模拟时间戳
             let at = base + Duration::from_nanos(i * 16_666_667 / 1000);
-            m.note_frame(at, Some(16.6667));
+            m.note_frame(at, Some(16.6667), false);
         }
         let ns = t.elapsed().as_secs_f64() * 1e9 / n as f64;
-        println!("\n[fps] note_frame（每帧都要走的那条路）: **{ns:.1} ns/帧**（{n} 次，含 0.5 秒一次的格式化与发布）");
+        println!(
+            "\n[fps] note_frame（每帧都要走的那条路）: **{ns:.1} ns/帧**（{n} 次，含 0.5 秒一次的格式化与发布）"
+        );
         println!("[fps] 作为对照：一个 60 fps 的帧预算 = 16.7 ms ⇒ 占了 {:.9}%", ns / 16_666_667.0 * 100.0);
-    }
-
-    /// 文本是**缓存**的：值没变就不重建字符串（帧里不做无谓的格式化/排版）
-    #[test]
-    fn the_text_is_cached_between_refreshes() {
-        let base = Instant::now();
-        let mut m = FpsMeter::new();
-        m.note_frame(base, None);
-        let mut t = 0.0;
-        while !m.note_frame(base + Duration::from_secs_f64(t / 1000.0), Some(20.0)) {
-            t += 20.0;
-        }
-        let first = m.text().unwrap().to_owned();
-        assert_eq!(first, "50.0 fps");
-        // 下一个窗口之前：内容不变（每帧都重建会得到同样的串，但那是白做的工作 —— 这里用
-        // 返回值的语义钉住"只有发布才重建"）
-        let mut published = 0;
-        for _ in 0..10 {
-            t += 20.0;
-            if m.note_frame(base + Duration::from_secs_f64(t / 1000.0), Some(20.0)) {
-                published += 1;
-            }
-        }
-        assert_eq!(published, 0, "0.2 秒内不该再发布");
-        assert_eq!(m.text(), Some(first.as_str()));
     }
 }
