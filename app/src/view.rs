@@ -128,6 +128,10 @@ pub struct NoteEdit {
     pub kind: String,
     pub start_beat: f64,
     pub end_beat: Option<f64>,
+    /// 判定时刻/释放时刻的**精确有理拍**（编辑器按 `[整拍] + [分子] / [分母]` 三个整数编辑）
+    pub start_exact: crate::doc::Beat,
+    /// 只有 hold 有（其余类型没有释放时刻）
+    pub end_exact: Option<crate::doc::Beat>,
     pub lane_x: f32,
     pub alpha: u16,
     pub is_fake: bool,
@@ -196,6 +200,8 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
             } else {
                 None
             },
+            start_exact: d.start,
+            end_exact: (d.kind == NoteKind::Hold).then(|| d.end_beat()),
             lane_x: d.lane_x,
             alpha: d.alpha,
             is_fake: d.is_fake,

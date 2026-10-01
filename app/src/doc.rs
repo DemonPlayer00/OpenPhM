@@ -51,8 +51,17 @@ fn gcd(a: i64, b: i64) -> i64 {
 }
 
 impl PartialEq for Beat {
+    /// **精确相等**（交叉相乘，走 `i128`）—— 不经过 f64。
+    ///
+    /// 以前是 `self.to_f64() == other.to_f64()`。那是"看起来相等"： numerator 超过 2^53 的两个
+    /// 不同整数在 f64 里会撞成一个数（`9007199254740993/1` 与 `9007199254740992/1`），
+    /// 于是判定时刻的相等/排序、去重、重叠检测都会把它们当成同一个时刻。
+    /// 交叉相乘还顺带容忍**没约分**的输入（`2/6 == 1/3`，`Beat` 经 `serde` 反序列化时可能带进来）。
+    ///
+    /// 实测真实谱面离撞车还差 ~11 个数量级（同一条线上相邻判定时刻最小间距 7.54e-4 拍，
+    /// 该量级的 f64 分辨率 1.2e-14）—— 仍然改成精确的：这条链上"几乎不会错"没有意义。
     fn eq(&self, other: &Self) -> bool {
-        self.to_f64() == other.to_f64()
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 impl Eq for Beat {}
@@ -63,7 +72,8 @@ impl PartialOrd for Beat {
 }
 impl Ord for Beat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.to_f64().partial_cmp(&other.to_f64()).unwrap_or(std::cmp::Ordering::Equal)
+        // i128：`n`/`d` 各自到 i64 上限时乘积也不会溢出
+        (self.n as i128 * other.d as i128).cmp(&(other.n as i128 * self.d as i128))
     }
 }
 
@@ -513,5 +523,40 @@ impl Document {
                 })
             }).collect::<Vec<_>>(),
         })
+    }
+}
+
+#[cfg(test)]
+mod beat_tests {
+    use super::Beat;
+
+    /// **拍的相等/排序是精确的**（交叉相乘），不经过 f64。
+    ///
+    /// 用户口径（2026-10-01）：判定时刻的比较要逐位精确。以前 `PartialEq`/`Ord` 都走
+    /// `to_f64()`，于是两个不同的大分子会在 f64 里撞成一个数 —— 去重、排序、重叠检测
+    /// 都会把它们当成同一个时刻。
+    #[test]
+    fn beat_equality_and_order_are_exact() {
+        // 没约分的输入也认（`serde` 反序列化可能带进来 `{"n":2,"d":6}`）
+        assert_eq!(Beat { n: 2, d: 6 }, Beat { n: 1, d: 3 });
+        assert_eq!(Beat { n: -2, d: -6 }, Beat { n: 1, d: 3 });
+        // 超过 2^53 的相邻整数：f64 下相等（都是 9007199254740992.0），精确比较必须不等
+        let a = Beat { n: 9_007_199_254_740_993, d: 1 };
+        let b = Beat { n: 9_007_199_254_740_992, d: 1 };
+        assert_eq!(a.to_f64(), b.to_f64(), "这条的前提：f64 下它们确实撞成一个数");
+        assert_ne!(a, b);
+        assert!(a > b);
+        // 排序：负数、分数、同值不同写法
+        assert!(Beat::new(-1, 3) < Beat::zero());
+        assert!(Beat::new(1, 3) < Beat::new(1, 2));
+        assert_eq!(
+            Beat::new(1, 3).cmp(&Beat::new(2, 6)),
+            std::cmp::Ordering::Equal,
+            "2/6 与 1/3 是同一个拍"
+        );
+        // 大分母也不能撞：1/(10^9) 与 1/(10^9+1) 在 f64 里是两个数，但精确比较更要分得开
+        assert!(Beat::new(1, 1_000_000_000) > Beat::new(1, 1_000_000_001));
+        // 交叉相乘不溢出：两边都取 i64 上限
+        assert!(Beat { n: i64::MAX, d: 1 } > Beat { n: i64::MAX - 1, d: 1 });
     }
 }

@@ -4946,3 +4946,37 @@ if idle { let entering = !self.idle; self.idle = true; if !entering { return fal
 （opm/RPE 两种文件夹各跑一遍：载入 → 改一处 → `save(None)` → 必须还能按原格式读回来）。
 命令行复核：`new --out fresh` → `--file fresh --cmd add_line --save` → 文件仍是 `"format": "opm"`、
 `summary` 可读；RPE 文件夹那条 `info.yml` 也还在。
+
+### 追加（同一天）：**音符的判定时间**也是三元组 —— 文件层已经如此，编辑器里补上；顺带把拍的比较改成精确（用户："检查音符的判定时间是否也使用三元组"）
+
+**先量文件层**（12 份真实 pez 的音符键**全枚举**，不是抽样）：
+
+```
+above/alpha/isFake/type  int 15996
+startTime / endTime      list[3] **15996/15996**（判定时刻 / hold 的释放时刻）
+positionX/size/speed/yOffset/visibleTime   float 15996
+judgeArea float 13724 | color 8258 / tint 5466  list[3]
+```
+
+⇒ 音符一共只有这 14 个键，**没有任何"单独的判定时间"字段**：判定时刻就是 `startTime`，
+100% 三元组。音符层唯一带 `time` 字样的浮点是 `visibleTime`（**可见时长·秒**），
+`judgeArea` 是**判定区宽度倍率**（float）—— 都与"什么时候判定"无关。
+Phira 的 RPE 音符表（[note](https://teamflos.github.io/phira-docs/chart-standard/chart-format/rpe/note.html)）
+列的也是这些字段，没有第二个时间字段。
+
+**编辑器这一侧才是缺的**：音符的 `拍`/`止` 还是**浮点框 + `EditorState::beat_json()` 按当前网格取整**
+（事件那两格上一轮已改）。于是编 `1/3` 得先把网格设成"每拍 3 条"，而且落盘的是量化后的值。
+现在改成与事件同一套：`view::NoteEdit` 带 `start_exact`/`end_exact`（精确有理拍），
+检查器用 `beat_triple_field` 画 **【整拍】+【分子】/【分母】**，命令载荷经
+`edit::beat_arg`（既约 `[分子, 分母]`；**命令语言只有这一种拍形状**，三元组是**文件**的形状）。
+**鼠标拖拽仍然按网格吸附** —— 拖是手势、键入是精确输入，两条路刻意不同。
+
+**第二处（用户点名要改）**：`Beat` 的 `PartialEq`/`Ord` 原来都走 `to_f64()`（"看起来相等"）：
+分子超过 2^53 的两个不同整数在 f64 里会撞成一个数，去重/排序/重叠检测就会把它们当成同一个时刻。
+改成**交叉相乘的精确比较**（走 `i128`，顺带容忍没约分的 `2/6 == 1/3`）。
+实测真实数据离撞车还有 ~11 个数量级（同一条判定线上相邻判定时刻最小间距 **7.54e-4 拍**，
+该量级的 f64 分辨率 **1.2e-14**）—— 仍然改：这条链上"几乎不会错"没有意义。
+
+验收：单测 `beat_equality_and_order_are_exact`（含"f64 下确实相等而精确比较不等"的那一对）、
+`note_judge_time_is_edited_as_a_whole_plus_fraction_triple`（控件 → 命令 → 文档 → 导出 pez：
+`startTime = [0,2,5]`、`endTime = [1,2,3]`）；12 份真实谱面 `pez→opm→pez` 复跑仍是 **0 处差异**。

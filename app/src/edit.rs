@@ -68,6 +68,15 @@ pub fn event_resize_command(
     })
 }
 
+/// 精确有理拍 → **命令语言**里的拍形状 `[分子, 分母]`（既约，不过浮点）。
+///
+/// 命令语言只有这一种拍形状（`cmd::parse_beat`）；**文件**里的形状是 RPE 的三元组
+/// `[整拍, 分子, 分母]`，由 `codec::beat_to_triple` 在导出时写出来。两者别混：
+/// 界面控件按三元组编辑，命令层收发既约分数。
+pub fn beat_arg(b: crate::doc::Beat) -> Value {
+    json!([b.n, b.d])
+}
+
 /// 事件头/尾 → `resize_event`，**精确有理拍**（事件编辑器的三元组控件走这条）。
 ///
 /// 与上面那条的区别就是**不吸附、不经过浮点**：控件编出来的是 `【整拍】+【分子】/【分母】`，
@@ -92,7 +101,7 @@ pub fn event_resize_command_exact(
         "track": track.key(),
         "index": at.index,
         "edge": edge,
-        "toBeat": [beat.n, beat.d],
+        "toBeat": beat_arg(beat),
     })
 }
 

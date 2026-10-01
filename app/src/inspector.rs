@@ -369,16 +369,20 @@ pub fn inspector_ui(
                 if kind != n.kind {
                     set.insert("kind".into(), serde_json::json!(kind));
                 }
-                let mut sb = n.start_beat;
-                if value_field(ui, &mut sb, "拍 ", 0.05, Some(0.0..=1e6)).changed
-                {
-                    set.insert("startBeat".into(), serde_json::json!(st.beat_json(sb)));
+                // ---- 判定时刻（`拍`）与释放时刻（hold 的 `止`）：同样是**三元组控件** ----
+                // 用户口径（2026-10-01）：音符的判定时间也用三元组。以前是浮点框 + `beat_json`
+                // 按当前网格取整 —— 编 1/3 得先把网格改成"每拍 3 条"，而且落盘走的是量化后的值。
+                // 这里直接给精确有理拍（`[分子, 分母]`，既约），鼠标拖拽那条路仍然按网格吸附。
+                if let Some(b) = beat_triple_field(ui, "note_start", "拍 ", n.start_exact) {
+                    if b.n != n.start_exact.n || b.d != n.start_exact.d {
+                        set.insert("startBeat".into(), opm_app::edit::beat_arg(b));
+                    }
                 }
-                if let Some(eb0) = n.end_beat {
-                    let mut eb = eb0;
-                    if value_field(ui, &mut eb, "止 ", 0.05, Some(0.0..=1e6)).changed
-                    {
-                        set.insert("endBeat".into(), serde_json::json!(st.beat_json(eb)));
+                if let Some(was) = n.end_exact {
+                    if let Some(b) = beat_triple_field(ui, "note_end", "止 ", was) {
+                        if b.n != was.n || b.d != was.d {
+                            set.insert("endBeat".into(), opm_app::edit::beat_arg(b));
+                        }
                     }
                 }
                 let mut lane = n.lane_x;
@@ -807,5 +811,57 @@ mod tests {
             mx.iter().any(|e| e["startTime"] == json!([0, 1, 3])),
             "导出的 pez 里应有 startTime = [0,1,3]：{text}"
         );
+    }
+
+    /// **音符的判定时刻同样用三元组编辑**（用户口径，2026-10-01）：
+    /// `拍`（判定时刻）与 hold 的 `止`（释放时刻）都是 `【整拍】+【分子】/【分母】`，
+    /// 命令里发**既约**有理拍 ⇒ 导出到 pez 就是 `[整拍, 分子, 分母]`。
+    ///
+    /// 以前是浮点框 + `st.beat_json()` 按网格取整：编 `1/3` 得先把网格改成"每拍 3 条"，
+    /// 而且落盘的是量化后的值。（鼠标拖拽那条路仍然按网格吸附 —— 那是手势，不是键入。）
+    #[test]
+    fn note_judge_time_is_edited_as_a_whole_plus_fraction_triple() {
+        let mut c = EditCore::new();
+        let r = c.exec(&json!({"op":"add_note","line":0,"kind":"hold",
+                               "startBeat":[1,3],"endBeat":[5,3],"laneX":100.0}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.selected_line = 0;
+        st.select_note(0);
+        let mut insp = view::inspector_of(&st, c.doc()).expect("有选中的线");
+        let n = insp.note_edit.as_ref().expect("有选中的音符");
+        assert_eq!((n.start_exact.n, n.start_exact.d), (1, 3), "判定时刻的精确拍进快照");
+        assert_eq!(n.end_exact.map(|b| (b.n, b.d)), Some((5, 3)), "hold 的释放时刻也在");
+
+        // ① 面板画的是三元组控件（`拍`/`止` + 两个分隔符），且没交互不发命令
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut cmds = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            cmds = inspector_ui(ui, &st, Some(&mut insp));
+        });
+        out.textures_delta.clear();
+        let joined = drawn_texts(&out).join("\n");
+        for want in ["拍", "止", "+", "/"] {
+            assert!(joined.contains(want), "音符的三元组控件没画全，缺 {want:?}：\n{joined}");
+        }
+        assert!(cmds.is_empty(), "没交互却发了命令：{cmds:?}");
+
+        // ② 控件产出的那份 `set` 载荷 → 施加 → 导出 pez：`startTime` 是 `[0, 2, 5]`
+        let payload = json!({"startBeat": opm_app::edit::beat_arg(opm_app::doc::Beat::new(2, 5))});
+        assert_eq!(payload["startBeat"], json!([2, 5]), "命令里是既约有理拍：{payload}");
+        let r = c.exec(&json!({"op":"set_note","line":0,"index":0,"set":payload}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let (text, _fid) = opm_app::codec::rpe::save_str(c.doc(), Default::default());
+        let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let note = &root["judgeLineList"][0]["notes"][0];
+        assert_eq!(note["startTime"], json!([0, 2, 5]), "判定时刻要精确落在 2/5 拍：{text}");
+        assert_eq!(note["endTime"], json!([1, 2, 3]), "释放时刻仍是 5/3 拍");
     }
 }
