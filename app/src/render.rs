@@ -104,11 +104,33 @@ pub struct MaskVertex {
     /// 为什么放在着色器里而不是 CPU 端：① 才有逐像素的坐标（CPU 端只能按顶点着色，
     /// 光晕会随三角形剖分看出棱角）；② "不超出遮蔽区边界"天然成立 —— 填充几何本身就是那块区域。
     glow: [f32; 4],
+    /// 网格图案：`[要不要画, 线的 alpha, 间距(px), 线宽(px)]` —— 同样是**片元着色器里**算。
+    ///
+    /// 为什么图案也进着色器（而不是 CPU 造线段几何）：① 方格纹理要**旋转 45°**
+    /// （用户口径 2026-10-02），斜线裁进任意三角形的活不该在 CPU 上逐行做；
+    /// ② 填充几何本身就是那块区域 ⇒ 图案**不可能**画到区域外；
+    /// ③ `fwidth` 顺带把线做成抗锯齿的。`grid.x <= 0.5` 的顶点不走这一段。
+    grid: [f32; 4],
 }
 
 impl MaskVertex {
-    pub fn new(pos: [f32; 2], color: [f32; 4], glow: [f32; 4]) -> Self {
-        Self { pos, color, glow }
+    pub fn new(pos: [f32; 2], color: [f32; 4], glow: [f32; 4], grid: [f32; 4]) -> Self {
+        Self { pos, color, glow, grid }
+    }
+
+    /// 只读访问器：字段是私有的，而"遮蔽区最终长什么样"要能被**测试与出图检查**读到
+    /// （`mask::tests` 钉的就是这几个值：填充 alpha、发光强度、网格参数）。
+    pub fn pos(&self) -> [f32; 2] {
+        self.pos
+    }
+    pub fn color(&self) -> [f32; 4] {
+        self.color
+    }
+    pub fn glow(&self) -> [f32; 4] {
+        self.glow
+    }
+    pub fn grid(&self) -> [f32; 4] {
+        self.grid
     }
 }
 
@@ -266,7 +288,9 @@ impl Playfield {
         let mask_layouts = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MaskVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4, 2 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4
+            ],
         })];
         let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("playfield-mask"),
@@ -1006,14 +1030,17 @@ struct MaskIn {
     @location(0) pos: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) glow: vec4<f32>,
+    @location(3) grid: vec4<f32>,
 };
 struct MaskOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     /// 发光参数：`xy` = 光标（RPE），`z` = 半径（**像素**），`w` = 强度 + 软化
     @location(1) glow: vec4<f32>,
-    /// 该片元在演奏区里的像素坐标（发光要按像素算距离）
-    @location(2) px: vec2<f32>,
+    /// 网格图案：`[要不要画, 线的 alpha, 间距(px), 线宽(px)]`
+    @location(2) grid: vec4<f32>,
+    /// 该片元在演奏区里的像素坐标（发光与网格都按像素算）
+    @location(3) px: vec2<f32>,
 };
 
 @vertex
@@ -1024,6 +1051,7 @@ fn vs_mask(in: MaskIn) -> MaskOut {
     out.clip = vec4<f32>(px / (u.viewport_px * 0.5), 0.0, 1.0);
     out.color = in.color;
     out.glow = in.glow;
+    out.grid = in.grid;
     out.px = px;
     return out;
 }
@@ -1038,6 +1066,25 @@ fn fs_mask(in: MaskOut) -> @location(0) vec4<f32> {
     let soft = clamp(in.glow.w * 0.0 + 0.45, 0.0, 0.95);
     let k = 1.0 - smoothstep(1.0 - soft, 1.0, d);
     var c = in.color;
+    // ---- 网格：**方格纹理旋转 45°**（用户口径 2026-10-02）----
+    //
+    // 在旋转后的坐标里取格线：u = (x+y)/√2、v = (x−y)/√2 ⇒ 两族 ±45° 的斜线，
+    // 相邻平行线的间距仍是 `grid.z`（旋转的是**纹理**，不是把格子拉大）。
+    // 锚点是 RPE 原点（`px` 以视口中心为原点）—— 于是网格跟着屏幕走、不贴在三角形上。
+    // 线是**更透明的那一部分**（"网格变为提高透明度的样子"）：`mix` 到 `grid.y`。
+    if in.grid.x > 0.5 {
+        let step = max(in.grid.z, 1.0);
+        let k = 0.70710678;
+        let uv = vec2<f32>((in.px.x + in.px.y) * k, (in.px.x - in.px.y) * k) / step;
+        let f = fract(uv);
+        let du = min(f.x, 1.0 - f.x) * step;
+        let dv = min(f.y, 1.0 - f.y) * step;
+        let d = min(du, dv);
+        let half_w = max(in.grid.w, 0.5) * 0.5;
+        let aa = max(fwidth(d), 0.35);
+        let cov = 1.0 - smoothstep(half_w - aa, half_w + aa, d);
+        c.a = mix(c.a, in.grid.y, cov);
+    }
     let strength = max(in.glow.w, 0.0);
     c.a = clamp(c.a + strength * k, 0.0, 1.0);
     // 亮起来时**极轻**地往白里提一点：只提 0.08 —— 提多了会显得"被冲淡"（像变透明），

@@ -12,26 +12,27 @@
 //! · 三角形顶点顺序无关紧要（凸包判定与线段裁剪都不依赖它）；
 //! · 一切退化情形（面积 0、点重合）都返回"没有形状"，而不是除以 0。
 
-/// 遮蔽区的一档外观（用户口径：`active=false` = 纯色、不透明度更高；
-/// `active=true` = 不透明度更低 + 细网格线条）。
+/// 遮蔽区的一档外观：填充不透明度 + 要不要画网格。
+///
+/// **两档的排序是"active 更重"**（用户口径 2026-10-02："active 要比 inactive 更不透明"，
+/// 也是最初那条"false 时透明度较高、true 时透明度变低"）：active 那档的填充**更不透明**，
+/// 网格是它上面**更透明的那一部分**（"网格变为提高透明度的样子"）——
+/// 线里能看见下面的音符，格子中间是那块更重的红。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaskStyle {
     /// 填充的不透明度 0~1
     pub fill_alpha: f32,
-    /// 是否画细网格
+    /// 是否画网格（图案在片元着色器里，见 `render::MASK_SHADER`）
     pub grid: bool,
 }
 
-/// 两种外观的**唯一定义**（预览、编辑区、无头出图都用它，免得三处各调一次参数）。
-///
-/// 依据用户口径：false 是"屏蔽区透明度较高且纯色"，true 是"透明度变低且绘制细网格线条"。
-/// 数值本身是观感取舍：纯色那档要挡住底下的音符（0.42），网格那档要能看清底下（0.18）。
-pub const MASK_FILL_SOLID: f32 = 0.42;
-pub const MASK_FILL_GRID: f32 = 0.18;
+/// 两种外观的**唯一定义**（预览、检查器、无头出图都用它，免得三处各调一次参数）。
+pub const MASK_FILL_ACTIVE: f32 = 0.62;
+pub const MASK_FILL_SOLID: f32 = 0.18;
 
 pub fn mask_style(active: bool) -> MaskStyle {
     if active {
-        MaskStyle { fill_alpha: MASK_FILL_GRID, grid: true }
+        MaskStyle { fill_alpha: MASK_FILL_ACTIVE, grid: true }
     } else {
         MaskStyle { fill_alpha: MASK_FILL_SOLID, grid: false }
     }
@@ -39,12 +40,20 @@ pub fn mask_style(active: bool) -> MaskStyle {
 
 /// 遮蔽区的底色（红）。用**同一份**红：预览的填充、轮廓、编辑区里那一列的高亮。
 pub const MASK_RED: [u8; 3] = [232, 64, 72];
-/// 细网格线的线宽（**像素**）与不透明度 —— 与判定线那边一样按像素给，缩放时观感恒定
+/// 网格线的线宽（**像素**）与 alpha —— 与判定线那边一样按像素给，缩放时观感恒定。
+///
+/// `GRID_ALPHA` **小于** [`MASK_FILL_ACTIVE`]：线是"透出来的那部分"（用户口径），
+/// 于是 active 那档的观感是"浓红底 + 一层更透明的斜格"。
 pub const GRID_LINE_PX: f32 = 1.6;
-pub const GRID_ALPHA: f32 = 0.42;
-/// 细网格线的间距（**RPE 单位**；窗口高 900 ÷ 16 = 56.25 —— 视觉上是"细网格"，
+pub const GRID_ALPHA: f32 = 0.18;
+/// 网格的间距（**RPE 单位**；窗口高 900 ÷ 16 = 56.25 —— 视觉上是"细网格"，
 /// 又不至于密到糊成一片。调用方按当前缩放折成像素）
 pub const MASK_GRID_STEP: f32 = 56.25;
+/// 网格纹理的**倾角**（度）：用户口径 2026-10-02 —— "将 active 状态下的屏蔽区预览方格纹理旋转 45 度"。
+///
+/// 旋转发生在**屏幕空间**（锚点是 RPE 原点，跟着屏幕走、不跟着三角形走）：
+/// 相邻两条平行线的间距不变，变的是"格子从正着放变成菱形放"。
+pub const MASK_GRID_TILT_DEG: f32 = 45.0;
 
 /// 三角形是否有面积（三个顶点不共线且不重合）
 pub fn triangle_area2(tri: &[[f32; 2]; 3]) -> f32 {
@@ -109,17 +118,15 @@ pub struct ZoneTri {
 /// **合并后**的预览几何（RPE 坐标；GPU 侧只负责把顶点喂进去）
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MaskDraw {
-    /// 纯色那一档的填充（每 3 个一组 = 一个三角形）
+    /// `active=false` 那一档的填充（每 3 个一组 = 一个三角形）
     pub solid: Vec<[[f32; 2]; 3]>,
-    /// 网格那一档的填充（更透明 + 细网格）
+    /// `active=true` 那一档的填充（更不透明；网格图案由片元着色器按这块几何画）
     pub active: Vec<[[f32; 2]; 3]>,
-    /// 细网格线（**只落在网格那一档的区域里**）
-    pub grid: Vec<[[f32; 2]; 2]>,
 }
 
 impl MaskDraw {
     pub fn is_empty(&self) -> bool {
-        self.solid.is_empty() && self.active.is_empty() && self.grid.is_empty()
+        self.solid.is_empty() && self.active.is_empty()
     }
 }
 
@@ -139,7 +146,7 @@ pub fn push_mask_vertices(
         return;
     }
     let mut draw = MaskDraw::default();
-    build_mask_draw(zones, scale_px, MASK_GRID_STEP, &mut draw);
+    build_mask_draw(zones, scale_px, &mut draw);
     let rgba = |a: f32| {
         [
             MASK_RED[0] as f32 / 255.0,
@@ -148,36 +155,29 @@ pub fn push_mask_vertices(
             a,
         ]
     };
-    for t in &draw.solid {
-        for v in t {
-            out.push(crate::render::MaskVertex::new(*v, rgba(MASK_FILL_SOLID), glow));
+    // 网格图案的参数（片元着色器要用）：`[要不要画, 线的 alpha, 间距(px), 线宽(px)]`。
+    // 间距按当前缩放折成像素 —— 于是"细网格"在任何缩放级别下都是同一个观感。
+    let step_px = MASK_GRID_STEP * scale_px.max(1e-6);
+    let pattern = |style: MaskStyle| -> [f32; 4] {
+        if style.grid {
+            [1.0, GRID_ALPHA, step_px, GRID_LINE_PX]
+        } else {
+            [0.0; 4]
         }
-    }
-    for t in &draw.active {
-        for v in t {
-            out.push(crate::render::MaskVertex::new(*v, rgba(MASK_FILL_GRID), glow));
-        }
-    }
-    // 细网格：线段铺成细四边形（厚度按**像素**折回 RPE，缩放时观感恒定）
-    let half = (GRID_LINE_PX * 0.5) / scale_px.max(1e-6);
-    let col = rgba(GRID_ALPHA);
-    for s in &draw.grid {
-        let (a, b) = (s[0], s[1]);
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len = (dx * dx + dy * dy).sqrt();
-        if len <= 1e-6 {
-            continue;
-        }
-        let (nx, ny) = (-dy / len * half, dx / len * half);
-        let quad = [
-            [a[0] - nx, a[1] - ny],
-            [a[0] + nx, a[1] + ny],
-            [b[0] + nx, b[1] + ny],
-            [b[0] - nx, b[1] - ny],
-        ];
-        for idx in [[0usize, 1, 2], [0, 2, 3]] {
-            for i in idx {
-                out.push(crate::render::MaskVertex::new(quad[i], col, glow));
+    };
+    for (tris, active) in [(&draw.solid, false), (&draw.active, true)] {
+        let style = mask_style(active);
+        // **inactive 那档"光标靠近也不发亮"**（用户口径 2026-10-02）：强度直接置 0 ——
+        // 发光是按顶点属性传给片元的，所以"哪一档会亮"在这里就定死了。
+        let g = if active {
+            glow
+        } else {
+            [glow[0], glow[1], glow[2], 0.0]
+        };
+        let pat = pattern(style);
+        for t in tris {
+            for v in t {
+                out.push(crate::render::MaskVertex::new(*v, rgba(style.fill_alpha), g, pat));
             }
         }
     }
@@ -351,7 +351,7 @@ fn band_edges(zones: &[ZoneTri], step: f32) -> Vec<f32> {
 ///    （`subtract_intervals`），于是同一像素只属于其中一档。网格线也只画在网格那档的区域里。
 ///
 /// `scale_px` = 1 RPE 等于多少像素（决定行带切多细）；`grid_step` = 网格间距（RPE）。
-pub fn build_mask_draw(zones: &[ZoneTri], scale_px: f32, grid_step: f32, out: &mut MaskDraw) {
+pub fn build_mask_draw(zones: &[ZoneTri], scale_px: f32, out: &mut MaskDraw) {
     let step = if scale_px > 1e-6 { (BAND_PX / scale_px).max(1e-3) } else { 1.0 };
     let ys = band_edges(zones, step);
     if ys.len() < 2 {
@@ -393,82 +393,9 @@ pub fn build_mask_draw(zones: &[ZoneTri], scale_px: f32, grid_step: f32, out: &m
         let rest0 = subtract_intervals(&ina0, &act0);
         let rest1 = subtract_intervals(&ina1, &act1);
         emit_intervals(&mut out.solid, y0, y1, &rest0, &rest1);
-        // ---- 网格线：只落在**网格那档**的区域里 ----
-        if !act0.is_empty() || !act1.is_empty() {
-            let inside = |v: &[(f32, f32)], x: f32| v.iter().any(|&(a, b)| x > a + eps && x < b - eps);
-            // 竖线：在整条带里都落在区域内才画
-            let k0 = (ys[0] / grid_step).floor() as i64;
-            let k1 = (ys[ys.len() - 1] / grid_step).ceil() as i64;
-            for k in k0..=k1 {
-                let x = k as f32 * grid_step;
-                if inside(&act0, x) && inside(&act1, x) {
-                    out.grid.push([[x, y0], [x, y1]]);
-                }
-            }
-            // 横线：落在这一条带里的那一条（横线的 y 是绝对的网格位置）
-            let ky0 = (y0 / grid_step).ceil() as i64;
-            let ky1 = (y1 / grid_step).floor() as i64;
-            for k in ky0..=ky1 {
-                let y = k as f32 * grid_step;
-                let at = if (y - y0).abs() < 1e-6 { &act0 } else { &act1 };
-                for &(a, b) in at {
-                    if b - a > eps {
-                        out.grid.push([[a, y], [b, y]]);
-                    }
-                }
-            }
-        }
     }
 }
 
-/// 用**半平面**裁剪一条线段到凸多边形（这里是三角形）。/// 用**半平面**裁剪一条线段到凸多边形（这里是三角形）。
-///
-/// 返回裁剪后的两个端点（`None` = 整条线段在外面）。用 Cyrus–Beck 的等价形式：
-/// 逐条边把参数区间 `[t0, t1]` 收紧；退化多边形直接给 `None`。
-///
-/// 为什么需要它：三角形里的"细网格"是**直线**，而 egui 只能按矩形裁剪 ——
-/// 按外接矩形裁会在三角形外面留下网格线（那看起来像溢出的 bug）。
-pub fn clip_segment_to_triangle(
-    p0: [f32; 2],
-    p1: [f32; 2],
-    tri: &[[f32; 2]; 3],
-) -> Option<[[f32; 2]; 2]> {
-    if triangle_is_degenerate(tri) {
-        return None;
-    }
-    let s = triangle_area2(tri).signum();
-    let d = [p1[0] - p0[0], p1[1] - p0[1]];
-    let mut t0 = 0.0f32;
-    let mut t1 = 1.0f32;
-    for i in 0..3 {
-        let a = tri[i];
-        let b = tri[(i + 1) % 3];
-        // 内侧 = cross(b-a, p-a) 与三角形定向同号
-        let e = [b[0] - a[0], b[1] - a[1]];
-        let num = s * ((e[0] * (p0[1] - a[1])) - (e[1] * (p0[0] - a[0])));
-        let den = s * ((e[0] * d[1]) - (e[1] * d[0]));
-        if den.abs() < 1e-9 {
-            if num < -1e-6 {
-                return None; // 平行且在边外
-            }
-            continue;
-        }
-        let t = -num / den;
-        if den > 0.0 {
-            // 进入
-            if t > t0 {
-                t0 = t;
-            }
-        } else if t < t1 {
-            t1 = t;
-        }
-        if t0 > t1 {
-            return None;
-        }
-    }
-    let at = |t: f32| [p0[0] + d[0] * t, p0[1] + d[1] * t];
-    Some([at(t0), at(t1)])
-}
 
 /// 三角形内部的**细网格线段**（屏幕像素）。
 ///
@@ -480,56 +407,7 @@ pub fn clip_segment_to_triangle(
 /// 三条边都超出 `max_lines` 时截断（极端缩放下不至于生成几万条线）。
 pub const MASK_GRID_MAX_LINES: usize = 512;
 
-/// 裁剪之后还值得画吗（**退化成点的线段一律丢**）：网格线正好落在三角形的顶点上时，
-/// 裁剪结果是"两个端点重合"——画它等于画一个点，还会把网格线的条数算多。
-fn segment_is_drawable(s: &[[f32; 2]; 2]) -> bool {
-    let dx = s[1][0] - s[0][0];
-    let dy = s[1][1] - s[0][1];
-    (dx * dx + dy * dy).sqrt() >= 0.5
-}
 
-pub fn mask_grid_lines(tri: &[[f32; 2]; 3], step_px: f32, origin: [f32; 2]) -> Vec<[[f32; 2]; 2]> {
-    let mut out: Vec<[[f32; 2]; 2]> = Vec::new();
-    if triangle_is_degenerate(tri) || !(step_px > 1.0) {
-        return out;
-    }
-    let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-    for v in tri {
-        minx = minx.min(v[0]);
-        maxx = maxx.max(v[0]);
-        miny = miny.min(v[1]);
-        maxy = maxy.max(v[1]);
-    }
-    // 竖线
-    let k0 = ((minx - origin[0]) / step_px).floor() as i32;
-    let k1 = ((maxx - origin[0]) / step_px).ceil() as i32;
-    for k in k0..=k1 {
-        if out.len() >= MASK_GRID_MAX_LINES {
-            return out;
-        }
-        let x = origin[0] + k as f32 * step_px;
-        if let Some(s) = clip_segment_to_triangle([x, miny - 1.0], [x, maxy + 1.0], tri) {
-            if segment_is_drawable(&s) {
-                out.push(s);
-            }
-        }
-    }
-    // 横线
-    let k0 = ((miny - origin[1]) / step_px).floor() as i32;
-    let k1 = ((maxy - origin[1]) / step_px).ceil() as i32;
-    for k in k0..=k1 {
-        if out.len() >= MASK_GRID_MAX_LINES {
-            return out;
-        }
-        let y = origin[1] + k as f32 * step_px;
-        if let Some(s) = clip_segment_to_triangle([minx - 1.0, y], [maxx + 1.0, y], tri) {
-            if segment_is_drawable(&s) {
-                out.push(s);
-            }
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -551,62 +429,58 @@ mod tests {
         let line = [[0.0, 0.0], [50.0, 0.0], [100.0, 0.0]];
         assert!(triangle_is_degenerate(&line));
         assert!(!point_in_triangle([50.0, 0.0], &line));
-        assert!(clip_segment_to_triangle([0.0, 0.0], [10.0, 10.0], &line).is_none());
     }
 
-    /// 两档外观就是用户口径那两句
+    /// 两档外观就是用户口径那几句（2026-10-02）：
+    /// **active 更不透明**、网格是**更透明的那部分**、纹理**旋转 45°**、inactive 没有网格。
     #[test]
     fn the_two_styles_match_the_spec() {
         let off = mask_style(false);
         let on = mask_style(true);
-        assert!(!off.grid, "false = 纯色");
-        assert!(on.grid, "true = 细网格");
-        assert!(off.fill_alpha > on.fill_alpha, "false 更不透明（透明度更低）");
+        assert!(!off.grid, "false = 纯色（没有网格）");
+        assert!(on.grid, "true = 网格");
+        assert!(
+            on.fill_alpha > off.fill_alpha,
+            "**active 要比 inactive 更不透明**：{} vs {}",
+            on.fill_alpha,
+            off.fill_alpha
+        );
+        assert!(
+            GRID_ALPHA < on.fill_alpha,
+            "网格线是'提高透明度'的那部分（线比填充更透）：{} vs {}",
+            GRID_ALPHA,
+            on.fill_alpha
+        );
+        assert_eq!(MASK_GRID_TILT_DEG, 45.0, "方格纹理旋转 45 度（用户口径）");
     }
 
-    /// 线段裁剪：穿过、完全在内、完全在外、刚好切角
+    /// 顶点装配：**网格参数只出现在 active 那档**，且 **inactive 的发光强度是 0**
+    /// （用户口径："inactive 状态下的屏蔽区，光标靠近不发亮"）。
     #[test]
-    fn clipping_a_segment_to_the_triangle() {
-        // 完全在内
-        let s = clip_segment_to_triangle([10.0, 10.0], [20.0, 10.0], &tri()).expect("在内");
-        assert!((s[0][0] - 10.0).abs() < 1e-3 && (s[1][0] - 20.0).abs() < 1e-3);
-        // 横穿：从 (-50, 10) 到 (500, 10) ⇒ 只保留 x ∈ [0, 90]（斜边 x + y = 100）
-        let s = clip_segment_to_triangle([-50.0, 10.0], [500.0, 10.0], &tri()).expect("横穿");
-        assert!((s[0][0] - 0.0).abs() < 1e-3, "{s:?}");
-        assert!((s[1][0] - 90.0).abs() < 1e-3, "{s:?}");
-        // 完全在外
-        assert!(clip_segment_to_triangle([200.0, 200.0], [300.0, 300.0], &tri()).is_none());
-        // 竖线贴着 x=0：只保留三角形内的那一段（y 从 0 到 10 —— y<0 在边外）
-        let s = clip_segment_to_triangle([0.0, -10.0], [0.0, 10.0], &tri()).expect("贴边竖线");
-        assert!(s[0][1].abs() < 1e-3 && (s[1][1] - 10.0).abs() < 1e-3, "{s:?}");
-        // 与边平行且在外侧：没有交集
-        assert!(clip_segment_to_triangle([110.0, -10.0], [110.0, 10.0], &tri()).is_none());
-    }
-
-    /// 网格线：全在三角形里（裁剪生效）、间距正确、锚在给定原点上
-    #[test]
-    fn grid_lines_are_clipped_and_anchored() {
-        let lines = mask_grid_lines(&tri(), 25.0, [0.0, 0.0]);
-        assert!(!lines.is_empty());
-        for l in &lines {
-            // 两端点都必须落在三角形内（裁剪过的）
-            assert!(point_in_triangle(l[0], &tri()), "端点跑出去了：{l:?}");
-            assert!(point_in_triangle(l[1], &tri()), "端点跑出去了：{l:?}");
+    fn vertices_carry_the_pattern_only_when_active_and_never_light_up_inactive() {
+        let glow = [0.0, 0.0, GLOW_RADIUS_PX, GLOW_STRENGTH];
+        let solid = ZoneTri { tri: [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]], active: false };
+        let active = ZoneTri { tri: [[200.0, 0.0], [300.0, 0.0], [200.0, 100.0]], active: true };
+        let mut v: Vec<crate::render::MaskVertex> = Vec::new();
+        push_mask_vertices(&[solid, active], 2.0, glow, &mut v);
+        assert!(!v.is_empty());
+        let (mut n_solid, mut n_active) = (0, 0);
+        for x in &v {
+            if x.grid()[0] > 0.5 {
+                n_active += 1;
+                assert_eq!(x.grid()[1], GRID_ALPHA);
+                assert!((x.grid()[2] - MASK_GRID_STEP * 2.0).abs() < 1e-3, "间距随缩放折成像素");
+                assert_eq!(x.grid()[3], GRID_LINE_PX);
+                assert!(x.color()[3] > 0.5, "active 的填充更不透明：{}", x.color()[3]);
+            } else {
+                n_solid += 1;
+                assert_eq!(x.grid(), [0.0; 4], "inactive 不该带网格参数");
+                assert_eq!(x.glow()[3], 0.0, "**inactive 不发光**（强度 0）");
+            }
         }
-        // x = 0 / 25 / 50 / 75 与 y = 0 / 25 / 50 / 75 ⇒ 竖线 4 条 + 横线 4 条（x=100、y=100 退化成点）
-        let vertical = lines.iter().filter(|l| (l[0][0] - l[1][0]).abs() < 1e-3).count();
-        let horizontal = lines.iter().filter(|l| (l[0][1] - l[1][1]).abs() < 1e-3).count();
-        assert_eq!((vertical, horizontal), (4, 4), "{lines:?}");
-        // 锚点平移 ⇒ 网格线整体平移
-        let shifted = mask_grid_lines(&tri(), 25.0, [5.0, 5.0]);
-        assert!(shifted.iter().any(|l| (l[0][0] - l[1][0]).abs() < 1e-3 && (l[0][0] - 5.0).abs() < 1e-3));
-        // 间距过小 / 退化三角形：不生成（否则会画出几万条线）
-        assert!(mask_grid_lines(&tri(), 0.5, [0.0, 0.0]).is_empty());
-        assert!(mask_grid_lines(&[[0.0, 0.0]; 3], 25.0, [0.0, 0.0]).is_empty());
-        // 上限生效
-        let many = mask_grid_lines(&[[0.0, 0.0], [4000.0, 0.0], [0.0, 4000.0]], 1.5, [0.0, 0.0]);
-        assert!(many.len() <= MASK_GRID_MAX_LINES);
+        assert!(n_solid > 0 && n_active > 0, "两档都要有顶点");
     }
+
 }
 
 #[cfg(test)]
@@ -641,8 +515,8 @@ mod region_tests {
     fn one_triangle_fills_exactly_itself() {
         let t = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
         let mut d = MaskDraw::default();
-        build_mask_draw(&[t], 1.0, 1000.0, &mut d);
-        assert!(d.active.is_empty() && d.grid.is_empty(), "纯色那档不该有网格");
+        build_mask_draw(&[t], 1.0, &mut d);
+        assert!(d.active.is_empty(), "纯色那档不进 active 几何（网格图案因此也不会画）");
         let area: f32 = d.solid.iter().map(|t| triangle_area2(t).abs() * 0.5).sum();
         assert!((area - 5000.0).abs() < 0.01, "面积该**精确**等于 100×100/2：{area}");
         // 每个顶点都落在原三角形里（或者贴着边）
@@ -666,7 +540,7 @@ mod region_tests {
         let a = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
         let b = tri([50.0, 0.0], [150.0, 0.0], [50.0, 100.0], false);
         let mut d = MaskDraw::default();
-        build_mask_draw(&[a, b], 1.0, 1000.0, &mut d);
+        build_mask_draw(&[a, b], 1.0, &mut d);
         let area: f32 = d.solid.iter().map(|t| triangle_area2(t).abs() * 0.5).sum();
         // 两块各 5000；重叠区 = {x≥50, y≥0, x+y≤100}（直角边各 50）⇒ 1250 ⇒ 并集 8750。
         // 容差 20 px²（0.2%）：两块的区间在**同一个带里合并/分裂**时那一带退回外接矩形。
@@ -680,7 +554,7 @@ mod region_tests {
         let solid = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
         let grid = tri([50.0, 0.0], [150.0, 0.0], [50.0, 100.0], true);
         let mut d = MaskDraw::default();
-        build_mask_draw(&[solid, grid], 1.0, 1000.0, &mut d);
+        build_mask_draw(&[solid, grid], 1.0, &mut d);
         let area = |v: &Vec<[[f32; 2]; 3]>| -> f32 {
             v.iter().map(|t| triangle_area2(t).abs() * 0.5).sum()
         };
@@ -692,30 +566,13 @@ mod region_tests {
         assert!((aw + sw - 8750.0).abs() < 30.0, "两档加起来 = 并集，不重不漏");
     }
 
-    /// 网格线**只落在网格那档的区域里**（这正是"不超出遮蔽区边界"）
-    #[test]
-    fn grid_lines_stay_inside_the_active_region() {
-        let grid = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], true);
-        let mut d = MaskDraw::default();
-        build_mask_draw(&[grid], 1.0, 25.0, &mut d);
-        assert!(!d.grid.is_empty(), "该有网格线");
-        for s in &d.grid {
-            for p in s {
-                assert!(
-                    p[0] >= -1e-3 && p[1] >= -1e-3 && p[0] + p[1] <= 100.0 + 1e-3,
-                    "网格线跑到区域外了：{s:?}"
-                );
-            }
-        }
-    }
-
     /// 退化三角形（三个点重合/共线）不产生任何几何
     #[test]
     fn degenerate_zones_draw_nothing() {
         let mut d = MaskDraw::default();
-        build_mask_draw(&[tri([5.0, 5.0], [5.0, 5.0], [5.0, 5.0], false)], 1.0, 25.0, &mut d);
+        build_mask_draw(&[tri([5.0, 5.0], [5.0, 5.0], [5.0, 5.0], false)], 1.0, &mut d);
         assert!(d.is_empty(), "{d:?}");
-        build_mask_draw(&[tri([0.0, 0.0], [10.0, 0.0], [20.0, 0.0], true)], 1.0, 25.0, &mut d);
+        build_mask_draw(&[tri([0.0, 0.0], [10.0, 0.0], [20.0, 0.0], true)], 1.0, &mut d);
         assert!(d.is_empty(), "共线也不画：{d:?}");
     }
 
@@ -724,7 +581,7 @@ mod region_tests {
     fn band_count_is_capped() {
         let big = tri([-5000.0, -5000.0], [5000.0, -5000.0], [0.0, 5000.0], false);
         let mut d = MaskDraw::default();
-        build_mask_draw(&[big], 0.001, 50.0, &mut d);
+        build_mask_draw(&[big], 0.001, &mut d);
         assert!(d.solid.len() <= BAND_MAX * 2 + 4, "行带数该被顶上：{}", d.solid.len());
     }
 }
