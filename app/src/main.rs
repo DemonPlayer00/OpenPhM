@@ -326,6 +326,38 @@ fn cursor_script_from_env() -> Vec<egui::Pos2> {
         .unwrap_or_default()
 }
 
+/// `OPM_CLICK_AUTO="<帧>:<down|up>[; …]"` → 假左键的**按/抬脚本**（帧号口径与 `OPM_KEY_AUTO` 相同）。
+///
+/// 为什么需要它：拖拽（拖控制杆、拖事件块、框选）是**唯一**没法用"改状态再截图"验证的一类交互 ——
+/// 它的中间态只存在于指针按住的那几帧里，而没有它，一次拖拽就只能靠人来试
+/// （`OPM_CLOSE_AUTO` 那段的原话："本会话没法往 Wayland 窗口注入点击"）。
+/// 位置取 [`cursor_script_from_env`] 给出的**那一帧的假指针**（所以必须一起给 `OPM_CURSOR`）。
+///
+/// 注入点在 `App::raw_input_hook`（`begin_pass` 之前）：按/抬要进 egui 的 `pointer` 状态，
+/// 晚了就只剩"看起来像" —— 与假指针同一个理由。
+fn click_script_from_env() -> Vec<(u32, bool)> {
+    std::env::var("OPM_CLICK_AUTO")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .filter_map(|one| {
+                    let (frame, what) = one.split_once(':')?;
+                    let at: u32 = frame.trim().parse().ok()?;
+                    let down = match what.trim().to_ascii_lowercase().as_str() {
+                        "down" => true,
+                        "up" => false,
+                        other => {
+                            eprintln!("  ⚠️ OPM_CLICK_AUTO：{other:?} 不认识（只认 down / up）");
+                            return None;
+                        }
+                    };
+                    Some((at, down))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `OPM_KEY_AUTO` 的一小片语法：`[ctrl+][shift+]键名` → `(修饰键, egui::Key)`。
 ///
 /// 只认够用的那几个（这是自动化钩子，不是键盘映射表）：`ctrl` / `shift` / `alt` 前缀，
@@ -442,6 +474,19 @@ fn main() -> eframe::Result<()> {
             std::env::var("OPM_CURSOR").unwrap_or_default().trim()
         );
     }
+    let click_script = click_script_from_env();
+    if !click_script.is_empty() {
+        // 位置只能来自假指针：egui 的按/抬事件必须带坐标，没脚本就不知道该往哪儿点
+        if cursor_script.is_empty() {
+            eprintln!("  ⚠️ OPM_CLICK_AUTO 还需要 OPM_CURSOR：按/抬的坐标取的是那一帧的假指针");
+        } else {
+            println!(
+                "  OPM_CLICK_AUTO   : {} 次左键按/抬（{}），位置取那一帧的假指针（拖拽取证用）",
+                click_script.len(),
+                std::env::var("OPM_CLICK_AUTO").unwrap_or_default().trim()
+            );
+        }
+    }
     println!(
         "  解压缓存根目录    : {}（每份谱面一把锁：lock.pid）",
         opm_app::codec::container::cache_root().display()
@@ -545,6 +590,12 @@ fn main() -> eframe::Result<()> {
                 (None, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO：未知轨道 {track:?}（可选 moveX/moveY/rotate/alpha/speed）"),
                 (_, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO=event: 需要 `<track>,<start>,<end>`"),
             }
+        } else if spec == "maskedit" {
+            // 只把编辑区切到遮蔽区模式（不带草稿）：拖事件块的头尾控制杆、看两档外观这些
+            // **不需要先起稿**，而起着稿时左键是"放下"（`draw_mask_pane` 的 `!st.drafting()`）。
+            // 与 `mask:` 那条的区别只有这一点 —— 于是同一条自动化路线既能拍草稿也能拍拖拽。
+            state.mask_edit = true;
+            println!("  遮蔽区编辑模式    : 开（OPM_EDIT_AUTO=maskedit，不带草稿）");
         } else if let Some(rest) = spec.strip_prefix("mask:") {
             // 遮蔽区的事件块草稿（`R` 起稿那一刻的样子）：同样没人能注入按键，
             // 而"起稿 → 跟随 → 放下"这条新流程正是要拍下来看的东西。
@@ -578,7 +629,7 @@ fn main() -> eframe::Result<()> {
         } else {
             eprintln!(
                 "  ⚠️ OPM_EDIT_AUTO：只认 hold:<lane>,<start>,<end>、\
-                 event:<track>,<start>,<end> 或 mask:<channel>,<start>,<end>"
+                 event:<track>,<start>,<end>、mask:<channel>,<start>,<end> 或 maskedit"
             );
         }
     }
@@ -1072,6 +1123,9 @@ struct App {
     cursor_script: Vec<egui::Pos2>,
     /// 脚本走到第几格
     cursor_step: usize,
+    /// `OPM_CLICK_AUTO` 的待办：`(第几帧, 按下还是抬起)`，到点注入一次就取走。
+    /// 位置用那一帧的假指针 —— 于是"拖 40 像素再拖回来"这种手势也能脚本化。
+    click_auto: Vec<(u32, bool)>,
     /// 这一帧**问过用户**"那份缓存要不要继续"吗（`launch_page` 靠它避免同一帧做第二个决定）
     resume_asked: bool,
     /// 「上次没有正常退出」这份待问的遗留缓存（`None` = 没有 / 已经问过）
@@ -1314,6 +1368,9 @@ impl App {
             cursor_auto: None,
             cursor_script: cursor_script_from_env(),
             cursor_step: 0,
+            // 启动期钩子：**假装按下/抬起左键**（帧号 + down/up；位置取那一帧的假指针）。
+            // 拖拽是唯一"中间态只在按住的那几帧里"的交互 —— 没有它就只能靠人手动试。
+            click_auto: click_script_from_env(),
             // 启动期钩子：遗留缓存对话框怎么选（`continue|discard|later`）—— 与 `OPM_LAUNCH_AUTO`
             // 同类，只在启动时读一次，给 agent 一条"把这一步走完"的路（没人能替它点鼠标）
             resume_auto: std::env::var("OPM_RESUME_AUTO").ok(),
@@ -1686,16 +1743,11 @@ impl App {
                     }
                 }
                 OverlayAction::MaskSetSpan { zone, channel, index, start, end } => {
-                    cmds.push(serde_json::json!({
-                        "op": "set_zone_event",
-                        "zone": zone,
-                        "track": channel.key(),
-                        "index": index,
-                        "set": {
-                            "startBeat": self.state.beat_json(start),
-                            "endBeat": self.state.beat_json(end),
-                        },
-                    }));
+                    // 起止拍是**精确有理拍**（面板已经吸附过）：命令层不再按网格取整一次，
+                    // 否则"拖回按下点"会把不在网格上的原值改掉 —— 见 `edit::set_mask_span_command`
+                    cmds.push(opm_app::edit::set_mask_span_command(
+                        zone, channel, index, start, end,
+                    ));
                 }
                 OverlayAction::MaskDragEnd => {
                     if self.drag_active {
@@ -3121,7 +3173,14 @@ impl App {
             return true;
         }
         // 下一个按键注入还没到点（没写帧号的那种解析成第 1 帧 ⇒ 立刻就到，不算欠）
-        self.key_auto.first().is_some_and(|(n, _)| u64::from(self.frames) < u64::from(*n))
+        if self.key_auto.first().is_some_and(|(n, _)| u64::from(self.frames) < u64::from(*n)) {
+            return true;
+        }
+        // 假左键的按/抬同样"不到第 N 帧就不会发生"：`OPM_CURSOR` 的脚本也是**每帧**挪一格，
+        // 所以没有这一条，空闲一停下这只手就永远停在半空（拖拽也就没开始过）。
+        self.click_auto
+            .first()
+            .is_some_and(|(n, _)| u64::from(self.frames) < u64::from(*n))
     }
 
     /// **这一帧还有活要干吗**；有的话说出**是什么活**（第一个说得清的）。
@@ -3850,14 +3909,32 @@ impl eframe::App for App {
     /// 指针不行 —— `hover_pos` / `pointer.delta` 都是 `begin_pass` 从 `RawInput` 算出来的，
     /// 晚了就只剩"看起来像"，`ui.interact` 一律拿不到（实测：这样注入的指针连悬停都不算）。
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.cursor_script.is_empty() {
-            return;
+        // 假指针：`OPM_CURSOR` 的脚本每帧挪一格
+        if !self.cursor_script.is_empty() {
+            let step = self.cursor_step.min(self.cursor_script.len() - 1);
+            let pos = self.cursor_script[step];
+            self.cursor_step = self.cursor_step.saturating_add(1);
+            self.cursor_auto = Some(pos);
+            raw_input.events.push(egui::Event::PointerMoved(pos));
         }
-        let step = self.cursor_step.min(self.cursor_script.len() - 1);
-        let pos = self.cursor_script[step];
-        self.cursor_step = self.cursor_step.saturating_add(1);
-        self.cursor_auto = Some(pos);
-        raw_input.events.push(egui::Event::PointerMoved(pos));
+        // 假按键：`OPM_CLICK_AUTO` 的到点项 —— **必须在同一个注入点**（`begin_pass` 之前，理由同上）：
+        // 按/抬要进 egui 的 `pointer` 状态，塞进 `i.events` 只会让"事件看着像发生过"，
+        // 而 `dragged()` / `press_origin()` / 命中判定全都还是旧的。
+        while self
+            .click_auto
+            .first()
+            .is_some_and(|(at, _)| self.frames >= *at)
+        {
+            let (_, pressed) = self.click_auto.remove(0);
+            if let Some(pos) = self.cursor_auto {
+                raw_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

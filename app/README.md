@@ -354,6 +354,25 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 拖拽的判定按**按下时**指针的位置算，而不是"当前指针位置"：egui 要等指针移动几个像素才认定为拖拽，
 那时指针已经离开 6px 的把手段了（这是"有提示但拖不动"的一个成因）。
 
+**拖头尾控制杆的三条规则**（用户报"拖不回去、会跳过原位"之后定下来的，都有单测 + 真机取证）：
+
+1. **抓哪一头按按下时的命中算**（`overlay::MaskPressHit`，与判定线事件区的 `press_hit` 同一条理由）。
+   用 `drag_started()` 那一帧的命中判，两拍的块会被判成"没抓到"（面板里什么都不发生），
+   长一点的块会被判成"抓身体"（拖端点变成整块平移）。
+2. **去重比的是"上一次真正发出去的跨度"**（`MaskDrag::live`），不是"拖拽开始时的跨度"：
+   拿原点比的话，指针拖回按下点那一帧算出来的跨度**正好等于原点** ⇒ 被当成"没变化"而不发命令
+   ⇒ 块停在拖出去的位置上，直到指针越过原位才突然跳过去。
+3. **指针拖回按下点（±2px）就精确写回按下时的跨度**（`MASK_RETURN_PX`）：拖动落点是吸附到拍网格的，
+   而按下时的原值不一定在网格上（导入的谱面、改过网格细分的谱面），落到最近的格点就永远差一点。
+   为此面板发出去的起止拍是**有理拍**（`edit::set_mask_span_command`），命令层不再取整第二次。
+   拖端点本身复用草稿那份 `state::resize_span`（只动这一头、不许交叉），此前这里另写了一份，
+   反向拖会把块**翻过来**（头变成尾）。
+
+真机取证：`~/.dsh/workspace/OpenPhM-artifacts/mask/drag-handle-e2e.py`（假指针 + 假左键，
+`OPM_EDIT_AUTO=maskedit`，拖完 `opm-ctl --attach auto --cmd '{"op":"dump"}' --json` 读文档）——
+`tail-stuck`（拖出去就抬手）读到 `end=18` 而 `start=0` ⇒ 抓的确实是尾、不是整块平移；
+`tail-return` 与 `head-return` 读到 `[0,16]` ⇒ 拖回按下点精确回到原位。
+
 **纵轴在中间**（不是贴左边缘）：它是两个区**共用**的纵轴。轴带宽 34px，拍号居中写在里面、
 两侧各一个小刻度线指向相邻半区，两半的网格线在轴带边缘停住 —— 视觉上就是"被轴隔开的两个区"。
 点在轴带上不会选中任何东西（轴是骨架，不是内容）。
@@ -834,7 +853,9 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
 
 自动化钩子（截图/CI 用，与 `OPM_LAUNCH_AUTO` 同类，只在启动时读一次）：
 `OPM_RESUME_AUTO=continue|discard|later`、`OPM_KEY_AUTO=<帧号>:<键>[,…][;…]`、
-**`OPM_CURSOR=x,y[; x,y]…`**（假装指针：多段用 `;` 分隔 = **每帧挪一格**，走完停在最后一格）。
+**`OPM_CURSOR=x,y[; x,y]…`**（假装指针：多段用 `;` 分隔 = **每帧挪一格**，走完停在最后一格）、
+**`OPM_CLICK_AUTO=<帧号>:<down|up>[;…]`**（假装左键按/抬，位置取**那一帧的假指针** ⇒ 必须与
+`OPM_CURSOR` 一起给）。
 
 `OPM_CURSOR` 的注入点在 `eframe::App::raw_input_hook` —— 也就是 egui `begin_pass` **之前**，
 所以悬停、`pointer.delta`、拖动判定全都和真指针一模一样（Wayland 下没法注入鼠标）。
@@ -842,6 +863,13 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
 `begin_pass` 从 `RawInput` 算出来的，晚塞只会让 hover 永远为假（`OPM_KEY_AUTO` 能那么写，
 是因为键另有 `events` 列表可查）。有位移才存在的中间态（播放期柔光、草稿跟随、拖到邻块停住）
 都得靠它才拍得出来。
+
+`OPM_CLICK_AUTO` 是同一件事的**按/抬**版：拖拽（拖控制杆、拖事件块、框选）是唯一"中间态只在
+按住的那几帧里"的交互，光有假指针验不了。它与假指针共用注入点、共用帧号口径，**也必须**
+记进 `frames_owed()` —— 假指针脚本是"每帧挪一格"，空闲一停下这只手就永远停在半空。
+一整套"拖出去再拖回来"的取证脚本见
+`~/.dsh/workspace/OpenPhM-artifacts/mask/drag-handle-e2e.py`（真实 GUI + 假指针 + 假左键，
+拖完用 `opm-ctl --attach auto --cmd '{"op":"dump"}' --json` 读文档里的拍）。
 
 **载入的四种形态**（都是 `EditCore::stage_file` 认的，按内容判、不看扩展名）：
 
@@ -1072,6 +1100,8 @@ $ wine opm-app.exe --fonts        # Windows 二进制、默认 wine 前缀（那
 
 自动化钩子：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>` 或 `OPM_EDIT_AUTO=event:<track>,<start>,<end>`
 启动就把"正在跟随的草稿"摆出来（截图/自检用；没人能往窗口里注入按键，这是唯一能把它拍下来的办法）。
+遮蔽区另有两档：`mask:<channel>,<start>,<end>`（开编辑模式并起一块草稿）与 **`maskedit`**
+（只开编辑模式、**不带草稿** —— 拖事件块头尾、看两档外观都不需要先起稿，而起着稿时左键是"放下"）。
 工件：`本机证据/pending-hold.png`、`本机证据/pending-hold-handles.png`、`本机证据/pending-event.png`。
 
 ## 按键也能被"真的按一遍"：`OPM_KEY_AUTO`

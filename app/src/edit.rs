@@ -701,6 +701,28 @@ pub fn zone_draft_begin(draft: bool, start: crate::doc::Beat, label: &str) -> Ve
     }
 }
 
+/// **拖控制杆**改遮蔽区事件块的跨度：起止拍是**精确有理数**，不是浮点。
+///
+/// 为什么不走"面板给 f64、命令层再按网格取整"那条（与 `resize_event` 的浮点那条同理）：
+/// 拖动落点本来就在面板里按网格吸附过了，再取整一次是**第二次**量化 —— 面板说 9.4 拍、
+/// 命令层写成 9.5 拍，两边对不上。更要紧的是"**拖回按下点**"：那一刻要的是**按下时的原值**
+/// 原样写回，而原值不一定在网格上（导入的谱面、改过网格细分的谱面）—— 一过量化的手就回不去了
+/// （用户报的就是"无法移动回原位"）。
+pub fn set_mask_span_command(
+    zone: usize,
+    track: crate::state::MaskChannel,
+    index: usize,
+    start: crate::doc::Beat,
+    end: crate::doc::Beat,
+) -> Value {
+    set_mask_event_command(
+        zone,
+        track,
+        index,
+        json!({"startBeat": beat_arg(start), "endBeat": beat_arg(end)}),
+    )
+}
+
 /// 改遮蔽区事件块（起止拍用精确有理数；值可以是数字或布尔 —— `active` 通道就是布尔）
 pub fn set_mask_event_command(
     zone: usize,
@@ -1329,6 +1351,42 @@ mod mask_command_tests {
         assert_eq!(del_mask_event_command(1, MaskChannel::X2, 0)["op"], serde_json::json!("del_zone_event"));
         assert_eq!(del_zone_command(4)["index"], serde_json::json!(4));
         assert_eq!(set_zone_command(0, serde_json::json!({"name": "x"}))["op"], serde_json::json!("set_zone"));
+    }
+
+    /// **拖控制杆写回的跨度不许被二次取整**：面板吸附过之后给的是有理拍，
+    /// 命令层原样写回 —— 不在网格上的原值（这里 47/5 = 9.4 拍）必须一字不差地落进文档。
+    ///
+    /// 这条覆盖的正是"拖回按下点回不到原位"的最后一段：就算面板把 9.4 交出来了，
+    /// 只要这里还按网格取整一次（9.5），用户看到的还是回不去。
+    #[test]
+    fn a_span_command_writes_the_exact_beats_it_was_given() {
+        use crate::core::EditCore;
+        let span = set_mask_span_command(0, MaskChannel::X1, 0, Beat::new(8, 1), Beat::new(47, 5));
+        assert_eq!(span["op"], serde_json::json!("set_zone_event"));
+        assert_eq!(span["set"]["startBeat"], serde_json::json!([8, 1]));
+        assert_eq!(span["set"]["endBeat"], serde_json::json!([47, 5]));
+
+        // 真的过一遍核心：文档里的跨度就是 47/5，不是最近的格点
+        let mut c = EditCore::new();
+        for cmd in [
+            serde_json::json!({"op": "add_zone"}),
+            add_mask_event_command(0, MaskChannel::X1, Beat::new(8, 1), Beat::new(47, 5)),
+        ] {
+            let r = c.exec(&cmd);
+            assert_eq!(r["ok"], serde_json::json!(true), "{cmd} 失败：{r}");
+        }
+        // `add_zone` 的默认三角形自己也带一块，下标要找（块按起点升序）
+        let index = c.doc().mask_zones[0]
+            .x1
+            .iter()
+            .position(|e| e.start == Beat::new(8, 1))
+            .expect("刚放进去的那一块");
+        let span = set_mask_span_command(0, MaskChannel::X1, index, Beat::new(8, 1), Beat::new(47, 5));
+        let r = c.exec(&span);
+        assert_eq!(r["ok"], serde_json::json!(true), "{span} 失败：{r}");
+        let ev = &c.doc().mask_zones[0].x1[index];
+        assert_eq!(ev.end, Beat::new(47, 5), "写回的就是 9.4 拍");
+        assert_ne!(ev.end, Beat::new(38, 4), "不许变成吸附后的 9.5 拍");
     }
 
     /// **草稿态**：第一条编辑要带上 `add_zone`，且**整段是一个事务**（一次撤销全回去）

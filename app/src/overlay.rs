@@ -98,12 +98,16 @@ pub enum OverlayAction {
     ///
     /// 为什么是绝对值：拖动期间文档每帧都在变，增量会在"视图慢一帧"时累积成漂移；
     /// 绝对跨度只需要一个冻结的起点（见 `MaskDrag`），与判定线的 `resize_event` 同一条思路。
+    ///
+    /// 为什么是**有理拍**而不是 `f64`：吸附已经在面板里做完了（`beat_at_grid`），命令层再按网格
+    /// 取整一次就是第二次量化 —— 而"拖回按下点"要的正是**按下时的原值**原样写回，那个值不一定
+    /// 在网格上（见 `MASK_RETURN_PX`）。
     MaskSetSpan {
         zone: usize,
         channel: MaskChannel,
         index: usize,
-        start: f64,
-        end: f64,
+        start: opm_app::doc::Beat,
+        end: opm_app::doc::Beat,
     },
     /// 遮蔽区编辑：拖动开始（调用方开事务 ⇒ 整段拖拽只占一个撤销步）
     MaskDragStart,
@@ -541,13 +545,57 @@ struct MaskDrag {
     zone: usize,
     channel: MaskChannel,
     index: usize,
-    /// 拖拽开始时的跨度（拍）—— 绝对跨度的原点
+    /// 拖拽开始时的跨度（拍）—— 平移增量的**原点**，拖动期间不动它
     start: f64,
     end: f64,
+    /// 同一个原点的**精确有理形态**（文档里读出来的那一份）：拖回按下点时原样写回，
+    /// 不经网格吸附 —— 它不一定在网格上（见 [`MASK_RETURN_PX`]）
+    exact: (opm_app::doc::Beat, opm_app::doc::Beat),
+    /// **上一次真正发出去**的跨度（去重的比较对象）。
+    ///
+    /// 拿原点当比较对象是踩过的坑：指针拖回按下点那一帧算出来的跨度**正好等于原点**，
+    /// 于是被当成"没变化"而不发命令，块就停在拖出去的位置上回不来
+    /// （用户报："拖动头尾控制杆无法移动回原位，拖动时可能卡住，也可能移动时会跳过原位置"）。
+    live: (f64, f64),
     /// `None` = 整块平移；`Some` = 拖那一头
     edge: Option<EventEdge>,
     /// 按下时指针所在的拍（算平移增量）
     press_beat: f64,
+    /// 按下时指针的屏幕 y —— "拖回按下点"按像素判，见 [`MASK_RETURN_PX`]
+    press_y: f32,
+}
+
+/// **拖回按下点**的判定容差（像素）：指针进到这个圈里就用回按下时的跨度（**精确**，不经吸附）。
+///
+/// 为什么需要它：拖动落点是吸附到拍网格的，而**原跨度不一定在网格上**（导入的谱面、或改过
+/// 网格细分的谱面）—— 那样"拖回原位"只能落到最近的格点，永远差一点。用户的原话就是
+/// "无法移动回原位"。
+const MASK_RETURN_PX: f32 = 2.0;
+
+/// **按下那一刻**指针下面是哪个块的哪一部分（遮蔽区面板版，与判定线的 `PressHit` 同一条理由）。
+///
+/// 为什么必须记在按下时：egui 的拖拽阈值约 6 像素，而头尾把手段 `EDGE_BAND` 也是 6 像素 ——
+/// `drag_started()` 那一帧指针**必定已经离开把手段**。拿那一帧的命中判"抓的是哪一头"，
+/// 长块会判成"抓身体"（拖端点变成整块平移），短块直接判成没抓到（压根拖不动）。
+/// 用户报的"拖动头尾控制杆无法移动回原位"就是这两条叠在一起。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaskPressHit {
+    channel: MaskChannel,
+    index: usize,
+    part: EventPart,
+    /// 按下时指针所在的拍（平移增量与"回到按下点"都用它，不必再问一次 `press_origin`）
+    beat: f64,
+    /// 按下时指针的屏幕 y
+    y: f32,
+}
+
+fn mask_press_hit_set(ui: &egui::Ui, v: Option<MaskPressHit>) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_mask_press_hit"), v));
+}
+
+fn mask_press_hit_get(ui: &egui::Ui) -> Option<MaskPressHit> {
+    ui.data(|d| d.get_temp::<Option<MaskPressHit>>(egui::Id::new("opm_mask_press_hit")))
+        .flatten()
 }
 
 fn mask_drag_set(ui: &egui::Ui, v: Option<MaskDrag>) {
@@ -1874,7 +1922,13 @@ fn draft_gesture(
     }
     // 矩形 → 控制杆：起点在下（纵轴越上越晚），与编辑区同一条约定
     let handle = TimeHandle::from_span(draft.min.x, draft.max.x, draft.max.y, draft.min.y);
-    let hot = ptr.map(|q| handle.hit(q));
+    // 判"抓的是哪一头"用**按下时的位置**：egui 的拖拽阈值（约 6 像素）与把手段 `EDGE_BAND`
+    // 一样宽 ⇒ `drag_started()` 那一帧指针必定已经离开把手段，用当前位置判会把"抓头/尾"
+    // 降级成"长度跟着鼠标走"（短草稿甚至判成没抓到）。与遮蔽区事件块的 `MaskPressHit`、
+    // 判定线事件区的 `press_hit` 是同一条理由。
+    // 指针没按下时 `press_origin()` 是 `None` ⇒ 退回当前位置，悬停高亮照常。
+    let grab = ui.input(|i| i.pointer.press_origin()).or(ptr);
+    let hot = grab.map(|q| handle.hit(q));
     let color = |hit: bool| if hit { egui::Color32::WHITE } else { edge_col };
     handle.paint(p, EventEdge::Start, color(hot == Some(EventPart::Start)));
     handle.paint(p, EventEdge::End, color(hot == Some(EventPart::End)));
@@ -2164,36 +2218,58 @@ fn draw_mask_pane(
         actions,
     );
 
+    // 记录"**按下时**指针下面是什么"，供拖拽开始那一帧使用 —— 与判定线事件区同一套
+    // （见 `MaskPressHit`；判定线那边是 `press_hit_set`，三个条件逐字相同）：
+    // · 已经进入拖拽 ⇒ 不再更新（否则会把"按下时抓的是哪一头"覆盖掉）；
+    // · `drag_started/dragged` 那一帧也不更新 —— 那一帧指针已经移开把手段了，
+    //   而拖拽分支就在本帧稍后运行，必须让它看到**按下时**的命中；
+    // · egui 的第一帧没有交互状态（hover 还是 None），所以"只在未按下时记录"会漏掉按下那一帧。
+    if !resp.drag_started() && !resp.dragged() && mask_drag_get(ui).is_none() {
+        let rec = match (&hit, ptr) {
+            (Some(Hit::Block(ch, i, part)), Some(q)) => Some(MaskPressHit {
+                channel: *ch,
+                index: *i,
+                part: *part,
+                beat: beat_of(q.y),
+                y: q.y,
+            }),
+            _ => None,
+        };
+        mask_press_hit_set(ui, rec);
+    }
+
     // 拖动（草稿期间不动事件块：那时左键是"放下"）
     if resp.drag_started() && !st.drafting() {
-        let press = ui
-            .input(|i| i.pointer.press_origin())
-            .or(resp.interact_pointer_pos())
-            .or(hover_pos);
-        if let (Some(Hit::Block(ch, i, part)), Some(q)) = (&hit, press) {
-            let e = zone.track(*ch).events.get(*i);
+        // **用按下时的命中**，不是这一帧的：拖拽阈值让指针一上来就离开把手段（见 `MaskPressHit`）
+        if let Some(ph) = mask_press_hit_get(ui) {
+            let e = zone.track(ph.channel).events.get(ph.index);
             if let Some(e) = e {
-                let edge = match part {
+                let edge = match ph.part {
                     EventPart::Start => Some(EventEdge::Start),
                     EventPart::End => Some(EventEdge::End),
                     _ => None,
                 };
+                let (start, end) = (e.start.to_f64(), e.end.to_f64());
                 mask_drag_set(
                     ui,
                     Some(MaskDrag {
                         zone: zone_idx,
-                        channel: *ch,
-                        index: *i,
-                        start: e.start.to_f64(),
-                        end: e.end.to_f64(),
+                        channel: ph.channel,
+                        index: ph.index,
+                        start,
+                        end,
+                        exact: (e.start, e.end),
+                        // 刚按下时文档就在原点 ⇒ 去重的起点是原点本身
+                        live: (start, end),
                         edge,
-                        press_beat: beat_of(q.y),
+                        press_beat: ph.beat,
+                        press_y: ph.y,
                     }),
                 );
                 actions.push(OverlayAction::MaskSelect {
                     zone: zone_idx,
-                    channel: *ch,
-                    index: *i,
+                    channel: ph.channel,
+                    index: ph.index,
                 });
                 actions.push(OverlayAction::MaskDragStart);
             }
@@ -2217,29 +2293,60 @@ fn draw_mask_pane(
                 .max(0.0)
                 .max(floor)
                 .min(ceiling.unwrap_or(f64::INFINITY));
-            let (start, end) = match d.edge {
-                Some(EventEdge::Start) => clamp_span(snapped, d.end, 1e-3),
-                Some(EventEdge::End) => clamp_span(d.start.min(snapped), snapped.max(d.start), 1e-3),
-                None => {
-                    // 整块平移：两端一起走，两头都不许压到邻块（长度保住 —— 拖的是位置）
-                    let delta = (snapped - d.press_beat)
-                        .max(floor - d.start)
-                        .min(ceiling.map_or(f64::INFINITY, |hi| hi - d.end));
-                    clamp_span(d.start + delta, d.end + delta, 1e-3)
-                }
+            // **指针拖回按下点 ⇒ 精确用回按下时的跨度**（连有理拍都照抄，见 `MASK_RETURN_PX`）。
+            // 判据是"指针回到按下点了没有"，不是"算出来的跨度变了没有"：后者正是把块卡在
+            // 外面回不来的原因。之所以还要回到**有理拍**：吸附只保证落在格点上，而按下时的原值
+            // 不一定在网格上 —— 那样"拖回原位"永远差一点点。
+            let back_to_press = (q.y - d.press_y).abs() <= MASK_RETURN_PX;
+            let span = if back_to_press {
+                d.exact
+            } else {
+                let (start, end) = match d.edge {
+                    // 拖端点：**只动这一头**，另一头钉死，且不许交叉 —— 与草稿的
+                    // `state::resize_span` 是同一份规则（此前这里另写了一份，反向拖会把块翻过来）
+                    Some(edge) => {
+                        let (mut s, mut e) = (d.start, d.end);
+                        opm_app::state::resize_span(
+                            &mut s,
+                            &mut e,
+                            edge,
+                            snapped,
+                            st.beat_step(),
+                        );
+                        (s, e)
+                    }
+                    None => {
+                        // 整块平移：两端一起走，两头都不许压到邻块（长度保住 —— 拖的是位置）
+                        let delta = (snapped - d.press_beat)
+                            .max(floor - d.start)
+                            .min(ceiling.map_or(f64::INFINITY, |hi| hi - d.end));
+                        clamp_span(d.start + delta, d.end + delta, 1e-3)
+                    }
+                };
+                // 吸附在**面板里**做完（命令层不再取整一次，见 `MaskSetSpan` 的头注）
+                (st.beat_at_grid(start), st.beat_at_grid(end))
             };
-            if (start, end) != (d.start, d.end) {
+            // 去重比的是**上一次发出去的**跨度，不是原点（见 `MaskDrag::live`）
+            if (span.0.to_f64(), span.1.to_f64()) != d.live {
                 actions.push(OverlayAction::MaskSetSpan {
                     zone: d.zone,
                     channel: d.channel,
                     index: d.index,
-                    start,
-                    end,
+                    start: span.0,
+                    end: span.1,
                 });
+                mask_drag_set(
+                    ui,
+                    Some(MaskDrag {
+                        live: (span.0.to_f64(), span.1.to_f64()),
+                        ..d
+                    }),
+                );
             }
         }
     }
     if resp.drag_stopped() {
+        mask_press_hit_set(ui, None);
         if mask_drag_get(ui).is_some() {
             actions.push(OverlayAction::MaskDragEnd);
             mask_drag_set(ui, None);
@@ -3956,6 +4063,285 @@ mod tests {
             (back.end.to_f64() - floor).abs() < 1e-9,
             "反拖到起点之前 ⇒ 停在保底长度 {floor}，实际 {}",
             back.end.to_f64()
+        );
+    }
+
+    /// 只有一块 x1 事件的遮蔽区，进入遮蔽区编辑模式。
+    ///
+    /// 默认那块是 `[8,10)`：**两拍**——短到"拖拽阈值（约 6 像素）比把手段（`EDGE_BAND` 6 像素）
+    /// 还宽"这件事会露出来（见 `MaskPressHit`）。
+    fn state_with_mask_zone(start: Beat, end: Beat) -> EditorState {
+        use opm_app::doc::MaskZone;
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 180.0,
+            foreign: Default::default(),
+        }];
+        doc.judge_lines.clear();
+        let mut z = MaskZone::default();
+        z.x1.push(Event::new(start, end, json!(0), json!(0), "linear"));
+        doc.mask_zones.push(z);
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.mask_edit = true;
+        st.selected_zone = 0;
+        st.selected_channel = MaskChannel::X1;
+        st.overlay_beats = 32.0;
+        st
+    }
+
+    fn mask_pane_rect() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0))
+    }
+
+    /// 遮蔽区面板里第 `k` 条通道列的**中心 x**（列布局只有面板自己知道，测试照抄同一套算式）
+    fn mask_col_x(k: usize) -> f32 {
+        let r = mask_pane_rect();
+        let lanes_min = r.min.x + AXIS_W;
+        let col_w = (r.max.x - lanes_min) / MaskChannel::ALL.len() as f32;
+        lanes_min + col_w * (k as f32 + 0.5)
+    }
+
+    /// 遮蔽区面板里某一拍的**屏幕 y**（纵轴：越上越晚）
+    fn mask_beat_y(st: &EditorState, beat: f64) -> f32 {
+        let r = mask_pane_rect();
+        let body = egui::Rect::from_min_max(egui::pos2(r.min.x, r.min.y + RULER_H), r.max);
+        let anchor = st.chart.tmap.beat(st.playhead) - OverlayCfg::default().lead_beats;
+        beat_y(body, anchor, st.overlay_beats, beat)
+    }
+
+    fn ptr_moved(x: f32, y: f32) -> Vec<egui::Event> {
+        vec![egui::Event::PointerMoved(egui::pos2(x, y))]
+    }
+
+    fn ptr_button(x: f32, y: f32, pressed: bool) -> Vec<egui::Event> {
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }]
+    }
+
+    /// 把"每帧一串事件"喂给 `draw`，返回每帧发出的动作（遮蔽区拖动测试共用）
+    fn drive_frames(st: &EditorState, frames: Vec<Vec<egui::Event>>) -> Vec<Vec<OverlayAction>> {
+        let ctx = egui::Context::default();
+        let rect = mask_pane_rect();
+        let cfg = OverlayCfg::default();
+        frames
+            .into_iter()
+            .map(|events| {
+                let mut acts: Vec<OverlayAction> = Vec::new();
+                let raw = egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    draw(ui, st, rect, &cfg, true, &mut acts);
+                });
+                out.textures_delta.clear();
+                acts
+            })
+            .collect()
+    }
+
+    /// 这些动作里的"改跨度"命令（拖端点每帧最多一条），按发出顺序 —— 拍是**有理数**，
+    /// 这里连分子分母一起收下来：`[8,1]` 与 `[32,4]` 相等的写法也要区分得出来（口径是精确拍，
+    /// 不是浮点近似）。
+    fn spans_of(acts: &[Vec<OverlayAction>]) -> Vec<((i64, i64), (i64, i64))> {
+        acts.iter()
+            .flatten()
+            .filter_map(|a| match a {
+                OverlayAction::MaskSetSpan { start, end, .. } => {
+                    Some(((start.n, start.d), (end.n, end.d)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 有理拍的浮点值（断言里说人话用）
+    fn beats(span: ((i64, i64), (i64, i64))) -> (f64, f64) {
+        (
+            span.0 .0 as f64 / span.0 .1 as f64,
+            span.1 .0 as f64 / span.1 .1 as f64,
+        )
+    }
+
+    fn has(acts: &[Vec<OverlayAction>], f: impl Fn(&OverlayAction) -> bool) -> bool {
+        acts.iter().flatten().any(f)
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// **拖遮蔽区事件块的尾巴**：隔着拖拽阈值也要抓得住把手段，而且**拖得回原位**。
+    ///
+    /// 用户报（2026-10-02）："拖动屏蔽区事件块的头尾控制杆时，无法移动回原位（原本尾在 10 拍，
+    /// 拖动时可能卡住，也可能能够拖动但移动时会跳过 10 拍）"。根因是两条叠在一起：
+    /// · **命中算晚了**：拖拽阈值与把手段一样宽（都约 6 像素）⇒ `drag_started()` 那一帧指针必定
+    ///   已经离开把手段，用那一帧的命中判"抓的是哪一头"，两拍的块直接判成"没抓到"（面板里
+    ///   什么都不发生），长一点的块判成"抓身体"（拖端点变成整块平移）；
+    /// · **去重比错了对象**：拿"拖拽开始时的跨度"当比较对象 ⇒ 拖回按下点算出来的跨度正好等于它，
+    ///   被当成"没变化"而不发命令 ⇒ 块停在拖出去的位置上，直到指针越过原位才突然跳过去
+    ///   （"移动时会跳过 10 拍"）。
+    #[test]
+    fn mask_handle_drag_grabs_the_edge_and_can_return_to_where_it_started() {
+        let st = state_with_mask_zone(Beat::new(8, 1), Beat::new(10, 1));
+        let x = mask_col_x(0);
+        let (y10, y14) = (mask_beat_y(&st, 10.0), mask_beat_y(&st, 14.0));
+        // 悬停 → 按在尾上 → 往上拖（更晚的拍）→ 拖回来 → 松开。中间那几步都跨过拖拽阈值
+        let mut frames = vec![ptr_moved(x, y10), ptr_button(x, y10, true)];
+        for y in [y10 - 8.0, y10 - 20.0, y14, y10 - 6.0, y10] {
+            frames.push(ptr_moved(x, y));
+        }
+        frames.push(ptr_button(x, y10, false));
+        let acts = drive_frames(&st, frames);
+
+        assert!(
+            has(&acts, |a| matches!(a, OverlayAction::MaskDragStart)),
+            "按在把手上必须开始拖拽：{acts:?}"
+        );
+        let spans = spans_of(&acts);
+        assert!(!spans.is_empty(), "拖拽必须改跨度：{acts:?}");
+        assert!(
+            spans.iter().all(|sp| near(beats(*sp).0, 8.0)),
+            "抓的是**尾**，起点一次都不许动（动了就是被当成整块平移）：{spans:?}"
+        );
+        assert!(
+            spans.iter().any(|sp| near(beats(*sp).1, 14.0)),
+            "指针拖到 14 拍，尾就该在 14 拍：{spans:?}"
+        );
+        assert_eq!(
+            spans.last().copied(),
+            Some(((8, 1), (10, 1))),
+            "**拖回按下点必须精确回到原位**（尾 10 拍 = [10,1]）：{spans:?}"
+        );
+    }
+
+    /// **拖头**：起点跟着走、终点钉死；反向拖不许把块翻过来（头跑到尾后面）。
+    #[test]
+    fn mask_head_drag_moves_only_the_head() {
+        let st = state_with_mask_zone(Beat::new(8, 1), Beat::new(14, 1));
+        let x = mask_col_x(0);
+        let (y8, y4) = (mask_beat_y(&st, 8.0), mask_beat_y(&st, 4.0));
+        let mut frames = vec![ptr_moved(x, y8), ptr_button(x, y8, true)];
+        // 往下拖 = 更早的拍（4 拍）；再拖过头到 16 拍（越过尾）——只许停在"保底一个格点"
+        for y in [y8 + 8.0, y4, mask_beat_y(&st, 16.0)] {
+            frames.push(ptr_moved(x, y));
+        }
+        frames.push(ptr_button(x, mask_beat_y(&st, 16.0), false));
+        let acts = drive_frames(&st, frames);
+        let spans = spans_of(&acts);
+        assert!(
+            spans.iter().all(|sp| near(beats(*sp).1, 14.0)),
+            "抓的是**头**，终点一次都不许动：{spans:?}"
+        );
+        assert!(
+            spans.iter().any(|sp| near(beats(*sp).0, 4.0)),
+            "指针拖到 4 拍，头就该在 4 拍：{spans:?}"
+        );
+        // 越过尾：停在 `end - 一个格点`（0.25 拍），**不翻块**
+        assert!(
+            spans.last().is_some_and(|sp| near(beats(*sp).0, 13.75)),
+            "头不许越过尾（保底一个格点）：{spans:?}"
+        );
+    }
+
+    /// **拖身体 = 整块平移**（长度不变），并且同样能拖回按下点 —— 这条把"去重比错对象"单独钉住：
+    /// 块够高（8 拍），按下与拖动都在块体内，用不到"按下的命中"那一条修正也有拖拽。
+    #[test]
+    fn mask_body_drag_translates_and_can_return() {
+        let st = state_with_mask_zone(Beat::new(4, 1), Beat::new(12, 1));
+        let x = mask_col_x(0);
+        let y_body = mask_beat_y(&st, 8.0);
+        let y_up = mask_beat_y(&st, 12.0);
+        let mut frames = vec![ptr_moved(x, y_body), ptr_button(x, y_body, true)];
+        for y in [y_body - 8.0, y_up, y_body] {
+            frames.push(ptr_moved(x, y));
+        }
+        frames.push(ptr_button(x, y_body, false));
+        let acts = drive_frames(&st, frames);
+        let spans = spans_of(&acts);
+        assert!(!spans.is_empty(), "拖身体要平移：{acts:?}");
+        let floats: Vec<(f64, f64)> = spans.iter().map(|sp| beats(*sp)).collect();
+        assert!(
+            floats.iter().all(|(s, e)| near(e - s, 8.0)),
+            "平移不许改长度：{floats:?}"
+        );
+        assert!(
+            floats.iter().any(|(s, _)| *s > 4.5),
+            "往上拖 = 更晚：起点要变大：{floats:?}"
+        );
+        assert_eq!(
+            spans.last().copied(),
+            Some(((4, 1), (12, 1))),
+            "拖回按下点必须精确回到原位：{spans:?}"
+        );
+    }
+
+    /// **原跨度不在网格上时也要回得去**：吸附只会落到最近的格点，差一点点就永远回不了原位。
+    /// 这里那块是 `[8, 9.4)`，网格是 1/4 拍（最近的格点 9.5）—— 全靠"拖回按下点用回原跨度"。
+    #[test]
+    fn mask_handle_drag_returns_to_an_off_grid_span() {
+        let st = state_with_mask_zone(Beat::new(8, 1), Beat::new(47, 5));
+        let x = mask_col_x(0);
+        let y94 = mask_beat_y(&st, 9.4);
+        let mut frames = vec![ptr_moved(x, y94), ptr_button(x, y94, true)];
+        for y in [y94 - 8.0, mask_beat_y(&st, 13.0), y94] {
+            frames.push(ptr_moved(x, y));
+        }
+        frames.push(ptr_button(x, y94, false));
+        let acts = drive_frames(&st, frames);
+        let spans = spans_of(&acts);
+        // `[47,5]` 而不是吸附出来的 `[38,4]`（= 9.5 拍）：精确有理拍才算回到了原位
+        assert_eq!(
+            spans.last().copied(),
+            Some(((8, 1), (47, 5))),
+            "拖回按下点要回到**原来的** 9.4 拍（不是吸附出来的 9.5）：{spans:?}"
+        );
+    }
+
+    /// **草稿的控制杆也按"按下时"判**：拖拽阈值那一帧指针已经离开把手段了（都约 6 像素）。
+    ///
+    /// 这条与遮蔽区事件块的 `MaskPressHit` 是同一个坑的**第二处**：`draft_gesture` 两个模式共用，
+    /// 用当前位置判的话，拖**头**会被降级成"长度跟着鼠标走"（尾动头不动）—— 而且不报错。
+    /// 这里故意把草稿拉成 10 拍长：移动 8px 之后指针落在**块体**里（短草稿会落进"取更近那一头"
+    /// 的小块分支，反而看不出来）。
+    #[test]
+    fn a_draft_handle_drag_uses_the_press_position() {
+        let mut st = state_with_events();
+        st.mask_edit = true;
+        st.overlay_beats = 32.0;
+        assert!(st.begin_pending_mask(MaskChannel::X1, 0, 10.0));
+        st.follow_pending_mask(20.0); // 草稿 [10,20)
+        let x = mask_col_x(0);
+        let y_head = mask_beat_y(&st, 10.0); // 起点在下边缘
+        let mut frames = vec![ptr_moved(x, y_head), ptr_button(x, y_head, true)];
+        for dy in [8.0, 16.0] {
+            frames.push(ptr_moved(x, y_head + dy));
+        }
+        frames.push(ptr_button(x, y_head + 16.0, false));
+        let acts = drive_frames(&st, frames);
+
+        let edges: Vec<EventEdge> = acts
+            .iter()
+            .flatten()
+            .filter_map(|a| match a {
+                OverlayAction::DraftResize { edge, .. } => Some(*edge),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !edges.is_empty(),
+            "拖草稿的**头**必须发 DraftResize(Start)，而不是降级成跟随：{acts:?}"
+        );
+        assert!(edges.iter().all(|e| *e == EventEdge::Start), "{edges:?}");
+        assert!(
+            !has(&acts, |a| matches!(a, OverlayAction::DraftFollow { .. })),
+            "抓到头就不该再「长度跟着鼠标走」：{acts:?}"
         );
     }
 

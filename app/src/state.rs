@@ -1116,7 +1116,11 @@ fn follow_span(start: &mut f64, end: &mut f64, beat: f64, min_len: f64) {
     *end = beat.max(*start + min_len.max(1e-6));
 }
 
-fn resize_span(start: &mut f64, end: &mut f64, edge: EventEdge, beat: f64, min_len: f64) {
+/// 拖控制杆改**一端**：另一端钉死，且不许交叉（只保证最小长度）。
+///
+/// 与 [`follow_span`] 一样是"手感"的一半，**故意公开**：遮蔽区的事件块拖动（`overlay::draw_mask_pane`）
+/// 复用它 —— 那边曾经自己写了一份 `clamp_span(min, max)`，反向拖会把块**翻过来**（头变成尾）。
+pub fn resize_span(start: &mut f64, end: &mut f64, edge: EventEdge, beat: f64, min_len: f64) {
     let min = min_len.max(1e-6);
     match edge {
         EventEdge::Start => *start = beat.min(*end - min),
