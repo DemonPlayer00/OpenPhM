@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{BpmEntry, Document, Event, JudgeLine, Layer, Meta, Note};
+use crate::doc::{BpmEntry, Document, Event, JudgeLine, Layer, MaskZone, Meta, Note};
 
 /// 判定线可变属性（只记录会被 `set_line` 改到的部分，避免整线克隆）
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -35,6 +35,21 @@ impl LineProps {
         l.bpm_factor = self.bpm_factor;
         l.z_order = self.z_order;
         l.is_cover = self.is_cover;
+    }
+}
+
+/// 遮蔽区可变属性（只记录会被 `set_zone` 改到的部分）
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ZoneProps {
+    pub name: String,
+}
+
+impl ZoneProps {
+    pub fn of(z: &MaskZone) -> Self {
+        Self { name: z.name.clone() }
+    }
+    pub fn apply_to(&self, z: &mut MaskZone) {
+        z.name = self.name.clone();
     }
 }
 
@@ -129,6 +144,34 @@ pub enum Change {
         before: Vec<Event>,
         after: Vec<Event>,
     },
+    /// 新增一块**遮蔽区**（整块，含它当时的七条轨道）
+    InsertZone {
+        index: usize,
+        zone: Box<MaskZone>,
+    },
+    /// 删除一块遮蔽区
+    RemoveZone {
+        index: usize,
+        zone: Box<MaskZone>,
+    },
+    /// 遮蔽区的可变属性（目前只有 `name` —— 与 `LineProps` 同一个理由：只记会被改到的部分）
+    SetZone {
+        index: usize,
+        before: Box<ZoneProps>,
+        after: Box<ZoneProps>,
+    },
+    /// 遮蔽区的**一条事件轨道**整条替换。
+    ///
+    /// 为什么不像判定线那样细到单条事件：遮蔽区没有图层（一条通道就一个数组），
+    /// 而"拖一个顶点"改的是两条通道同一拍上的值、拖一个事件块要重排跨度 ——
+    /// 落到日志上都是"这一条通道从 A 变成 B"，记整条反而更小更直观
+    /// （通道数量级与判定线的单层轨道相同，不会像 `NotesOfLine` 那样放大）。
+    ZoneTrack {
+        zone: usize,
+        track: String,
+        before: Vec<Event>,
+        after: Vec<Event>,
+    },
     /// 事务：多条改动作为一次撤销单元（agent 的一次批量提交 = 一次撤销）
     Transaction {
         label: String,
@@ -157,7 +200,26 @@ impl Change {
             | Change::SetBpm { .. }
             | Change::InsertLine { .. }
             | Change::RemoveLine { .. }
-            | Change::Transaction { .. } => None,
+            | Change::Transaction { .. }
+            // 遮蔽区不属于任何判定线 —— 判定线的重叠检测也管不到它（见 `Change::is_mask`）
+            | Change::InsertZone { .. }
+            | Change::RemoveZone { .. }
+            | Change::SetZone { .. }
+            | Change::ZoneTrack { .. } => None,
+        }
+    }
+
+    /// 这条改动**只动了遮蔽区**（判定线的重叠检测与它无关，不必为它全量重查）。
+    pub fn is_mask_only(&self) -> bool {
+        match self {
+            Change::InsertZone { .. }
+            | Change::RemoveZone { .. }
+            | Change::SetZone { .. }
+            | Change::ZoneTrack { .. } => true,
+            Change::Transaction { changes, .. } => {
+                !changes.is_empty() && changes.iter().all(Change::is_mask_only)
+            }
+            _ => false,
         }
     }
 
@@ -176,6 +238,11 @@ impl Change {
             Change::NotesOfLine { before, after, .. } => note * (before.len() + after.len()),
             Change::InsertEvent { .. } | Change::RemoveEvent { .. } | Change::SetEvent { .. } => ev,
             Change::ReplaceTrack { before, after, .. } => ev * (before.len() + after.len()),
+            Change::InsertZone { zone, .. } | Change::RemoveZone { zone, .. } => {
+                ev * (zone.event_count() + 7) + 256
+            }
+            Change::SetZone { .. } => 128,
+            Change::ZoneTrack { before, after, .. } => ev * (before.len() + after.len()),
             Change::Transaction { changes, .. } => {
                 64 + changes.iter().map(Change::approx_bytes).sum::<usize>()
             }
@@ -198,6 +265,10 @@ impl Change {
             Change::RemoveEvent { line, track, index, .. } => format!("del_event[{line}:{track}:{index}]"),
             Change::SetEvent { line, track, index, .. } => format!("set_event[{line}:{track}:{index}]"),
             Change::ReplaceTrack { line, track, .. } => format!("track[{line}:{track}]"),
+            Change::InsertZone { index, .. } => format!("add_zone[{index}]"),
+            Change::RemoveZone { index, .. } => format!("del_zone[{index}]"),
+            Change::SetZone { index, .. } => format!("set_zone[{index}]"),
+            Change::ZoneTrack { zone, track, .. } => format!("zone_track[{zone}:{track}]"),
             Change::Transaction { label, changes } => format!("{label}({} 条)", changes.len()),
         }
     }
@@ -259,6 +330,23 @@ impl Change {
             }
             Change::ReplaceTrack { line, layer, track, after, .. } => {
                 let t = get_track_mut(doc, *line, *layer, track)?;
+                *t = after.clone();
+            }
+            Change::InsertZone { index, zone } => {
+                let i = (*index).min(doc.mask_zones.len());
+                doc.mask_zones.insert(i, (**zone).clone());
+            }
+            Change::RemoveZone { index, .. } => {
+                if *index >= doc.mask_zones.len() {
+                    return Err(format!("遮蔽区下标 {index} 越界"));
+                }
+                doc.mask_zones.remove(*index);
+            }
+            Change::SetZone { index, after, .. } => {
+                after.apply_to(doc.mask_zones.get_mut(*index).ok_or("遮蔽区下标越界")?);
+            }
+            Change::ZoneTrack { zone, track, after, .. } => {
+                let t = get_zone_track_mut(doc, *zone, track)?;
                 *t = after.clone();
             }
             Change::Transaction { changes, .. } => {
@@ -329,6 +417,23 @@ impl Change {
                 let t = get_track_mut(doc, *line, *layer, track)?;
                 *t = before.clone();
             }
+            Change::InsertZone { index, .. } => {
+                if *index >= doc.mask_zones.len() {
+                    return Err(format!("遮蔽区下标 {index} 越界"));
+                }
+                doc.mask_zones.remove(*index);
+            }
+            Change::RemoveZone { index, zone } => {
+                let i = (*index).min(doc.mask_zones.len());
+                doc.mask_zones.insert(i, (**zone).clone());
+            }
+            Change::SetZone { index, before, .. } => {
+                before.apply_to(doc.mask_zones.get_mut(*index).ok_or("遮蔽区下标越界")?);
+            }
+            Change::ZoneTrack { zone, track, before, .. } => {
+                let t = get_zone_track_mut(doc, *zone, track)?;
+                *t = before.clone();
+            }
             Change::Transaction { changes, .. } => {
                 // 逆序回滚
                 for c in changes.iter().rev() {
@@ -355,6 +460,22 @@ fn get_track_mut<'a>(
 pub fn read_track(doc: &Document, line: usize, layer: usize, track: &str) -> Option<Vec<Event>> {
     let events = doc.judge_lines.get(line)?.layers.get(layer).and_then(|l| track_of(l, track))?;
     Some(events.to_vec())
+}
+
+/// 遮蔽区的一条轨道（**没有图层**：一条通道就是一份事件表）
+fn get_zone_track_mut<'a>(
+    doc: &'a mut Document,
+    zone: usize,
+    track: &str,
+) -> Result<&'a mut Vec<Event>, String> {
+    let z = doc.mask_zones.get_mut(zone).ok_or("遮蔽区下标越界")?;
+    z.track_mut(track)
+        .ok_or_else(|| format!("未知遮蔽区通道 {track}（可选 {:?}）", crate::doc::MASK_TRACKS))
+}
+
+/// 读取遮蔽区的一条轨道（记录 before 用）
+pub fn read_zone_track(doc: &Document, zone: usize, track: &str) -> Option<Vec<Event>> {
+    Some(doc.mask_zones.get(zone)?.track(track)?.to_vec())
 }
 
 /// 更改日志：撤销栈 + 重做栈 + 事务支持 + 字节上限

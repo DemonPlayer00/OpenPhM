@@ -134,6 +134,92 @@ impl TrackId {
     }
 }
 
+/// 遮蔽区的七条通道（顺序与 `doc::MASK_TRACKS` **逐位一致** —— 编辑区里的列序就是它）
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum MaskChannel {
+    X1 = 0,
+    Y1 = 1,
+    X2 = 2,
+    Y2 = 3,
+    X3 = 4,
+    Y3 = 5,
+    Active = 6,
+}
+
+impl MaskChannel {
+    pub const ALL: [MaskChannel; 7] = [
+        MaskChannel::X1,
+        MaskChannel::Y1,
+        MaskChannel::X2,
+        MaskChannel::Y2,
+        MaskChannel::X3,
+        MaskChannel::Y3,
+        MaskChannel::Active,
+    ];
+    /// 文档字段名（`doc::MASK_TRACKS` 的同一份字符串，不另抄一遍）
+    pub fn key(self) -> &'static str {
+        crate::doc::MASK_TRACKS[self as usize]
+    }
+    /// 字符串键 → 通道（键与枚举的换算只此一份，理由同 [`TrackId::from_key`]）
+    pub fn from_key(key: &str) -> Option<MaskChannel> {
+        MaskChannel::ALL.iter().copied().find(|c| c.key() == key)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskChannel::X1 => "顶点1 X",
+            MaskChannel::Y1 => "顶点1 Y",
+            MaskChannel::X2 => "顶点2 X",
+            MaskChannel::Y2 => "顶点2 Y",
+            MaskChannel::X3 => "顶点3 X",
+            MaskChannel::Y3 => "顶点3 Y",
+            MaskChannel::Active => "激活",
+        }
+    }
+    pub fn short_unit(self) -> &'static str {
+        match self {
+            MaskChannel::Active => "0–1",
+            _ => "RPE",
+        }
+    }
+    /// 它属于哪个顶点（`None` = `active` 通道，不属于任何顶点）
+    pub fn vertex(self) -> Option<usize> {
+        self.axis().map(|(v, _)| v)
+    }
+    /// `(顶点下标, 轴)`：轴 0 = X、1 = Y。`active` 给 `None`。
+    pub fn axis(self) -> Option<(usize, usize)> {
+        match self {
+            MaskChannel::Active => None,
+            other => Some((other as usize / 2, other as usize % 2)),
+        }
+    }
+}
+
+/// 一块遮蔽区在视图侧的缓存：**七条通道**（与 `doc::MaskZone` 一一对应）。
+///
+/// 遮蔽区**没有图层**（一条通道就是一份事件表）⇒ 这里的下标与文档下标是同一个数，
+/// 不存在判定线那种"合并视图下标 ≠ 文档下标"的坑。
+#[derive(Clone, Debug, Default)]
+pub struct MaskZoneView {
+    /// `doc.mask_zones` 里的下标
+    pub index: usize,
+    pub name: String,
+    pub tracks: [TrackView; 7],
+}
+
+impl MaskZoneView {
+    pub fn track(&self, c: MaskChannel) -> &TrackView {
+        &self.tracks[c as usize]
+    }
+    pub fn event_count(&self) -> usize {
+        self.tracks.iter().map(|t| t.events.len()).sum()
+    }
+    /// 此刻的区域状态 —— 与预览渲染、检查器读数**同一份求值**（`perf::mask_state_at`）
+    pub fn state(&self, tmap: &TimeMap, sec: f64) -> crate::perf::MaskState {
+        let r: [&[Event]; 7] = std::array::from_fn(|i| self.tracks[i].events.as_slice());
+        crate::perf::mask_state_at(&r, tmap.beat(sec), tmap)
+    }
+}
+
 /// 一条事件轨道在视图侧的缓存：**拍域事件** + **秒域采样折线**（时间轴用）
 #[derive(Clone, Default, Debug)]
 pub struct TrackView {
@@ -680,6 +766,8 @@ pub struct Chart {
     pub bpm: f64,
     /// 判定线（已按 zOrder 稳定排序）
     pub lines: Vec<Line>,
+    /// **遮蔽区**（顺序 = 文档顺序；它没有 zOrder，绘制不分层）
+    pub zones: Vec<MaskZoneView>,
 }
 
 impl Chart {
@@ -784,6 +872,39 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
     out
 }
 
+/// 取**一块遮蔽区**的七条通道缓存（与 [`tracks_of`] 同构，只是没有图层）。
+pub fn mask_zone_of(doc: &Document, index: usize, tmap: &TimeMap) -> Option<MaskZoneView> {
+    let src = doc.mask_zones.get(index)?;
+    let mut out = MaskZoneView {
+        index,
+        name: src.name.clone(),
+        tracks: Default::default(),
+    };
+    for c in MaskChannel::ALL {
+        let events = src.track(c.key()).cloned().unwrap_or_default();
+        if events.is_empty() {
+            continue;
+        }
+        // 遮蔽区没有图层：通道数组的下标**就是**文档下标（不存在"合并视图下标"，
+        // 所以这里的来历是恒等映射 —— 不是近似，也不是占位）
+        let origins = (0..events.len()).map(|i| crate::doc::EventRef::new(0, i)).collect();
+        let curve = sample_track(&events, tmap);
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in &curve {
+            min = min.min(p[1]);
+            max = max.max(p[1]);
+        }
+        out.tracks[c as usize] = TrackView {
+            events,
+            origins,
+            curve,
+            min: if min.is_finite() { min } else { 0.0 },
+            max: if max.is_finite() { max } else { 0.0 },
+        };
+    }
+    Some(out)
+}
+
 /// 把文档整体转成视图（引导期 / BPM 或判定线集合变化时用）
 ///
 /// **音符位置在这里一次算好**（`activate_floors`）：它是"加载时算好所有音符实例的实际位置"
@@ -801,6 +922,10 @@ pub fn chart_from_doc(doc: &Document) -> Chart {
     // zOrder 小的先画（在后），大的后画（在前）；同 zOrder 保持文档顺序
     lines.sort_by(|a, b| a.z_order.cmp(&b.z_order).then(a.index.cmp(&b.index)));
     let bpm = tmap.bpm_at(0.0);
+    // 遮蔽区要在 `tmap` 被移进 `Chart` **之前**建好（它的通道折线按秒采样，同样要用它）
+    let zones: Vec<MaskZoneView> = (0..doc.mask_zones.len())
+        .filter_map(|i| mask_zone_of(doc, i, &tmap))
+        .collect();
     Chart {
         name: doc.meta.name.clone(),
         duration: tmap.duration,
@@ -808,6 +933,7 @@ pub fn chart_from_doc(doc: &Document) -> Chart {
         bpm,
         tmap,
         lines,
+        zones,
     }
 }
 
@@ -1286,6 +1412,19 @@ pub struct EditorState {
     /// 而这条机制的依据正是那些框（用户口径："以编辑区 note 选择框为准"）。
     /// **它属于界面状态**：不进文档、不影响保存，也不参与任何谱面语义。
     pub note_stack: Vec<usize>,
+    /// **遮蔽区编辑模式**（视图状态）。
+    ///
+    /// 用户口径：这个模式下**整个编辑区**都用来编当前遮蔽区的七条通道 ——
+    /// 音符区的空间被直接占用、音符功能本身停用，直到切回普通模式。
+    /// 它是界面状态：不进文档、不影响保存。
+    pub mask_edit: bool,
+    /// 选中的遮蔽区（doc 下标；遮蔽区不排序，所以视图序与文档序是同一个数）
+    pub selected_zone: usize,
+    /// 选中通道（遮蔽区编辑模式下的"当前列"）
+    pub selected_channel: MaskChannel,
+    /// 选中通道里的事件块下标（**单选**：遮蔽区编辑模式暂不做多选，
+    /// 见 `docs/使用教程.md` 的口径说明）
+    pub mask_sel: Option<usize>,
     /// 边界外压暗的 alpha（**目标色彩空间下的名义值**）。
     /// 若渲染目标是 sRGB，混合发生在线性空间，同样的名义 alpha 观感会弱得多 ——
     /// 调用方用 [`crate::render::dim_alpha_for`] 按目标格式换算，保证 GUI 与无头出图观感一致。
@@ -1335,6 +1474,10 @@ impl EditorState {
             overlay_beats: Self::DEFAULT_OVERLAY_BEATS,
             window_offset_x: 0.0,
             note_stack: Vec::new(),
+            mask_edit: false,
+            selected_zone: 0,
+            selected_channel: MaskChannel::X1,
+            mask_sel: None,
             boundary_dim: crate::render::DIM_ALPHA_DEFAULT,
             started: None,
             start_playhead: 0.0,
@@ -1610,6 +1753,83 @@ impl EditorState {
 
     pub fn selected(&self) -> Option<&Line> {
         self.chart.lines.get(self.selected_line)
+    }
+
+    // ---------------------------------------------------------------- 遮蔽区（视图侧）
+    //
+    // 全是**视图状态**：哪个区/哪一列/哪个事件块被选中，不进文档。
+
+    /// 选中的遮蔽区视图（没选中或下标过期给 `None`）
+    pub fn selected_zone(&self) -> Option<&MaskZoneView> {
+        self.chart.zones.get(self.selected_zone)
+    }
+
+    /// 选中区的那条通道
+    pub fn mask_track(&self) -> Option<&TrackView> {
+        self.selected_zone().map(|z| z.track(self.selected_channel))
+    }
+
+    /// 选中区此刻的状态（预览/检查器/编辑区读数共用一份求值）
+    pub fn mask_state(&self) -> Option<crate::perf::MaskState> {
+        self.selected_zone().map(|z| z.state(&self.chart.tmap, self.playhead))
+    }
+
+    /// 选中通道里选中的那个事件块是否就是 `i`
+    pub fn is_mask_event_selected(&self, i: usize) -> bool {
+        self.mask_sel == Some(i)
+    }
+
+    /// 点选一个遮蔽区（顺便清掉块选中：换区之后旧下标没有意义）
+    pub fn select_zone(&mut self, i: usize) {
+        self.selected_zone = i.min(self.chart.zones.len().saturating_sub(1));
+        self.mask_sel = None;
+    }
+
+    /// 切到某条通道（换列就清掉块选中：下标在另一列里没有意义）
+    pub fn select_channel(&mut self, c: MaskChannel) {
+        if self.selected_channel != c {
+            self.selected_channel = c;
+            self.mask_sel = None;
+        }
+    }
+
+    /// 选中某条通道里的第 `i` 个事件块
+    pub fn select_mask_event(&mut self, c: MaskChannel, i: usize) {
+        self.selected_channel = c;
+        self.mask_sel = Some(i);
+    }
+
+    /// 清掉遮蔽区的事件选中（换区/删块之后必须调，否则会指着一个已经不存在的下标）
+    pub fn clear_mask_selection(&mut self) {
+        self.mask_sel = None;
+    }
+
+    /// 选中区/选中块的下标**夹回合法范围**（增删之后调；遮蔽区的视图下标与文档下标同源）
+    pub fn clamp_mask(&mut self) {
+        if self.chart.zones.is_empty() {
+            self.selected_zone = 0;
+            self.mask_sel = None;
+            self.mask_edit = false;
+            return;
+        }
+        self.selected_zone = self.selected_zone.min(self.chart.zones.len() - 1);
+        let n = self
+            .selected_zone()
+            .map(|z| z.track(self.selected_channel).events.len())
+            .unwrap_or(0);
+        if self.mask_sel.is_some_and(|i| i >= n) {
+            self.mask_sel = None;
+        }
+    }
+
+    /// 局部重建**一块遮蔽区**的通道缓存（对应判定线的 [`Line::set_tracks`]）。
+    ///
+    /// 与判定线不同：遮蔽区的事件不影响任何音符位置（它不属于任何线），
+    /// 所以这里没有"标脏流速位置"那一步 —— 换掉缓存就完事。
+    pub fn set_mask_tracks(&mut self, zone: usize, view: MaskZoneView) {
+        if let Some(slot) = self.chart.zones.get_mut(zone) {
+            *slot = view;
+        }
     }
 
     /// 时间轴总长在内容末尾之后**多留的拍数**（显示留白；不写进文件）。

@@ -201,35 +201,22 @@ pub fn load_value(v: Value) -> Result<RpeImport, String> {
         meta,
         bpm_list,
         judge_lines,
+        // RPE 里没有遮蔽区（实测：官方格式与 RPE 全量字段都没有）⇒ 导入永远是空的
+        mask_zones: Vec::new(),
         foreign,
     };
-    // 能力等级按内容推导：出现了 RPE 1.7 才有的字段（tint/judgeArea）就得抬到 2
+    // 能力等级按内容推导（**唯一一份**在 `doc::capability_of`）：出现了 RPE 1.7 才有的字段
+    // （tint/judgeArea）就得抬到 2，出现遮蔽区抬到 4，有 `x-opm:` 扩展抬到 3。
     let mut doc = doc;
-    doc.min_client_capability = capability_of(&doc);
+    doc.min_client_capability = crate::doc::capability_of(&doc);
     fid.finalize();
     Ok(RpeImport { doc, fidelity: fid })
 }
 
 /// 按内容推导 `minClientCapability`（`spec/opm-format.md` §7）
-fn capability_of(doc: &Document) -> u8 {
-    let mut cap = 1u8; // 有判定线事件/音符基础字段就是 rpe-base
-    for line in &doc.judge_lines {
-        for n in &line.notes {
-            if n.judge_area_scale != 1.0
-                || n.foreign.contains_key("visibleTime")
-                || n.foreign.contains_key("tint")
-                || n.foreign.contains_key("hitEffectTint")
-            {
-                cap = cap.max(2);
-            }
-        }
-        if line.foreign.contains_key("extended") || line.foreign.contains_key("controls") {
-            cap = cap.max(2);
-        }
-    }
-    cap
-}
-
+///
+/// **已搬到** [`crate::doc::capability_of`]：遮蔽区与扩展也要算进同一份判据，
+/// 而"两份 capability 表"必然在加档那天分家（症状：同一份谱面从 pez 进来是 2、从 opm 进来还是 1）。
 fn import_bpm_list(root: &Map<String, Value>, fid: &mut Fidelity) -> Result<Vec<BpmEntry>, String> {
     let arr = get(root, "BPMList")
         .and_then(|x| x.as_array())
@@ -816,6 +803,16 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
     }
     if doc.extensions.iter().any(|e| !e.starts_with("x-opm:")) {
         fid.warn("`extensions` 里存在非 `x-opm:` 前缀项 —— RPE 不认识，已忽略".to_owned());
+    }
+    // **遮蔽区在 RPE 里没有对应物**（实测：官方谱面格式与 RPE 1.4~1.7 的全量字段里都没有）。
+    // 静默丢掉是最坏的选择 —— "该挡的地方没挡"是一份**玩法不同**的谱面，而不是降级渲染；
+    // 所以这里逐个数报出来，让作者知道换个格式就少了东西。
+    if !doc.mask_zones.is_empty() {
+        fid.warn(format!(
+            "遮蔽区（{} 个区 / {} 条事件）**RPE 无法表达，已丢弃** —— 要保住它们只能用 opm 格式",
+            doc.mask_zones.len(),
+            doc.mask_zones.iter().map(|z| z.event_count()).sum::<usize>(),
+        ));
     }
     fid.note(format!(
         "导出 {} 条判定线、{} 个音符、{} 条 BPM 条目",

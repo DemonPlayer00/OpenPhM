@@ -40,7 +40,10 @@ EVENT_EPOCH = Fraction(0)
 NOTE_SOFT_LIMIT = 32768
 
 ROOT_KEYS = {"format", "formatVersion", "minClientCapability", "extensions",
-             "meta", "bpmList", "judgeLines", "source", "foreign"}
+             "meta", "bpmList", "judgeLines", "maskZones", "source", "foreign"}
+MASK_TRACKS = ("x1", "y1", "x2", "y2", "x3", "y3", "active")
+#: 遮蔽区需要的能力等级（§7 的第 4 档）：不认识它的读取方必须**明确拒绝**
+CAP_MASK = 4
 META_KEYS = {"name", "composer", "charter", "illustrator", "difficulty", "level",
              "constant", "offsetMs", "audio", "background", "id"}
 LINE_KEYS = {"name", "group", "bpmFactor", "zOrder", "isCover", "attachUI", "isGif",
@@ -352,6 +355,70 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int) -> Fraction:
     return chart_end
 
 
+def check_mask_track(track: list, name: str, ptr: str, rep: Report) -> None:
+    """遮蔽区的一条通道。
+
+    **与判定线轨道刻意不同的三条**（规范 §4.6）：
+    · 允许**空隙**（空档里保持前值）；
+    · 允许**首事件晚于拍 0** —— "这块区域什么时候出现"就是靠它表达的；
+    · 不要求末事件延拓到谱面末尾。
+    剩下的不变量只有：按 startBeat 升序、不重叠、endBeat > startBeat、缓动合法。
+    """
+    prev = None  # (start, end)
+    for i, ev in enumerate(track):
+        p = f"{ptr}[{i}]"
+        if not isinstance(ev, dict):
+            rep.err(p, "事件必须是对象")
+            continue
+        unknown_keys(ev, EVENT_KEYS, p, rep)
+        sb = beat_of(ev.get("startBeat"), f"{p}.startBeat", rep)
+        eb = beat_of(ev.get("endBeat"), f"{p}.endBeat", rep)
+        if sb is None or eb is None:
+            continue
+        if eb <= sb:
+            rep.err(p, f"endBeat({eb}) 必须大于 startBeat({sb})")
+        if prev is not None:
+            ps, pe = prev
+            if sb < ps:
+                rep.err(p, f"通道必须按 startBeat 升序（上一事件起于 {ps}，本事件起于 {sb}）")
+            elif sb < pe:
+                rep.err(p, f"通道不允许重叠：上一事件止于 {pe}，本事件起于 {sb}")
+        prev = (sb, eb)
+
+        easing = ev.get("easing", "linear")
+        if easing not in EASINGS:
+            rep.err(f"{p}.easing", f"未知缓动 {easing!r}（见 spec/easing.json）")
+        for key in ("startValue", "endValue"):
+            v = ev.get(key)
+            if v is None:
+                rep.err(f"{p}.{key}", "事件缺少数值")
+            elif name == "active":
+                # 二值化：写 true/false 最贴口径，写 0/1 也认（求值器按 ≥0.5 二值化）
+                if not isinstance(v, bool) and not is_num(v):
+                    rep.err(f"{p}.{key}", "active 的值必须是布尔（true/false）或数字")
+            elif not is_num(v):
+                rep.err(f"{p}.{key}", "遮蔽区坐标通道的值必须是数字")
+
+
+def check_mask_zone(zone, index: int, rep: Report) -> None:
+    ptr = f"/maskZones[{index}]"
+    if not isinstance(zone, dict):
+        rep.err(ptr, "遮蔽区必须是对象")
+        return
+    unknown_keys(zone, set(MASK_TRACKS) | {"name"}, ptr, rep)
+    name = zone.get("name")
+    if name is not None and not isinstance(name, str):
+        rep.err(f"{ptr}.name", "name 必须是字符串")
+    for track_name in MASK_TRACKS:
+        track = zone.get(track_name)
+        if track is None:
+            continue  # 缺省即空数组
+        if not isinstance(track, list):
+            rep.err(f"{ptr}.{track_name}", "通道必须是数组")
+            continue
+        check_mask_track(track, track_name, f"{ptr}.{track_name}", rep)
+
+
 def check_document(doc, rep: Report) -> None:
     if not isinstance(doc, dict):
         rep.err("/", "根必须是对象")
@@ -367,8 +434,8 @@ def check_document(doc, rep: Report) -> None:
         rep.warn("/formatVersion", f"formatVersion={fv}：本校验器只实现 v1")
 
     cap = doc.get("minClientCapability")
-    if not isinstance(cap, int) or isinstance(cap, bool) or not 0 <= cap <= 3:
-        rep.err("/minClientCapability", "minClientCapability 必须是 0~3 的整数")
+    if not isinstance(cap, int) or isinstance(cap, bool) or not 0 <= cap <= CAP_MASK:
+        rep.err("/minClientCapability", f"minClientCapability 必须是 0~{CAP_MASK} 的整数")
         cap = None
     exts = doc.get("extensions")
     if not isinstance(exts, list) or not all(isinstance(e, str) for e in exts):
@@ -382,6 +449,19 @@ def check_document(doc, rep: Report) -> None:
                 f"声明了 {len(exts)} 个扩展但 minClientCapability={cap}（应为 3）")
     if not exts and cap == 3:
         rep.warn("/minClientCapability", "minClientCapability=3 但没有任何扩展声明")
+
+    # ---- 遮蔽区（躁域）----
+    zones = doc.get("maskZones", [])
+    if not isinstance(zones, list):
+        rep.err("/maskZones", "maskZones 必须是数组")
+        zones = []
+    for i, zone in enumerate(zones):
+        check_mask_zone(zone, i, rep)
+    if zones and cap is not None and cap < CAP_MASK:
+        rep.err("/minClientCapability",
+                f"有 {len(zones)} 块遮蔽区但 minClientCapability={cap}（应为 {CAP_MASK}）——"
+                "不认识遮蔽区的读取方必须拒绝载入，"
+                "否则会渲染出一份「该挡的地方没挡」的谱面")
 
     meta = doc.get("meta")
     if not isinstance(meta, dict):

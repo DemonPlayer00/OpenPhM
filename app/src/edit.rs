@@ -566,6 +566,75 @@ pub fn milli_beat(beat: f64) -> [i64; 2] {
     [(beat * 1000.0).round() as i64, 1000]
 }
 
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+/// 新建一块遮蔽区（默认在中央摆一个正三角形 —— 那三条常量事件由核心写）。
+///
+/// `start` 是**播放头那一拍**（界面按当前网格吸附过）：区域从哪一刻开始存在，就是这条命令决定的
+/// （用户口径："当前时间没有任何坐标事件就不显示"—— 首事件的起点就是它出现的那一刻）。
+pub fn add_zone_command(start: crate::doc::Beat) -> Value {
+    json!({ "op": "add_zone", "startBeat": beat_arg(start) })
+}
+
+/// 遮蔽区属性（目前只有 `name`）
+pub fn set_zone_command(zone: usize, set: Value) -> Value {
+    json!({ "op": "set_zone", "zone": zone, "set": set })
+}
+
+/// 删除一块遮蔽区
+pub fn del_zone_command(zone: usize) -> Value {
+    json!({ "op": "del_zone", "index": zone })
+}
+
+/// 在遮蔽区的某条通道上放一个事件块。
+///
+/// **不带值**：缺省值 = 该通道此刻的值（由核心算）—— 界面上"放下一刻不跳变"这句话
+/// 只有核心算得准（它握着文档与时间映射），界面自己算会变成第二份求值实现。
+pub fn add_mask_event_command(
+    zone: usize,
+    track: crate::state::MaskChannel,
+    start: crate::doc::Beat,
+    end: crate::doc::Beat,
+) -> Value {
+    json!({
+        "op": "add_zone_event",
+        "zone": zone,
+        "track": track.key(),
+        "startBeat": beat_arg(start),
+        "endBeat": beat_arg(end),
+    })
+}
+
+/// 改遮蔽区事件块（起止拍用精确有理数；值可以是数字或布尔 —— `active` 通道就是布尔）
+pub fn set_mask_event_command(
+    zone: usize,
+    track: crate::state::MaskChannel,
+    index: usize,
+    set: Value,
+) -> Value {
+    json!({
+        "op": "set_zone_event",
+        "zone": zone,
+        "track": track.key(),
+        "index": index,
+        "set": set,
+    })
+}
+
+/// 删遮蔽区事件块
+pub fn del_mask_event_command(
+    zone: usize,
+    track: crate::state::MaskChannel,
+    index: usize,
+) -> Value {
+    json!({
+        "op": "del_zone_event",
+        "zone": zone,
+        "track": track.key(),
+        "index": index,
+    })
+}
+
 /// 判定线属性：`set_line`。字段名是**文档字段名**（`zOrder`/`isCover`/`bpmFactor`/`name`），
 /// 手写在这些调用点上迟早会写歪一个大小写。
 pub fn set_line_command(line: usize, set: Value) -> Value {
@@ -1125,5 +1194,44 @@ mod tests {
         let back = &c.doc().judge_lines[0].notes[1];
         assert_eq!(back.lane_x, before.lane_x);
         assert_eq!(back.start.to_f64(), before.start.to_f64());
+    }
+}
+
+#[cfg(test)]
+mod mask_command_tests {
+    use super::*;
+    use crate::doc::Beat;
+    use crate::state::MaskChannel;
+
+    /// 遮蔽区那几条命令的**拼法**（界面只调它们，所以 JSON 键名只在这里出现一次）。
+    ///
+    /// 钉住的是键名与**拍的形状**：拍一律既约分数 `[n, d]`（命令语言唯一的拍形状，
+    /// `cmd::parse_beat` 吃它），绝不放浮点 —— 界面上拖出来的 `1/3` 拍必须是 `[1,3]`。
+    #[test]
+    fn mask_commands_use_fractional_beats_and_document_keys() {
+        let start = Beat::new(1, 3);
+        let end = Beat::new(7, 6);
+        let add = add_zone_command(start);
+        assert_eq!(add["op"], serde_json::json!("add_zone"));
+        assert_eq!(add["startBeat"], serde_json::json!([1, 3]));
+
+        let ev = add_mask_event_command(2, MaskChannel::Y3, start, end);
+        assert_eq!(ev["op"], serde_json::json!("add_zone_event"));
+        assert_eq!(ev["zone"], serde_json::json!(2));
+        assert_eq!(ev["track"], serde_json::json!("y3"), "轨道名用文档键");
+        assert_eq!(ev["startBeat"], serde_json::json!([1, 3]));
+        assert_eq!(ev["endBeat"], serde_json::json!([7, 6]));
+        // **值不在这条命令里**：缺省值由核心取"该通道此刻的值"（放下一刻不跳变）
+        assert!(ev.get("startValue").is_none());
+
+        let set = set_mask_event_command(0, MaskChannel::Active, 3, serde_json::json!({"startValue": true}));
+        assert_eq!(set["op"], serde_json::json!("set_zone_event"));
+        assert_eq!(set["track"], serde_json::json!("active"));
+        assert_eq!(set["index"], serde_json::json!(3));
+        assert_eq!(set["set"]["startValue"], serde_json::json!(true), "active 的值是布尔");
+
+        assert_eq!(del_mask_event_command(1, MaskChannel::X2, 0)["op"], serde_json::json!("del_zone_event"));
+        assert_eq!(del_zone_command(4)["index"], serde_json::json!(4));
+        assert_eq!(set_zone_command(0, serde_json::json!({"name": "x"}))["op"], serde_json::json!("set_zone"));
     }
 }

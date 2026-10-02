@@ -195,6 +195,126 @@ impl Layer {
     }
 }
 
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+/// 遮蔽区的七条事件轨道（**顺序即编辑区里的列序**）。
+///
+/// 前六条是三角形三个顶点的屏幕坐标（RPE 单位：X ∈ ±675、Y ∈ ±450），
+/// 第七条 `active` 是二值化的外观开关（求值口径见 [`crate::perf::mask_state_at`]）。
+/// 没有第八条：用户口径是"不要保留位"（2026-10-02）—— 以后要加通道时，
+/// 按规范第 1 节第 6 条（永不删除字段）**追加**即可，不必预先挖坑。
+pub const MASK_TRACKS: [&str; 7] = ["x1", "y1", "x2", "y2", "x3", "y3", "active"];
+
+/// 新建遮蔽区的默认形状：以屏幕中心为外心的**正三角形**（外接圆半径 200 RPE 单位）。
+///
+/// 顶点坐标按"Y 向上"给（与 RPE 坐标系一致）：第一个顶点在上，另两个在下。
+/// 它是**文档数据**（`add_zone` 会把它写成三条常量事件），不是编辑器侧的兜底 ——
+/// 用户口径（2026-10-02）："总保底都是 (0,0)，新建写入默认事件为中央正三角形"。
+pub const MASK_DEFAULT_TRIANGLE: [[f64; 2]; 3] =
+    [[0.0, 200.0], [-173.205, -100.0], [173.205, -100.0]];
+
+/// 一个**遮蔽区**：三角形区域 + 它的七条事件轨道。
+///
+/// 为什么是一等根级对象（而不是挂在判定线下）：它**不属于任何判定线** ——
+/// 区域是屏幕空间的，与线的变换无关（用户口径：pez 里没这东西，opm 自己定）。
+/// 代价是"不认识遮蔽区的读取方"必须**明确拒绝**（能力等级 4，见 `spec/opm-format.md` §7）：
+/// 默默忽略它会让玩家看到一份"该挡的地方没挡"的谱面，那是错的呈现，不是降级。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaskZone {
+    #[serde(default = "default_zone_name")]
+    pub name: String,
+    #[serde(default)]
+    pub x1: Vec<Event>,
+    #[serde(default)]
+    pub y1: Vec<Event>,
+    #[serde(default)]
+    pub x2: Vec<Event>,
+    #[serde(default)]
+    pub y2: Vec<Event>,
+    #[serde(default)]
+    pub x3: Vec<Event>,
+    #[serde(default)]
+    pub y3: Vec<Event>,
+    #[serde(default)]
+    pub active: Vec<Event>,
+    #[serde(flatten)]
+    pub foreign: Foreign,
+}
+
+fn default_zone_name() -> String {
+    "遮蔽区".to_owned()
+}
+
+impl Default for MaskZone {
+    fn default() -> Self {
+        Self {
+            name: default_zone_name(),
+            x1: Vec::new(),
+            y1: Vec::new(),
+            x2: Vec::new(),
+            y2: Vec::new(),
+            x3: Vec::new(),
+            y3: Vec::new(),
+            active: Vec::new(),
+            foreign: Foreign::new(),
+        }
+    }
+}
+
+impl MaskZone {
+    pub fn track(&self, name: &str) -> Option<&Vec<Event>> {
+        match name {
+            "x1" => Some(&self.x1),
+            "y1" => Some(&self.y1),
+            "x2" => Some(&self.x2),
+            "y2" => Some(&self.y2),
+            "x3" => Some(&self.x3),
+            "y3" => Some(&self.y3),
+            "active" => Some(&self.active),
+            _ => None,
+        }
+    }
+    pub fn track_mut(&mut self, name: &str) -> Option<&mut Vec<Event>> {
+        match name {
+            "x1" => Some(&mut self.x1),
+            "y1" => Some(&mut self.y1),
+            "x2" => Some(&mut self.x2),
+            "y2" => Some(&mut self.y2),
+            "x3" => Some(&mut self.x3),
+            "y3" => Some(&mut self.y3),
+            "active" => Some(&mut self.active),
+            _ => None,
+        }
+    }
+    pub fn event_count(&self) -> usize {
+        MASK_TRACKS
+            .iter()
+            .filter_map(|t| self.track(t))
+            .map(|l| l.len())
+            .sum()
+    }
+
+    /// **新建遮蔽区**：默认名字 + 三条（顶点）各一对常量事件 = 屏幕中央的正三角形。
+    ///
+    /// `[start, end)` 是这六条事件共同的跨度 —— 之后怎么动由事件决定；`active` **不写事件**
+    /// （没有 active 事件时的取值是 `false`，见 `perf::mask_state_at`）。
+    pub fn with_default_triangle(start: Beat, end: Beat) -> Self {
+        let mut z = MaskZone::default();
+        for (i, [x, y]) in MASK_DEFAULT_TRIANGLE.iter().enumerate() {
+            let (xs, ys) = (i * 2, i * 2 + 1);
+            let xv = serde_json::json!(x);
+            let yv = serde_json::json!(y);
+            if let Some(slot) = z.track_mut(MASK_TRACKS[xs]) {
+                *slot = vec![Event::new(start, end, xv.clone(), xv, "linear")];
+            }
+            if let Some(slot) = z.track_mut(MASK_TRACKS[ys]) {
+                *slot = vec![Event::new(start, end, yv.clone(), yv, "linear")];
+            }
+        }
+        z
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NoteKind {
@@ -384,8 +504,49 @@ pub struct Document {
     pub bpm_list: Vec<BpmEntry>,
     #[serde(rename = "judgeLines")]
     pub judge_lines: Vec<JudgeLine>,
+    /// **遮蔽区**（见 [`MaskZone`]）。空数组**不写进文件**：没有遮蔽区的谱面与加这个字段之前
+    /// 逐字节相同（"永不静默改变既有字段语义"的第 6 条，也包括不凭空多出字段）。
+    #[serde(rename = "maskZones", default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_zones: Vec<MaskZone>,
     #[serde(flatten)]
     pub foreign: Foreign,
+}
+
+/// 能力等级：**遮蔽区**（`spec/opm-format.md` §7 的第 4 档）。
+///
+/// 为什么单列一档而不是塞进第 3 档（`opm-ext`）：第 3 档的含义是"用了 `x-opm:` 扩展字段"，
+/// 而遮蔽区是**一等字段**；而且读取方必须"要么完整支持、要么明确拒绝"——
+/// 忽略遮蔽区会渲染出一份**玩法不同**的谱面（该挡的地方没挡）。
+pub const CAP_MASK: u8 = 4;
+
+/// 按内容推导 `minClientCapability`（`spec/opm-format.md` §7）——**全工程唯一一份**。
+///
+/// RPE 导入侧与遮蔽区命令都走它：两份实现迟早会在"加第 5 档"那天分家，
+/// 而分家的症状是"同一份谱面，从 pez 进来是 2、从 opm 进来还是 1"。
+pub fn capability_of(doc: &Document) -> u8 {
+    let mut cap = 1u8; // 有判定线事件/音符基础字段就是 rpe-base
+    for line in &doc.judge_lines {
+        for n in &line.notes {
+            // RPE 1.7 才有的字段（值不是默认、或干脆来自 foreign 袋）
+            if n.judge_area_scale != 1.0
+                || n.foreign.contains_key("visibleTime")
+                || n.foreign.contains_key("tint")
+                || n.foreign.contains_key("hitEffectTint")
+            {
+                cap = cap.max(2);
+            }
+        }
+        if line.foreign.contains_key("extended") || line.foreign.contains_key("controls") {
+            cap = cap.max(2);
+        }
+    }
+    if !doc.extensions.is_empty() {
+        cap = cap.max(3);
+    }
+    if !doc.mask_zones.is_empty() {
+        cap = cap.max(CAP_MASK);
+    }
+    cap
 }
 
 impl Document {
@@ -428,6 +589,7 @@ impl Default for Document {
                 foreign: Foreign::new(),
             }],
             judge_lines: vec![JudgeLine::default()],
+            mask_zones: Vec::new(),
             foreign: Foreign::new(),
         }
     }
@@ -462,6 +624,7 @@ impl Document {
             "meta",
             "bpmList",
             "judgeLines",
+            "maskZones",
         ];
         doc.foreign = foreign_from(obj, &known);
         Ok(doc)
@@ -493,6 +656,18 @@ impl Document {
                 }
             }
         }
+        // 遮蔽区的事件也算内容：一块区域的表演（顶点的移动）往往跟在最后一个音符之后
+        for z in &self.mask_zones {
+            for track in MASK_TRACKS {
+                if let Some(list) = z.track(track) {
+                    for ev in list {
+                        if ev.end > end {
+                            end = ev.end;
+                        }
+                    }
+                }
+            }
+        }
         end
     }
 
@@ -510,6 +685,16 @@ impl Document {
             "bpmList": self.bpm_list.len(),
             "capability": self.min_client_capability,
             "extensions": self.extensions,
+            "maskZones": self.mask_zones.iter().enumerate().map(|(i, z)| {
+                serde_json::json!({
+                    "zone": i,
+                    "name": z.name,
+                    "events": z.event_count(),
+                    "tracks": MASK_TRACKS.iter().map(|t| {
+                        (t.to_string(), Value::from(z.track(t).map(|l| l.len()).unwrap_or(0)))
+                    }).collect::<Map<String, Value>>(),
+                })
+            }).collect::<Vec<_>>(),
             "eventCounts": self.judge_lines.iter().enumerate().map(|(i, l)| {
                 let layer = l.layers.first();
                 serde_json::json!({

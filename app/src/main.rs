@@ -1034,6 +1034,8 @@ struct App {
     builds_props: u64,
     builds_notes: u64,
     builds_tracks: u64,
+    /// 遮蔽区通道缓存的重建次数（与 `builds_tracks` 同一条纪律：见证"只重建脏掉的那一块"）
+    builds_zones: u64,
     builds_meta: u64,
     builds_inspector: u64,
     skipped_structure: u64,
@@ -1250,6 +1252,7 @@ impl App {
             builds_props: 0,
             builds_notes: 0,
             builds_tracks: 0,
+            builds_zones: 0,
             builds_meta: 0,
             builds_inspector: 0,
             skipped_structure: 0,
@@ -1518,6 +1521,61 @@ impl App {
                     self.state.cancel_pending();
                     self.file_message = Some((true, "已取消放置".to_owned()));
                 }
+                // ---- 遮蔽区编辑：选中/切列/放块/拖动 ----
+                //
+                // 这一组动作与判定线事件那组**形状一致**（选中 → 拖动 → 提交），只是数据源与
+                // 命令名不同（`*_zone_event`）。命令一律用 `beat_json`（按当前网格等分写成
+                // 有理数）—— 拖出来的拍绝不以浮点形式落进文档（那会在往返里变成 0.3333333）。
+                OverlayAction::MaskSelect { zone, channel, index } => {
+                    self.state.select_zone(zone);
+                    self.state.select_mask_event(channel, index);
+                    sel_changed = true;
+                }
+                OverlayAction::MaskSelectChannel(ch) => {
+                    self.state.select_channel(ch);
+                    self.state.clear_mask_selection();
+                    sel_changed = true;
+                }
+                OverlayAction::MaskDragStart => {
+                    if !self.drag_active {
+                        self.drag_active = true;
+                        cmds.push(opm_app::edit::begin_command("拖动遮蔽区事件"));
+                    }
+                }
+                OverlayAction::MaskSetSpan { zone, channel, index, start, end } => {
+                    cmds.push(serde_json::json!({
+                        "op": "set_zone_event",
+                        "zone": zone,
+                        "track": channel.key(),
+                        "index": index,
+                        "set": {
+                            "startBeat": self.state.beat_json(start),
+                            "endBeat": self.state.beat_json(end),
+                        },
+                    }));
+                }
+                OverlayAction::MaskDragEnd => {
+                    if self.drag_active {
+                        self.drag_active = false;
+                        cmds.push(opm_app::edit::commit_command());
+                    }
+                }
+                OverlayAction::MaskPlace { zone, channel, start, end } => {
+                    cmds.push(serde_json::json!({
+                        "op": "add_zone_event",
+                        "zone": zone,
+                        "track": channel.key(),
+                        "startBeat": self.state.beat_json(start),
+                        "endBeat": self.state.beat_json(end),
+                    }));
+                    self.file_message = Some((
+                        true,
+                        format!(
+                            "放下遮蔽区事件（{}）：{start:.3} → {end:.3} 拍（值取此刻的值）",
+                            channel.key()
+                        ),
+                    ));
+                }
                 OverlayAction::Notice(t) => {
                     self.file_message = Some((false, t));
                 }
@@ -1751,7 +1809,166 @@ impl App {
     /// 两件事不在这一层做：
     /// · **命令怎么拼**（尤其是"同一张表里按下标降序发"这条正确性规则）在 `edit.rs`；
     /// · **哪些下标还算数**由 `EditCore` 判（越界会明确报错，这里不预筛）。
+    /// 在**预览里**画所有可见的遮蔽区（用户口径：三条坐标轨道都没有"已开始"的事件就不显示）。
+    ///
+    /// 三条来自用户口径的硬约束（2026-10-02）：
+    /// · **本体属于预览**：它是游戏画面的一部分（跟判定线、音符同层），画在 wgpu 播放区**之上**、
+    ///   编辑区叠加层**之下** —— 编辑区是编辑器 chrome，遮蔽区不是；
+    /// · **在判定线和音符上方**：egui 这一层永远盖在 wgpu 实例之上，所以它天然压住线与音符
+    ///   （游戏里也是如此：这块红区盖住里面的音符）；
+    /// · **不做手柄**：顶点不画可拖的把手（"日后有更好的方案"），坐标靠编辑区的通道列与属性编辑器改。
+    ///
+    /// 唯一与指针有关的是**发光**（用户口径："靠近鼠标的遮蔽区发光"）：它只是读数，
+    /// 不占交互区 —— 所以不会把编辑区通道列上的点击抢走。
+    fn draw_mask_zones(&self, ui: &mut egui::Ui, play_rect: egui::Rect, scale_pts: f32, outline_only: bool) {
+        if self.state.chart.zones.is_empty() {
+            return;
+        }
+        let center = play_rect.center();
+        let rpe_of = |x: f32, y: f32| center + egui::vec2(x * scale_pts, -y * scale_pts);
+        let tmap = &self.state.chart.tmap;
+        let playhead = self.state.playhead;
+        // 发光只在遮蔽区编辑模式下算：那时"哪一块在等着被编"才是要看的信息
+        let pointer = if self.state.mask_edit {
+            ui.input(|i| i.pointer.hover_pos())
+        } else {
+            None
+        };
+        let p = ui.painter();
+        for i in 0..self.state.chart.zones.len() {
+            let Some(zone) = self.state.chart.zones.get(i) else { continue };
+            let st = zone.state(tmap, playhead);
+            if !st.visible {
+                continue; // 还没有任何坐标事件 ⇒ 这块区域此刻不存在
+            }
+            let tri: [[f32; 2]; 3] = [
+                [st.v[0][0] as f32, st.v[0][1] as f32],
+                [st.v[1][0] as f32, st.v[1][1] as f32],
+                [st.v[2][0] as f32, st.v[2][1] as f32],
+            ];
+            let pts: Vec<egui::Pos2> = tri.iter().map(|v| rpe_of(v[0], v[1])).collect();
+            let tri_px: [[f32; 2]; 3] = std::array::from_fn(|k| [pts[k].x, pts[k].y]);
+            if opm_app::mask::triangle_is_degenerate(&tri_px) {
+                continue; // 三个顶点重合/共线：没有可画的东西
+            }
+            let glow = pointer
+                .map(|q| {
+                    opm_app::mask::mask_glow(opm_app::mask::point_triangle_distance(
+                        [q.x, q.y],
+                        &tri_px,
+                    ))
+                })
+                .unwrap_or(0.0);
+            let red = opm_app::mask::MASK_RED;
+            let stroke_w = 1.4 + 1.8 * glow;
+            let stroke = egui::Color32::from_rgba_unmultiplied(
+                red[0],
+                red[1],
+                red[2],
+                (150.0 + 105.0 * glow) as u8,
+            );
+            // **发光**：先描一圈更宽的半透明轮廓（在填充之下），看起来才像"亮起来了"。
+            // 编辑区叠加层开着时会把预览整体压暗，所以这一圈刻意画粗一点 ——
+            // 压暗之后仍要认得出"哪一块在等你"。
+            if glow > 0.01 {
+                p.add(egui::Shape::closed_line(
+                    pts.clone(),
+                    egui::Stroke::new(
+                        stroke_w + 9.0,
+                        egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], (80.0 * glow) as u8),
+                    ),
+                ));
+            }
+            if outline_only {
+                // 遮蔽区编辑模式在叠加层**之上**补的一遍：**只在指针靠近时**描一圈细轮廓
+                //（"靠近鼠标的遮蔽区发光"就是它），平时一笔都不画 ——
+                // 七列数据是编辑的主体，不能被常驻的 chrome 压住。
+                if glow > 0.01 {
+                    p.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(stroke_w, stroke)));
+                }
+                continue;
+            }
+            let style = opm_app::mask::mask_style(st.active);
+            let fill_a = ((style.fill_alpha + 0.30 * glow).min(1.0) * 255.0) as u8;
+            let fill = egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], fill_a);
+            p.add(egui::Shape::convex_polygon(pts.clone(), fill, egui::Stroke::new(stroke_w, stroke)));
+            // **细网格**（active 那一档）：间距按当前缩放折算，锚在屏幕原点
+            // （三角形移动时网格跟着走 —— 网格属于"屏幕"，不属于这块区）
+            if style.grid {
+                let step_px = opm_app::mask::MASK_GRID_STEP * scale_pts;
+                let origin_px = rpe_of(0.0, 0.0);
+                let grid_col = egui::Color32::from_rgba_unmultiplied(
+                    red[0].saturating_add(40),
+                    red[1].saturating_add(40),
+                    red[2].saturating_add(40),
+                    (120.0 + 60.0 * glow) as u8,
+                );
+                for seg in opm_app::mask::mask_grid_lines(
+                    &tri_px,
+                    step_px.max(2.0),
+                    [origin_px.x, origin_px.y],
+                ) {
+                    p.line_segment(
+                        [egui::pos2(seg[0][0], seg[0][1]), egui::pos2(seg[1][0], seg[1][1])],
+                        egui::Stroke::new(1.0, grid_col),
+                    );
+                }
+            }
+        }
+    }
+
+    /// 切换**遮蔽区编辑模式**（编辑区整片换形态）。
+    ///
+    /// 收成一个方法而不是两处直接改字段：切过去时要把"当前列/选中块"收拾干净
+    /// （否则会指着一块区里不存在的下标），切回来时也不能留着半个拖动状态。
+    fn set_mask_edit(&mut self, on: bool) {
+        if self.state.mask_edit == on {
+            return;
+        }
+        self.state.mask_edit = on;
+        self.state.clear_mask_selection();
+        if self.state.pending_event.is_some() || self.state.pending_hold.is_some() {
+            // 草稿（按住 R 之后的跟随状态）属于普通模式：切模式时丢掉它，
+            // 免得"切回去之后一个 hold 还在跟着鼠标"
+            self.state.cancel_pending();
+        }
+        if on {
+            self.state.clamp_mask();
+            let n = self.state.chart.zones.len();
+            self.file_message = Some((
+                true,
+                if n == 0 {
+                    "遮蔽区编辑模式：还没有遮蔽区 —— 左栏「遮蔽区」面板里点「新建」".to_owned()
+                } else {
+                    format!("遮蔽区编辑模式：当前 #{}（共 {n} 块）", self.state.selected_zone)
+                },
+            ));
+        } else {
+            self.file_message = Some((true, "普通编辑模式".to_owned()));
+        }
+        self.insp = self.build_inspector();
+    }
+
     fn delete_selection(&mut self) {
+        // **遮蔽区编辑模式**下 Del 删的是那块区当前通道里选中的事件块
+        // （这个模式下音符区功能停用，选中的音符/事件与眼前的东西没关系，别误删）
+        if self.state.mask_edit {
+            let Some(i) = self.state.mask_sel else {
+                self.file_message = Some((false, "没有选中的遮蔽区事件块".to_owned()));
+                return;
+            };
+            let (zone, ch) = (self.state.selected_zone, self.state.selected_channel);
+            self.state.clear_mask_selection();
+            self.insp = self.build_inspector();
+            self.dispatch(&[serde_json::json!({
+                "op": "del_zone_event", "zone": zone, "track": ch.key(), "index": i,
+            })]);
+            self.file_message = Some((
+                true,
+                format!("已删除遮蔽区事件（{} 第 {i} 块，Ctrl+Z 可撤销）", ch.key()),
+            ));
+            return;
+        }
         let notes = self.state.selection().notes().count();
         let events = self.state.selection().events().count();
         if notes + events == 0 {
@@ -2362,8 +2579,35 @@ impl App {
                         }
                     );
                 }
-                control::ViewCmd::Select { line, track, note, event, notes, events } => {
+                control::ViewCmd::Select {
+                    line,
+                    track,
+                    note,
+                    event,
+                    notes,
+                    events,
+                    zone,
+                    mask_edit,
+                    channel,
+                    zone_event,
+                } => {
                     // 选中是视图状态：直接改 EditorState，不碰文档
+                    //
+                    // **遮蔽区那一组先处理**：进编辑模式会重排编辑区，之后再选通道/块才有意义
+                    // （顺序反了的话"选中块"会被随后的清空抹掉）。
+                    if let Some(z) = zone {
+                        self.state.select_zone(z);
+                    }
+                    if let Some(on) = mask_edit {
+                        self.set_mask_edit(on);
+                    }
+                    if let Some(c) = channel.as_deref().and_then(state::MaskChannel::from_key) {
+                        self.state.select_channel(c);
+                    }
+                    if let Some(k) = zone_event {
+                        let ch = self.state.selected_channel;
+                        self.state.select_mask_event(ch, k);
+                    }
                     if let Some(li) = line {
                         self.state.select_line_doc(li);
                     }
@@ -2512,7 +2756,12 @@ impl App {
         // `structure` 变化时重建（加音符走"逐线局部重建"）⇒ 音符放到 68.9s 了，时间轴还停在 20.0s。
         // 只算末端（`chart_end()` 是 note/事件的 max），不重建视图模型，所以可以每条广播都做。
         // （不含 `d.meta`：改曲名/曲师不影响内容长度，别为它白扫一遍所有音符）
-        if d.structure || !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_empty() {
+        if d.structure
+            || !d.props.is_empty()
+            || !d.notes.is_empty()
+            || !d.tracks.is_empty()
+            || !d.zones.is_empty()
+        {
             let c = self.core.lock().unwrap();
             let end = c.doc().chart_end().to_f64();
             drop(c);
@@ -2559,7 +2808,8 @@ impl App {
             self.clamp_selection();
         } else {
             // 逐线局部重建：只锁一次文档，按需取该线的部分
-            if !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_empty() {
+            if !d.props.is_empty() || !d.notes.is_empty() || !d.tracks.is_empty() || !d.zones.is_empty()
+            {
                 let c = self.core.lock().unwrap();
                 let tmap = self.state.chart.tmap.clone();
                 for i in &d.props {
@@ -2589,6 +2839,14 @@ impl App {
                         // （异步补齐，见下面的 `pump_floors`），并刷新构建窗口用的 min_speed_abs
                         slot.set_tracks(tracks, &tmap);
                         self.builds_tracks += 1;
+                    }
+                }
+                // 遮蔽区：只重建动过的那一块（与"按线重建"同一条纪律）。
+                // 注意它**不牵动任何音符位置** —— 遮蔽区不属于任何判定线。
+                for i in &d.zones {
+                    if let Some(z) = state::mask_zone_of(c.doc(), *i, &tmap) {
+                        self.state.set_mask_tracks(*i, z);
+                        self.builds_zones += 1;
                     }
                 }
                 drop(c);
@@ -2632,6 +2890,8 @@ impl App {
     /// 多选之后这件事必须**整批**做：集合里任何一个下标过期都要剔除（否则 Del 会删错东西）。
     /// 只清锚是不够的 —— 锚没了会自动落到集合里还在的第一个，见 `Selection::retain`。
     fn clamp_selection(&mut self) {
+        // 遮蔽区（选中区/选中块）也在这里夹一下：增删之后旧下标会指到不存在的东西上
+        self.state.clamp_mask();
         let n = self.state.chart.lines.len();
         if n == 0 {
             self.state.selected_line = 0;
@@ -2878,6 +3138,7 @@ impl App {
         s.builds_props = self.builds_props;
         s.builds_notes = self.builds_notes;
         s.builds_tracks = self.builds_tracks;
+        s.builds_zones = self.builds_zones;
         s.builds_meta = self.builds_meta;
         s.builds_inspector = self.builds_inspector;
         s.skipped_structure = self.skipped_structure;
@@ -3803,6 +4064,30 @@ impl eframe::App for App {
                     .on_hover_text("当前音符区显示的 laneX 区间（橙色竖线 = 官方窗口边界 ±675）");
                 }
                 ui.separator();
+                // ---- 遮蔽区（躁域）编辑模式：一键切换编辑区的两种形态 ----
+                //
+                // 普通模式：左半音符 / 右半事件；遮蔽区编辑：**整个编辑区**都是当前遮蔽区的
+                // 七条通道（音符功能停用，用户口径）。按钮上带数量，免得"没建区就切过去"看着像坏了。
+                let mask_on = self.state.mask_edit;
+                let mask_label = if mask_on {
+                    format!("🟥 遮蔽区编辑：开（{} 块）", self.state.chart.zones.len())
+                } else {
+                    format!("🟥 遮蔽区编辑（{} 块）", self.state.chart.zones.len())
+                };
+                if ui
+                    .selectable_label(mask_on, mask_label)
+                    .on_hover_text(
+                        "在**普通编辑模式**与**遮蔽区编辑模式**之间切换。\n\
+                         遮蔽区（游戏里的「躁域」）是一块三角形区域：游戏里点进这块区域无法与音符交互。\n\
+                         遮蔽区编辑模式下，整个编辑区都是当前遮蔽区的七条通道（x1/y1/x2/y2/x3/y3/active）——\n\
+                         音符区的功能**停用**，直到切回普通模式。\n\
+                         左栏「遮蔽区」面板里可以新建/切换/删除（一块谱面可以有多个遮蔽区）。",
+                    )
+                    .clicked()
+                {
+                    self.set_mask_edit(!mask_on);
+                }
+                ui.separator();
                 // ---- 基础设置（收在"设置"里）----
                 ui.menu_button("设置 ⚙", |ui| {
                     ui.checkbox(&mut self.state.overlay_enabled, "编辑区叠加层");
@@ -4269,6 +4554,13 @@ impl eframe::App for App {
                         }
                         sel_changed = true;
                     }
+                    // 选中一块遮蔽区：**顺便进入遮蔽区编辑模式**（用户点它的意图就是编它）。
+                    // 走 `set_mask_edit` 而不是直接改字段：切模式要收拾草稿/选中（只此一处实现）
+                    TreeAction::SelectZone(i) => {
+                        self.state.select_zone(i);
+                        self.set_mask_edit(true);
+                        sel_changed = true;
+                    }
                     TreeAction::Cmd(c) => cmds.push(c),
                 }
             }
@@ -4302,6 +4594,13 @@ impl eframe::App for App {
                 self.state.select_note(i);
                 self.insp = self.build_inspector();
             }
+            // 遮蔽区通道列表里点了一行 ⇒ 切"当前列"（同样是**视图**动作；块选中随之清掉，
+            // 因为旧下标在另一条通道里指的不是同一个块）
+            if let Some(c) = ins_out.select_channel {
+                self.state.select_channel(c);
+                self.state.clear_mask_selection();
+                self.insp = self.build_inspector();
+            }
             if self.ws == Workspace::Debug {
             ui.separator();
             ui.label("诊断（调试工作区）");
@@ -4333,8 +4632,8 @@ impl eframe::App for App {
                 self.builds_structure, self.builds_props, self.builds_notes
             ));
             ui.monospace(format!(
-                "重建 轨道{} 检查{}",
-                self.builds_tracks, self.builds_inspector
+                "重建 轨道{} 遮蔽区{} 检查{}",
+                self.builds_tracks, self.builds_zones, self.builds_inspector
             ));
             ui.monospace(format!(
                 "跳过 整表{} 属性{} 音符{}",
@@ -4440,6 +4739,9 @@ impl eframe::App for App {
                 },
             ));
 
+            // ---- 遮蔽区**本体**：画在预览里（播放区之上、编辑区之下），两种模式都画 ----
+            self.draw_mask_zones(ui, play_rect, scale_pts, false);
+
             // 边界与判定线的标注（文字与端点标记走 egui，几何线走 wgpu，两者用同一个映射公式）
             // 编辑区开着时不再画窗口文字：两套 chrome 叠在同一角会互相糊掉（边框本身还在）
             if self.state.show_boundary && !self.overlay_visible {
@@ -4522,6 +4824,11 @@ impl eframe::App for App {
                 // 叠加层不画（播放中 / 按住 H）⇒ 这一帧根本没有"选择框"可言，
                 // 重叠组随之清空：宁可列表消失，也别留一份与画面不符的旧数据。
                 self.state.set_note_stack(Vec::new());
+            }
+
+            // ---- 遮蔽区编辑模式：在叠加层**之上**补一遍细轮廓（只描边，不盖数据、不做手柄）----
+            if self.state.mask_edit {
+                self.draw_mask_zones(ui, play_rect, scale_pts, true);
             }
 
             // 对齐自检：用与着色器相同的映射公式，把同一批 RPE 坐标画成十字。

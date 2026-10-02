@@ -64,6 +64,45 @@ pub fn lines_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
     })
 }
 
+/// **遮蔽区在某个时刻的数值快照** —— 给 agent 的核对口径（与 `lines_report` 同一套路）。
+///
+/// 为什么必须有它：遮蔽区的画面是 **egui 层**画的（三角形 + 网格，见 `mask` 模块），
+/// 而无头出图（`render_png`）走的是 wgpu 实例管线 —— 那张 PNG 里**看不到遮蔽区**。
+/// 与其让 agent 对着一张看不见区域的图猜，不如把"此刻它是哪三个点、显不显示、active 是什么"
+/// 直接给成数字：这些数就是判据（`perf::mask_state_at`），图只是同一份求值的一种画法。
+pub fn masks_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
+    let tmap = crate::perf::TimeMap::from_doc(doc);
+    let zones: Vec<serde_json::Value> = doc
+        .mask_zones
+        .iter()
+        .enumerate()
+        .map(|(i, z)| {
+            let lists: Vec<Vec<crate::doc::Event>> = crate::doc::MASK_TRACKS
+                .iter()
+                .map(|t| z.track(t).cloned().unwrap_or_default())
+                .collect();
+            let r: [&[crate::doc::Event]; 7] = std::array::from_fn(|k| lists[k].as_slice());
+            let st = crate::perf::mask_state_at(&r, tmap.beat(playhead_sec), &tmap);
+            serde_json::json!({
+                "index": i,
+                "name": z.name,
+                "events": z.event_count(),
+                "visible": st.visible,
+                "active": st.active,
+                "vertices": st.v.iter().map(|v| serde_json::json!([v[0], v[1]])).collect::<Vec<_>>(),
+                "tracks": crate::doc::MASK_TRACKS.iter().map(|t| {
+                    (t.to_string(), serde_json::Value::from(z.track(t).map(|l| l.len()).unwrap_or(0)))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "playheadSec": playhead_sec,
+        "playheadBeat": tmap.beat(playhead_sec),
+        "zones": zones,
+    })
+}
+
 /// 出图选项（与 GUI 的视图设置同源，避免"agent 看到的"和"人看到的"不一致）
 #[derive(Clone, Copy)]
 pub struct RenderOpts {

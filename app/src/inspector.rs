@@ -159,6 +159,9 @@ pub fn beat_triple_field(
 pub struct InspectorOut {
     pub commands: Vec<serde_json::Value>,
     pub select_note: Option<usize>,
+    /// **视图**动作：在通道列表里点了某一条 ⇒ 把编辑区的"当前列"切过去
+    /// （与 `select_note` 同一条理由：选中不是文档数据，不走命令通道）
+    pub select_channel: Option<opm_app::state::MaskChannel>,
 }
 
 /// 画属性编辑器，返回这一帧的产物（见 [`InspectorOut`]）。
@@ -171,6 +174,14 @@ pub fn inspector_ui(
 ) -> InspectorOut {
     let mut out = InspectorOut::default();
     let ec = &mut out.commands;
+    // ---- 遮蔽区编辑模式：右栏整片让给它 ----
+    //
+    // 放在 `match insp` **之前**：这个模式下面板要的是"当前遮蔽区"，而 `Inspector` 快照是
+    // 按**判定线**取的（没有判定线的谱面上它会是 `None`）—— 遮蔽区与判定线本来就没有关系。
+    if st.mask_edit {
+        mask_panel(ui, st, &mut out);
+        return out;
+    }
     match insp {
         Some(v) => {
             // ---- 判定线（当前线）：可编辑 ----
@@ -533,6 +544,248 @@ pub fn inspector_ui(
         }
     }
     out
+}
+
+/// **遮蔽区面板**（遮蔽区编辑模式下右栏的全部内容）。
+///
+/// 它只读 `st`（视图状态）—— 名字/通道/事件块/此刻的状态都在视图模型里，
+/// 不需要文档快照（`Inspector` 是按判定线取的，遮蔽区与判定线无关）。
+fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
+    let ec = &mut out.commands;
+    let beat = st.chart.tmap.beat(st.playhead);
+    let snapped = st.snap_beat(beat).max(0.0);
+    let anchor = opm_app::codec::beat_from_f64(snapped);
+
+    ui.horizontal(|ui| {
+        ui.label("遮蔽区");
+        ui.monospace(format!(
+            "#{} / {}",
+            st.selected_zone,
+            st.chart.zones.len()
+        ));
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("新建")
+            .on_hover_text("在播放头摆一个中央正三角形（六条常量事件；active 不写事件）")
+            .clicked()
+        {
+            ec.push(opm_app::edit::add_zone_command(anchor));
+        }
+        if ui
+            .add_enabled(
+                !st.chart.zones.is_empty(),
+                egui::Button::new("删除本区").small(),
+            )
+            .on_hover_text("删掉当前这块遮蔽区（Ctrl+Z 可撤销）")
+            .clicked()
+        {
+            ec.push(opm_app::edit::del_zone_command(st.selected_zone));
+        }
+    });
+
+    let Some(mi) = opm_app::view::mask_inspect(st) else {
+        ui.separator();
+        ui.label("（还没有遮蔽区 —— 点上面的「新建」）").on_hover_text(
+            "遮蔽区（游戏里的「躁域」）：一块三角形区域，游戏里点进这块区域无法与音符交互。\n\
+             它的形状完全由事件块决定 —— **三条坐标通道一个事件都没有时它不存在**（不显示）。",
+        );
+        return;
+    };
+
+    // ---- 名字 ----
+    ui.horizontal(|ui| {
+        ui.label("名字");
+        if let Some(name) = text_field(ui, "zone-name", &mi.name, 130.0) {
+            ec.push(opm_app::edit::set_zone_command(
+                mi.index,
+                serde_json::json!({"name": name}),
+            ));
+        }
+    });
+
+    // ---- 此刻 ----
+    // "此刻"= 播放头那一拍：不显示时**明说**（这正是它与判定线不同的地方）
+    let st_now = mi.state;
+    ui.separator();
+    if st_now.visible {
+        ui.monospace(format!(
+            "此刻 三角形 ({:.0},{:.0}) ({:.0},{:.0}) ({:.0},{:.0})",
+            st_now.v[0][0], st_now.v[0][1], st_now.v[1][0], st_now.v[1][1], st_now.v[2][0], st_now.v[2][1]
+        ));
+    } else {
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 190, 110),
+            "此刻**不显示**（三条坐标通道都还没有已开始的事件）",
+        );
+    }
+    ui.monospace(format!(
+        "外观 {}",
+        if st_now.active { "true（细网格 + 更透明）" } else { "false（纯色）" }
+    ));
+
+    // ---- 在播放头放一块 ----
+    ui.separator();
+    let ch = mi.channel;
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("在播放头放一块")
+            .on_hover_text(format!(
+                "给当前列 {} 放一个 4 拍的事件块，**值取此刻的值**（放下一刻不跳变）",
+                ch.key()
+            ))
+            .clicked()
+        {
+            let end = opm_app::codec::beat_from_f64(snapped + 4.0);
+            ec.push(opm_app::edit::add_mask_event_command(
+                mi.index,
+                ch,
+                anchor,
+                end,
+            ));
+        }
+    });
+
+    // ---- 七条通道 ----
+    ui.separator();
+    ui.label("通道（点一行切换编辑区的当前列）");
+    for row in &mi.channels {
+        let mark = if row.channel == ch { "▶" } else { " " };
+        let val = match (row.channel, row.value) {
+            (opm_app::state::MaskChannel::Active, Some(v)) => {
+                if v >= 0.5 { "true".to_owned() } else { "false".to_owned() }
+            }
+            (_, Some(v)) => format!("{v:>8.1}"),
+            (_, None) => "       —".to_owned(),
+        };
+        let text = format!(
+            "{mark}{:<6}{:>3}块 {val}  [{:.0},{:.0}] {}",
+            row.channel.key(),
+            row.events,
+            row.min,
+            row.max,
+            row.channel.short_unit()
+        );
+        if ui.monospace(text).clicked() {
+            out.select_channel = Some(row.channel);
+        }
+    }
+    ui.monospace(format!("（播放头 {beat:.3} 拍）"));
+
+    // ---- 选中的事件块：可编辑 ----
+    let Some(ev) = mi.event.as_ref() else {
+        ui.separator();
+        ui.label("（在编辑区点一个事件块，这里编辑它）");
+        return;
+    };
+    ui.separator();
+    ui.label(format!("事件块 · {} #{}", ch.key(), ev.index));
+    // 头/尾：**【整拍数】+【分子】/【分母】**（与判定线的事件编辑器同一套控件、同一个理由：
+    // 1/3 这类拍走浮点留不住）
+    for (key, label, edge, was) in [
+        ("ze_start", "起 ", opm_app::state::EventEdge::Start, ev.start_exact),
+        ("ze_end", "止 ", opm_app::state::EventEdge::End, ev.end_exact),
+    ] {
+        if let Some(b) = beat_triple_field(ui, key, label, was) {
+            if b.n != was.n || b.d != was.d {
+                let field = if edge == opm_app::state::EventEdge::Start { "startBeat" } else { "endBeat" };
+                ec.push(opm_app::edit::set_mask_event_command(
+                    mi.index,
+                    ch,
+                    ev.index,
+                    serde_json::json!({ field: opm_app::edit::beat_arg(b) }),
+                ));
+            }
+        }
+    }
+    // 值：`active` 是**布尔**（用户口径"二值化"），坐标通道是数字。
+    // 判据取自值本身的类型，不是通道名 —— 文件里写 `true`/`false` 与写 `1`/`0` 都成立。
+    let as_bool = |v: &serde_json::Value| -> Option<bool> {
+        match v {
+            serde_json::Value::Bool(b) => Some(*b),
+            serde_json::Value::Number(n) => Some(n.as_f64().unwrap_or(0.0) >= 0.5),
+            _ => None,
+        }
+    };
+    match (as_bool(&ev.start_value), as_bool(&ev.end_value)) {
+        (Some(sb), Some(eb)) if ch == opm_app::state::MaskChannel::Active => {
+            let (mut a, mut b) = (sb, eb);
+            let mut set = serde_json::Map::new();
+            if ui.checkbox(&mut a, "起 true").changed() {
+                set.insert("startValue".into(), serde_json::json!(a));
+            }
+            if ui.checkbox(&mut b, "止 true").changed() {
+                set.insert("endValue".into(), serde_json::json!(b));
+            }
+            if !set.is_empty() {
+                ec.push(opm_app::edit::set_mask_event_command(
+                    mi.index,
+                    ch,
+                    ev.index,
+                    serde_json::Value::Object(set),
+                ));
+            }
+        }
+        _ => {
+            let (mut sv, mut evv) = (
+                ev.start_value.as_f64().unwrap_or(0.0),
+                ev.end_value.as_f64().unwrap_or(0.0),
+            );
+            let mut changed = false;
+            changed |= value_field(ui, &mut sv, "值起 ", 1.0, None).changed;
+            changed |= value_field(ui, &mut evv, "值止 ", 1.0, None).changed;
+            if changed {
+                ec.push(opm_app::edit::set_mask_event_command(
+                    mi.index,
+                    ch,
+                    ev.index,
+                    serde_json::json!({"startValue": sv, "endValue": evv}),
+                ));
+            }
+        }
+    }
+    // 缓动：与判定线事件同一套控件（遮蔽区的坐标也是"从这一块到下一块"插值的）
+    if let Some((curve, variant)) = cmd::split_easing(&ev.easing) {
+        let mut new_curve = curve;
+        egui::ComboBox::from_id_salt("ze_easing_curve")
+            .selected_text(curve.label())
+            .width(104.0)
+            .show_ui(ui, |ui| {
+                for c in cmd::EaseCurve::ALL {
+                    ui.selectable_value(&mut new_curve, c, c.label());
+                }
+            });
+        let mut new_variant = new_curve.clamp_variant(variant.unwrap_or(cmd::EaseVariant::Out));
+        let avail = new_curve.variants();
+        ui.add_enabled_ui(!avail.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("ze_easing_variant")
+                .selected_text(new_variant.label())
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for v in avail {
+                        ui.selectable_value(&mut new_variant, *v, v.label());
+                    }
+                });
+        });
+        let want = cmd::easing_name(new_curve, new_variant);
+        if want != ev.easing {
+            ec.push(opm_app::edit::set_mask_event_command(
+                mi.index,
+                ch,
+                ev.index,
+                serde_json::json!({"easing": want}),
+            ));
+        }
+    } else {
+        ui.monospace(format!("缓动 {}（无法识别，已原样保留）", ev.easing));
+    }
+    if ui
+        .button("删除这一块")
+        .on_hover_text("Del 同效（Ctrl+Z 可撤销）")
+        .clicked()
+    {
+        ec.push(opm_app::edit::del_mask_event_command(mi.index, ch, ev.index));
+    }
 }
 
 #[cfg(test)]

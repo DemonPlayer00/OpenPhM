@@ -19,7 +19,7 @@
 //!
 //! 这一层只读 `EditorState`、只产出**动作**（选中），不直接改任何数据 —— 与左侧判定线树同一条规矩。
 
-use opm_app::state::{EditorState, SelKind, TrackId, RPE_WINDOW_HALF_W, RPE_WINDOW_W};
+use opm_app::state::{EditorState, MaskChannel, SelKind, TrackId, RPE_WINDOW_HALF_W, RPE_WINDOW_W};
 // 事件边界规则只有一份实现，住在库内 `state`（好让集成测试能调真身）：这里只再导出，GUI 侧的名字不变。
 pub use opm_app::state::{prefer_edge, EventEdge};
 
@@ -86,6 +86,36 @@ pub enum OverlayAction {
     DraftCommit,
     /// 草稿：取消（Esc）
     DraftCancel,
+    /// **遮蔽区编辑**：选中某块区的某条通道里的某个事件块（顺便把"当前列"切过去）
+    MaskSelect {
+        zone: usize,
+        channel: MaskChannel,
+        index: usize,
+    },
+    /// 遮蔽区编辑：点空白/列头 ⇒ 只切"当前列"，清掉块选中
+    MaskSelectChannel(MaskChannel),
+    /// 遮蔽区编辑：把选中块的时间跨度设成这个（**绝对值**，不是增量）。
+    ///
+    /// 为什么是绝对值：拖动期间文档每帧都在变，增量会在"视图慢一帧"时累积成漂移；
+    /// 绝对跨度只需要一个冻结的起点（见 `MaskDrag`），与判定线的 `resize_event` 同一条思路。
+    MaskSetSpan {
+        zone: usize,
+        channel: MaskChannel,
+        index: usize,
+        start: f64,
+        end: f64,
+    },
+    /// 遮蔽区编辑：拖动开始（调用方开事务 ⇒ 整段拖拽只占一个撤销步）
+    MaskDragStart,
+    /// 遮蔽区编辑：拖动结束（调用方提交事务）
+    MaskDragEnd,
+    /// 遮蔽区编辑：双击空处放一个新块（起止已吸附；值由核心取"此刻的值"）
+    MaskPlace {
+        zone: usize,
+        channel: MaskChannel,
+        start: f64,
+        end: f64,
+    },
     /// 面板想跟用户说一句话（例如"指针不在音符区，快速放置用不了"）——
     /// 动作只描述意图，显示在状态栏/控制台由调用方决定
     Notice(String),
@@ -499,6 +529,47 @@ fn grab_get(ui: &egui::Ui) -> Option<opm_app::edit::Grab> {
 /// 正在拉的**框选**：起点屏幕坐标 + 选哪一类（**起始点定半区**，用户定的规则）
 type BoxSelState = (egui::Pos2, SelKind);
 
+/// **遮蔽区编辑模式下正在拖的那一块**（冻结拖拽开始时的跨度）。
+///
+/// 为什么不复用 `EdgeDrag`：那个存的是"判定线事件的文档地址 + 哪一头"，
+/// 而遮蔽区**没有图层、也没有多选**（一块区的一条通道就是一个数组，下标即文档下标），
+/// 需要的额外信息是"拖的是整块还是某一头"和"按下时指针在哪一拍"。
+/// 共用一份状态会让两条路径的语义互相污染（判定线那边还有组拖动，这边没有）。
+#[derive(Clone, Copy, Debug)]
+struct MaskDrag {
+    zone: usize,
+    channel: MaskChannel,
+    index: usize,
+    /// 拖拽开始时的跨度（拍）—— 绝对跨度的原点
+    start: f64,
+    end: f64,
+    /// `None` = 整块平移；`Some` = 拖那一头
+    edge: Option<EventEdge>,
+    /// 按下时指针所在的拍（算平移增量）
+    press_beat: f64,
+}
+
+fn mask_drag_set(ui: &egui::Ui, v: Option<MaskDrag>) {
+    ui.data_mut(|d| {
+        if let Some(v) = v {
+            d.insert_temp(egui::Id::new("opm_mask_drag"), v);
+        } else {
+            d.remove::<MaskDrag>(egui::Id::new("opm_mask_drag"));
+        }
+    });
+}
+
+fn mask_drag_get(ui: &egui::Ui) -> Option<MaskDrag> {
+    ui.data(|d| d.get_temp::<MaskDrag>(egui::Id::new("opm_mask_drag")))
+}
+
+/// 按 `pad` 把闭区间夹进合法范围（`[0, ∞)` 里的一个"有长度的"区间）
+fn clamp_span(start: f64, end: f64, min_len: f64) -> (f64, f64) {
+    let start = start.max(0.0);
+    let end = end.max(start + min_len);
+    (start, end)
+}
+
 fn box_set(ui: &egui::Ui, v: Option<BoxSelState>) {
     ui.data_mut(|d| d.insert_temp(egui::Id::new("opm_box_sel"), v));
 }
@@ -827,34 +898,52 @@ pub fn draw(
     );
 
     let mid_x = rect.center().x;
-    // 中间是**纵轴轴带**（拍号写在里面），两半各让出一半宽度 —— 这样两区被轴分开
-    let axis = egui::Rect::from_min_max(
-        egui::pos2(mid_x - AXIS_W * 0.5, body.min.y),
-        egui::pos2(mid_x + AXIS_W * 0.5, body.max.y),
-    );
-    let note_pane = egui::Rect::from_min_max(body.min, egui::pos2(axis.min.x, body.max.y));
-    let ev_pane = egui::Rect::from_min_max(egui::pos2(axis.max.x, body.min.y), body.max);
+    // **两种模式的骨架**（用户口径：遮蔽区编辑模式下"使用整个编辑区空间、音符功能停用"）：
+    // · 普通模式：纵轴轴带在**正中**，左半音符 / 右半事件；
+    // · 遮蔽区编辑：轴带贴**左边缘**（拍号还是要有），右边整片是七条通道 ——
+    //   不给 7 列塞一半宽度，因为坐标通道要靠拖时间块来编，列越宽越好用。
+    let mask_mode = st.mask_edit;
+    let (axis, note_pane, ev_pane, lanes) = if mask_mode {
+        let axis = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, body.min.y),
+            egui::pos2(rect.min.x + AXIS_W, body.max.y),
+        );
+        let lanes = egui::Rect::from_min_max(egui::pos2(axis.max.x, body.min.y), body.max);
+        (axis, egui::Rect::NOTHING, egui::Rect::NOTHING, lanes)
+    } else {
+        let axis = egui::Rect::from_min_max(
+            egui::pos2(mid_x - AXIS_W * 0.5, body.min.y),
+            egui::pos2(mid_x + AXIS_W * 0.5, body.max.y),
+        );
+        let note_pane = egui::Rect::from_min_max(body.min, egui::pos2(axis.min.x, body.max.y));
+        let ev_pane = egui::Rect::from_min_max(egui::pos2(axis.max.x, body.min.y), body.max);
+        (axis, note_pane, ev_pane, ev_pane)
+    };
     // 两半各自压一点底色，轴带再暗一档（轴是"骨架"，不该抢内容）
     let pane_a = (cfg.body_alpha.clamp(0.0, 1.0) * 46.0) as u8;
-    p.rect_filled(
-        note_pane,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(20, 24, 34, pane_a),
-    );
-    p.rect_filled(
-        ev_pane,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(26, 22, 32, pane_a),
-    );
+    if !mask_mode {
+        p.rect_filled(
+            note_pane,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(20, 24, 34, pane_a),
+        );
+        p.rect_filled(
+            ev_pane,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(26, 22, 32, pane_a),
+        );
+    }
     p.rect_filled(
         axis,
         0.0,
         egui::Color32::from_rgba_unmultiplied(10, 11, 16, (cfg.body_alpha.clamp(0.0, 1.0) * 150.0) as u8),
     );
     // 轴带两侧各一条竖线：分栏线就是轴本身
-    for x in [axis.min.x, axis.max.x] {
+    // （遮蔽区模式下轴贴在左边缘 ⇒ 只有右侧那条有意义）
+    let axis_sides: &[f32] = if mask_mode { &[axis.max.x] } else { &[axis.min.x, axis.max.x] };
+    for x in axis_sides {
         p.line_segment(
-            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            [egui::pos2(*x, rect.min.y), egui::pos2(*x, rect.max.y)],
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 160, 200, 110)),
         );
     }
@@ -885,8 +974,9 @@ pub fn draw(
             // 否则"一拍为基准"又糊成一整片。α 阶梯 110 < 170 < 215，线宽 0.9 < 1.5 < 2.2。
             (0.9, egui::Color32::from_rgba_unmultiplied(118, 128, 174, 110))
         };
-        // 网格线只画在两半里：轴带留白，视觉上才是"被轴分开的两个区"
-        for pane in [note_pane, ev_pane] {
+        // 网格线只画在内容区里：轴带留白，视觉上才是"被轴分开的区"
+        let panes: &[egui::Rect] = if mask_mode { &[lanes] } else { &[note_pane, ev_pane] };
+        for pane in panes {
             p.line_segment(
                 [egui::pos2(pane.min.x, y), egui::pos2(pane.max.x, y)],
                 egui::Stroke::new(w, col),
@@ -903,7 +993,8 @@ pub fn draw(
             if y < body.min.y - 1.0 || y > body.max.y + 1.0 {
                 continue;
             }
-            for x in [axis.min.x, axis.max.x] {
+            for x in axis_sides {
+                let x = *x;
                 p.line_segment(
                     [egui::pos2(x, y), egui::pos2(x + if x < mid_x { 3.5 } else { -3.5 }, y)],
                     egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(140, 150, 195, 130)),
@@ -923,15 +1014,18 @@ pub fn draw(
         } else {
             (8.5, egui::Color32::from_rgb(150, 160, 205), 4.5)
         };
-        // 数字居中写在轴带里，两侧各一个小刻度线指向相邻半区
+        // 数字居中写在**轴带**里，两侧各一个小刻度线指向相邻半区。
+        // 遮蔽区模式下轴带贴在左边缘 ⇒ 这里必须用轴带自己的中心，不能用 `mid_x`
+        //（用 `mid_x` 会把拍号写到通道列上 —— 截图里一眼看得出来，测试看不出来）
         p.text(
-            egui::pos2(mid_x, y - 1.0),
+            egui::pos2(axis.center().x, y - 1.0),
             egui::Align2::CENTER_BOTTOM,
             &t.text,
             egui::FontId::monospace(fsize),
             col,
         );
-        for x in [axis.min.x, axis.max.x] {
+        for x in axis_sides {
+            let x = *x;
             p.line_segment(
                 [egui::pos2(x, y), egui::pos2(x + if x < mid_x { tick } else { -tick }, y)],
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 160, 205)),
@@ -943,13 +1037,24 @@ pub fn draw(
         egui::pos2(rect.max.x - 4.0, rect.min.y + 1.0),
         egui::Align2::RIGHT_TOP,
         // 简短：右半的列名就在同一行，长标题会跟列名叠字（其余信息在工具栏/检查器里）
-        format!(
-            "编辑区 [{} 拍] · 基准 1 拍 · 网格 1/{} · Ctrl+滚轮 缩放 · H 隐藏",
-            beats as i64,
-            div
-        ),
+        if mask_mode {
+            format!(
+                "遮蔽区编辑 [{} 拍] · 七条通道 · 双击空处放块 · Del 删除 · Ctrl+滚轮 缩放 · H 隐藏",
+                beats as i64
+            )
+        } else {
+            format!(
+                "编辑区 [{} 拍] · 基准 1 拍 · 网格 1/{} · Ctrl+滚轮 缩放 · H 隐藏",
+                beats as i64,
+                div
+            )
+        },
         egui::FontId::monospace(9.5),
-        egui::Color32::from_rgb(165, 175, 215),
+        if mask_mode {
+            egui::Color32::from_rgb(250, 180, 180)
+        } else {
+            egui::Color32::from_rgb(165, 175, 215)
+        },
     );
 
     // **选区读数**：多选之后"选了几个"必须一眼可见（Del 与拖动都作用在它上面）。
@@ -982,6 +1087,14 @@ pub fn draw(
             [egui::pos2(body.min.x, y_now), egui::pos2(body.max.x, y_now)],
             egui::Stroke::new(1.4, egui::Color32::from_rgb(245, 235, 120)),
         );
+    }
+
+    // ---- 遮蔽区编辑模式：整个编辑区都是它的（音符区功能停用，用户口径）----
+    //
+    // 放在"取选中判定线"**之前**：这个模式下不需要判定线，没有判定线也能编遮蔽区。
+    if mask_mode {
+        draw_mask_pane(ui, st, rect, lanes, keys_enabled, &y_of, &beat_of, actions);
+        return OverlayOut::default();
     }
 
     let Some(line) = st.selected() else {
@@ -1750,6 +1863,365 @@ pub fn draw(
     OverlayOut { note_stack }
 }
 
+
+/// 遮蔽区编辑模式的七条通道列。
+///
+/// 交互与判定线的事件区**同一条规则**（命中头/尾优先于本体、吸附到拍网格、拖动期间冻结跨度），
+/// 差别只在数据源与动作：这里发 `Mask*` 动作，调用方翻译成 `*_zone_event` 命令。
+/// 单文件里两套列布局并存是刻意的 —— 判定线那边还挂着多选、组拖动、框选、跨图层合并地址，
+/// 把这些一起泛化会让 3000 行的叠加层多出一层抽象，而收益只是"少写 120 行"。
+#[allow(clippy::too_many_arguments)]
+fn draw_mask_pane(
+    ui: &mut egui::Ui,
+    st: &EditorState,
+    rect: egui::Rect,
+    lanes: egui::Rect,
+    keys_enabled: bool,
+    y_of: &impl Fn(f64) -> f32,
+    beat_of: &impl Fn(f32) -> f64,
+    actions: &mut Vec<OverlayAction>,
+) {
+    let p = ui.painter_at(rect);
+    let tmap = &st.chart.tmap;
+    let beat_now = tmap.beat(st.playhead);
+    let zone_idx = st.selected_zone;
+    let Some(zone) = st.selected_zone() else {
+        p.text(
+            lanes.center(),
+            egui::Align2::CENTER_CENTER,
+            "还没有遮蔽区 —— 在左边的「遮蔽区」面板里新建一块（工具栏的「遮蔽区」按钮切换本模式）",
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(220, 170, 170),
+        );
+        // 这一帧没有列可点：仍然吃掉指针（否则点到的是下面的演奏区）
+        ui.interact(rect, egui::Id::new("opm_mask_pane"), egui::Sense::click_and_drag());
+        return;
+    };
+
+    let n = MaskChannel::ALL.len();
+    let col_w = lanes.width() / n as f32;
+    let col_of_x = |x: f32| -> usize {
+        (((x - lanes.min.x) / col_w).floor().max(0.0) as usize).min(n - 1)
+    };
+
+    // ---- 列背景 + 列名 + 此刻的值 ----
+    for (k, ch) in MaskChannel::ALL.iter().enumerate() {
+        let x0 = lanes.min.x + k as f32 * col_w;
+        let col = MASK_COLORS[k];
+        let is_sel = *ch == st.selected_channel;
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0 + 1.0, lanes.min.y),
+                egui::pos2(x0 + col_w - 1.0, lanes.max.y),
+            ),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(col[0], col[1], col[2], if is_sel { 26 } else { 10 }),
+        );
+        if k > 0 {
+            p.line_segment(
+                [egui::pos2(x0, lanes.min.y), egui::pos2(x0, lanes.max.y)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 130, 170, 90)),
+            );
+        }
+        // 列头：通道名 + 此刻的值（值就是"这块区现在长什么样"的一部分）
+        let tr = zone.track(*ch);
+        let cur = opm_app::perf::track_value(&tr.events, beat_now, tmap);
+        let val = match (*ch, cur) {
+            (MaskChannel::Active, Some(v)) => if v >= 0.5 { "true" } else { "false" }.to_owned(),
+            (_, Some(v)) => format!("{v:.0}"),
+            (_, None) => "—".to_owned(),
+        };
+        p.text(
+            egui::pos2(x0 + col_w * 0.5, rect.min.y + RULER_H - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("{} {val}", ch.key()),
+            egui::FontId::monospace(9.0),
+            egui::Color32::from_rgb(col[0], col[1], col[2]),
+        );
+        if is_sel {
+            p.line_segment(
+                [
+                    egui::pos2(x0 + 2.0, rect.min.y + RULER_H - 1.0),
+                    egui::pos2(x0 + col_w - 2.0, rect.min.y + RULER_H - 1.0),
+                ],
+                egui::Stroke::new(1.6, egui::Color32::from_rgb(col[0], col[1], col[2])),
+            );
+        }
+    }
+
+    // ---- 事件块 ----
+    // 本帧画过的块：(通道, 下标, 矩形, 起点 y, 终点 y) —— 命中/框选/高亮共用这一份几何
+    let mut blocks: Vec<(MaskChannel, usize, egui::Rect, f32, f32)> = Vec::new();
+    for (k, ch) in MaskChannel::ALL.iter().enumerate() {
+        let x0 = lanes.min.x + k as f32 * col_w;
+        let col = MASK_COLORS[k];
+        let inset = col_w * 0.16; // 比判定线那半边更靠边：通道少、列宽，块画宽一点更好点
+        for (i, e) in zone.track(*ch).events.iter().enumerate() {
+            let y0 = y_of(tmap.beat(tmap.sec(e.start.to_f64())));
+            let y1 = y_of(tmap.beat(tmap.sec(e.end.to_f64())));
+            if y0.max(y1) < lanes.min.y - 20.0 || y0.min(y1) > lanes.max.y + 20.0 {
+                continue;
+            }
+            let r = egui::Rect::from_min_max(
+                egui::pos2(x0 + inset, y0.min(y1)),
+                egui::pos2(x0 + col_w - inset, y0.max(y1).max(y0.min(y1) + 3.0)),
+            );
+            let selected = st.selected_channel == *ch && st.is_mask_event_selected(i);
+            let (bottom, top) =
+                gradient_colors(egui::Color32::from_rgb(col[0], col[1], col[2]), selected);
+            let mut mesh = egui::Mesh::default();
+            let base = mesh.vertices.len() as u32;
+            let uv = egui::epaint::WHITE_UV;
+            mesh.vertices.push(egui::epaint::Vertex { pos: r.left_bottom(), uv, color: bottom });
+            mesh.vertices.push(egui::epaint::Vertex { pos: r.right_bottom(), uv, color: bottom });
+            mesh.vertices.push(egui::epaint::Vertex { pos: r.right_top(), uv, color: top });
+            mesh.vertices.push(egui::epaint::Vertex { pos: r.left_top(), uv, color: top });
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            p.add(egui::Shape::mesh(mesh));
+            if selected {
+                p.rect_stroke(
+                    r.expand(1.0),
+                    1.0,
+                    egui::Stroke::new(1.4, egui::Color32::WHITE),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            // 块里写起止值（高度不够就不硬塞 —— 与判定线事件区同一条口径）
+            if r.height() >= 16.0 {
+                let txt = egui::Color32::from_rgb(235, 240, 255);
+                p.text(
+                    egui::pos2(r.center().x, r.min.y + 1.0),
+                    egui::Align2::CENTER_TOP,
+                    fmt_val(&e.start_value),
+                    egui::FontId::monospace(9.0),
+                    txt,
+                );
+                p.text(
+                    egui::pos2(r.center().x, r.max.y - 1.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    fmt_val(&e.end_value),
+                    egui::FontId::monospace(9.0),
+                    txt,
+                );
+            }
+            blocks.push((*ch, i, r, y0, y1));
+        }
+    }
+
+    // ---- 交互 ----
+    let resp = ui.interact(
+        rect,
+        egui::Id::new("opm_mask_pane"),
+        egui::Sense::click_and_drag() | egui::Sense::hover(),
+    );
+    let hover_pos = resp.hover_pos();
+    let ptr = resp.interact_pointer_pos().or(hover_pos);
+    let over_ruler = |pos: egui::Pos2| pos.y < rect.min.y + RULER_H;
+    let in_axis = |pos: egui::Pos2| pos.x < lanes.min.x;
+
+    // 命中：先算清楚"指针下面是什么"
+    #[derive(Clone, Copy)]
+    enum Hit {
+        Ruler(f64),
+        Channel(MaskChannel),
+        Block(MaskChannel, usize, EventPart),
+    }
+    let hit = ptr.map(|pos| {
+        if over_ruler(pos) {
+            return Hit::Ruler(beat_of(pos.y.max(rect.min.y + RULER_H)));
+        }
+        if in_axis(pos) {
+            return Hit::Channel(MaskChannel::ALL[0]);
+        }
+        let k = col_of_x(pos.x);
+        let ch = MaskChannel::ALL[k];
+        let tr = zone.track(ch);
+        // 与判定线同一条规则：头/尾把手优先，同一 y 上"选中的那个优先"，否则选靠后的
+        let mut near: Vec<(usize, EventEdge, f32)> = Vec::new();
+        let mut body: Option<usize> = None;
+        for (i, e) in tr.events.iter().enumerate() {
+            let y0 = y_of(tmap.beat(tmap.sec(e.start.to_f64())));
+            let y1 = y_of(tmap.beat(tmap.sec(e.end.to_f64())));
+            match hit_event_part(pos.y, y0, y1, EDGE_BAND) {
+                EventPart::Start => near.push((i, EventEdge::Start, (pos.y - y0).abs())),
+                EventPart::End => near.push((i, EventEdge::End, (pos.y - y1).abs())),
+                EventPart::Body => {
+                    if body.is_none() {
+                        body = Some(i);
+                    }
+                }
+                EventPart::None => {}
+            }
+        }
+        if let Some(best) = near
+            .iter()
+            .map(|(_, _, d)| *d)
+            .fold(None, |m: Option<f32>, d| Some(m.map(|x: f32| x.min(d)).unwrap_or(d)))
+        {
+            let cands: Vec<(usize, EventEdge)> = near
+                .iter()
+                .filter(|(_, _, d)| (*d - best).abs() < 0.75)
+                .map(|(i, e, _)| (*i, *e))
+                .collect();
+            let sel_here = cands
+                .iter()
+                .find(|(i, _)| st.selected_channel == ch && st.is_mask_event_selected(*i))
+                .map(|(i, _)| *i);
+            if let Some((i, edge)) = prefer_edge(&cands, sel_here) {
+                let part = if edge == EventEdge::Start {
+                    EventPart::Start
+                } else {
+                    EventPart::End
+                };
+                return Hit::Block(ch, i, part);
+            }
+        }
+        match body {
+            Some(i) => Hit::Block(ch, i, EventPart::Body),
+            None => Hit::Channel(ch),
+        }
+    });
+
+    // 光标：拖得动就直说（事件块只有时间一个轴 ⇒ 上下双头箭头）
+    match &hit {
+        Some(Hit::Block(_, _, _)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+        Some(Hit::Channel(_)) if ptr.is_some() && !in_axis(ptr.unwrap()) => {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        _ => {}
+    }
+
+    // 拖动
+    if resp.drag_started() {
+        let press = ui
+            .input(|i| i.pointer.press_origin())
+            .or(resp.interact_pointer_pos())
+            .or(hover_pos);
+        if let (Some(Hit::Block(ch, i, part)), Some(q)) = (&hit, press) {
+            let e = zone.track(*ch).events.get(*i);
+            if let Some(e) = e {
+                let edge = match part {
+                    EventPart::Start => Some(EventEdge::Start),
+                    EventPart::End => Some(EventEdge::End),
+                    _ => None,
+                };
+                mask_drag_set(
+                    ui,
+                    Some(MaskDrag {
+                        zone: zone_idx,
+                        channel: *ch,
+                        index: *i,
+                        start: e.start.to_f64(),
+                        end: e.end.to_f64(),
+                        edge,
+                        press_beat: beat_of(q.y),
+                    }),
+                );
+                actions.push(OverlayAction::MaskSelect {
+                    zone: zone_idx,
+                    channel: *ch,
+                    index: *i,
+                });
+                actions.push(OverlayAction::MaskDragStart);
+            }
+        }
+    }
+    if resp.drag_started() || resp.dragged() {
+        if let (Some(d), Some(q)) = (mask_drag_get(ui), ptr) {
+            // 吸附与夹取都在这里一次算完（拖动只改时间一个轴）
+            let snapped = st.snap_beat(beat_of(q.y)).max(0.0);
+            let (start, end) = match d.edge {
+                Some(EventEdge::Start) => clamp_span(snapped, d.end, 1e-3),
+                Some(EventEdge::End) => clamp_span(d.start.min(snapped), snapped.max(d.start), 1e-3),
+                None => {
+                    let delta = snapped - d.press_beat;
+                    clamp_span(d.start + delta, d.end + delta, 1e-3)
+                }
+            };
+            if (start, end) != (d.start, d.end) {
+                actions.push(OverlayAction::MaskSetSpan {
+                    zone: d.zone,
+                    channel: d.channel,
+                    index: d.index,
+                    start,
+                    end,
+                });
+            }
+        }
+    }
+    if resp.drag_stopped() {
+        if mask_drag_get(ui).is_some() {
+            actions.push(OverlayAction::MaskDragEnd);
+            mask_drag_set(ui, None);
+        }
+    }
+
+    // 点选 / 双击新建
+    if resp.double_clicked() {
+        if let (Some(Hit::Channel(ch)), Some(q)) = (&hit, ptr) {
+            let ch = *ch;
+            let start = st.snap_beat(beat_of(q.y)).max(0.0);
+            // 新块铺 4 拍，但**不越过下一块**（越过了就贴到它起点；起点本身在块里时不该走到这里）
+            let next = zone
+                .track(ch)
+                .events
+                .iter()
+                .filter(|e| e.start.to_f64() > start + 1e-9)
+                .map(|e| e.start.to_f64())
+                .fold(f64::INFINITY, f64::min);
+            let end = (start + 4.0).min(next);
+            if end > start + 1e-3 {
+                actions.push(OverlayAction::MaskPlace {
+                    zone: zone_idx,
+                    channel: ch,
+                    start,
+                    end,
+                });
+            } else {
+                actions.push(OverlayAction::Notice(
+                    "这里放不下新块（紧挨着下一块）—— 双击稍微早一点的位置".to_owned(),
+                ));
+            }
+        }
+    } else if resp.clicked() && mask_drag_get(ui).is_none() {
+        match hit {
+            Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
+            Some(Hit::Block(ch, i, _)) => actions.push(OverlayAction::MaskSelect {
+                zone: zone_idx,
+                channel: ch,
+                index: i,
+            }),
+            Some(Hit::Channel(ch)) => actions.push(OverlayAction::MaskSelectChannel(ch)),
+            None => {}
+        }
+    }
+
+    // 滚轮：与普通模式同一件事（滚动 = 改播放头；Ctrl+滚轮 = 缩放）
+    if resp.hovered() && keys_enabled {
+        let (dy, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        if (zoom - 1.0).abs() > 1e-4 {
+            actions.push(OverlayAction::ZoomBeats(zoom_delta_to_beats_factor(zoom)));
+        } else if dy.abs() > 0.01 {
+            actions.push(OverlayAction::ScrollBeats(scroll_delta_to_beats(
+                dy,
+                st.overlay_beats.max(4.0),
+                st.overlay_beats.max(4.0) / 32.0 * 2.0,
+            )));
+        }
+    }
+}
+
+/// 七条通道的配色（与判定线那五条一样：颜色只用来分辨列，不承载语义）
+const MASK_COLORS: [[u8; 3]; 7] = [
+    [240, 120, 120], // x1
+    [240, 175, 110], // y1
+    [150, 220, 150], // x2
+    [110, 205, 195], // y2
+    [140, 180, 255], // x3
+    [185, 160, 255], // y3
+    [255, 220, 120], // active
+];
 
 #[cfg(test)]
 mod tests {

@@ -801,3 +801,55 @@ fn a_bare_chart_has_no_snapshot_job() {
     assert!(core.snapshot_job().is_err());
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// **遮蔽区要活过一次真实的保存/打开**（四种形态里 opm 那两种；RPE 两种必须明确丢弃并报告）。
+///
+/// 这条守的是"新对象最容易漏掉的那一环"：文档模型有它、命令层能改它、但**落盘/回读**这条路上
+/// 少一处序列化点，区域就会在"保存之后打开"时静默消失 —— 而那时用户已经在继续编谱了。
+#[test]
+fn mask_zones_survive_a_real_save_and_reload() {
+    use opm_app::codec::Format;
+
+    let dir = tmpdir("mask-zones");
+    for (shape, folder, expect_zones) in [
+        (SaveFormat::OpmFolder, dir.join("proj.opm.d"), true),
+        (SaveFormat::OpmPacked, dir.join("proj.opm"), true),
+        // RPE 无法表达遮蔽区 ⇒ 丢，但**必须报**（这里只断言不 panic 且报告里点名）
+        (SaveFormat::RpeFolder, dir.join("proj.pez.d"), false),
+        (SaveFormat::RpePacked, dir.join("proj.pez"), false),
+    ] {
+        let mut maker = EditCore::new();
+        for cmd in [
+            json!({"op":"add_note","line":0,"kind":"tap","startBeat":[4,1],"laneX":80.0}),
+            json!({"op":"add_zone","startBeat":[0,1]}),
+            json!({"op":"add_zone_event","zone":0,"track":"active","startBeat":[4,1],
+                   "endBeat":[12,1],"startValue":true,"endValue":true}),
+        ] {
+            let r = maker.exec(&cmd);
+            assert_eq!(r["ok"], json!(true), "{shape:?}: {cmd} → {r}");
+        }
+        let (_, fid) = maker.save_as(&folder, shape).unwrap_or_else(|e| panic!("{shape:?}: {e}"));
+
+        let back = EditCore::load(&folder).unwrap_or_else(|e| panic!("{shape:?} 读不回来：{e}"));
+        assert_eq!(back.source_format(), if expect_zones { Format::Opm } else { Format::Rpe });
+        if expect_zones {
+            assert_eq!(back.doc().mask_zones.len(), 1, "{shape:?} 遮蔽区丢了");
+            assert_eq!(back.doc().mask_zones[0].active[0].start_value, json!(true));
+            assert_eq!(back.doc().mask_zones[0].x1[0].start_value, json!(0.0));
+            assert_eq!(
+                back.doc().min_client_capability,
+                opm_app::doc::CAP_MASK,
+                "{shape:?} 能力等级没跟着落盘"
+            );
+            assert!(fid.is_lossless(), "{shape:?} 本该无损：{}", fid.report());
+        } else {
+            assert!(back.doc().mask_zones.is_empty(), "{shape:?} 不该留下遮蔽区");
+            assert!(
+                fid.warnings.iter().any(|w| w.contains("遮蔽区")),
+                "{shape:?} 丢了遮蔽区却没报：{}",
+                fid.report()
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

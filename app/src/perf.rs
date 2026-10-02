@@ -1183,6 +1183,59 @@ pub fn perf_at(tracks: &[Vec<Event>; 5], tmap: &TimeMap, sec: f64) -> LinePerf {
     perf_of(&ev, tmap.beat(sec), tmap)
 }
 
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+/// 一块**遮蔽区**在某一拍的状态（求值结果，不是文档）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaskState {
+    /// 三角形此刻**是否存在于画面上**。
+    ///
+    /// 判据（用户口径）：三条顶点轨道里**至少有一条已经有"已开始"的事件**（`start ≤ beat`）。
+    /// 与判定线不同 —— 判定线永远有本体，没有任何事件也画得出来；遮蔽区没有事件就没有形状，
+    /// 所以在第一条坐标事件之前它**不存在**（"如果当前时间没有任何对应的坐标事件块，则不显示"）。
+    ///
+    /// 单调性：事件一旦开始就不会"没开始" ⇒ 这个布尔随时间只会从 false 变 true 一次。
+    pub visible: bool,
+    /// 三个顶点的屏幕坐标（RPE 单位，Y 向上；与判定线同一个坐标系）。
+    /// 某一维没有事件 ⇒ **0.0**（用户口径："总保底都是 (0,0)"）。
+    pub v: [[f64; 2]; 3],
+    /// `active` 通道按 `≥ 0.5` 二值化的结果；**没有 active 事件时是 `false`**
+    /// （= 纯色、不透明度更高那一档）。
+    pub active: bool,
+}
+
+/// 遮蔽区在拍 `beat` 处的状态。`tracks` 的顺序 = [`crate::doc::MASK_TRACKS`]
+/// （`x1,y1,x2,y2,x3,y3,active`）。
+///
+/// **求值只有这一份**：预览渲染、编辑区读数、检查器、命令层全部经它 ——
+/// 谁要自己算一遍，"同一时刻两个数"就会在某个缓动上冒出来（判定线那五条轨道踩过同一个坑）。
+///
+/// 三处口径写在这里，别处不许再解释一遍：
+/// · **空轨道 ⇒ `(0,0)`**（不是"整块平移"，也不是"用上一个顶点的值"）；
+/// · **块之前 ⇒ 首事件的起始值、块之后 ⇒ 末事件的终值**（都由 [`track_value`] 给，
+///   与判定线轨道同一条规则 —— "如果任意一个坐标事件块还在则延续最后值"）；
+/// · **`active` 与其它轨道同一套插值**，只在最后一步按 `≥ 0.5` 二值化（用户口径）。
+pub fn mask_state_at(tracks: &[&[Event]; 7], beat: f64, tmap: &TimeMap) -> MaskState {
+    let mut v = [[0.0f64; 2]; 3];
+    for i in 0..3 {
+        for (k, axis) in [0usize, 1].into_iter().enumerate() {
+            let list = tracks[i * 2 + axis];
+            if let Some(x) = track_value(list, beat, tmap) {
+                v[i][k] = x;
+            }
+        }
+    }
+    // "任意一个坐标事件块还在"：**任一维**已经有已开始的事件 ⇒ 这个顶点就位；
+    // 三个顶点一个都没就位 ⇒ 整块不显示。
+    let visible = (0..3).any(|i| {
+        [0usize, 1]
+            .into_iter()
+            .any(|axis| active_event(tracks[i * 2 + axis], beat).is_some())
+    });
+    let active = track_value(tracks[6], beat, tmap).map(|x| x >= 0.5).unwrap_or(false);
+    MaskState { visible, v, active }
+}
+
 /// 把一条轨道采样成折线（供时间轴画曲线）：**画的与求值的是同一条折线**。
 ///
 /// 每个事件交给 [`event_knots`] —— 于是时间轴上看到的形状**就是**演奏区会发生的形状
@@ -1769,5 +1822,114 @@ mod speed_tests {
         // 表也一样：问"0 秒之前"给 0，而不是某个负值
         let table = SpeedTable::build(&events, &tmap, 20.0);
         assert_eq!(table.h_at(&tmap, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use crate::doc::{Beat, BpmEntry, MASK_TRACKS};
+
+    fn tmap120() -> TimeMap {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        TimeMap::from_doc(&doc)
+    }
+
+    /// 七条轨道（顺序 = `doc::MASK_TRACKS`），只给用得上的几条赋值
+    fn tracks(sets: &[(&str, Vec<Event>)]) -> Vec<Vec<Event>> {
+        let mut out: Vec<Vec<Event>> = vec![Vec::new(); 7];
+        for (name, list) in sets {
+            let i = MASK_TRACKS.iter().position(|t| t == name).expect("轨道名");
+            out[i] = list.clone();
+        }
+        out
+    }
+
+    fn ev(a: f64, b: f64, v0: f64, v1: f64) -> Event {
+        Event::new(
+            Beat::new((a * 4.0) as i64, 4),
+            Beat::new((b * 4.0) as i64, 4),
+            serde_json::json!(v0),
+            serde_json::json!(v1),
+            "linear",
+        )
+    }
+
+    fn at(t: &[Vec<Event>], beat: f64) -> MaskState {
+        let tmap = tmap120();
+        let r: [&[Event]; 7] = [
+            &t[0], &t[1], &t[2], &t[3], &t[4], &t[5], &t[6],
+        ];
+        mask_state_at(&r, beat, &tmap)
+    }
+
+    /// **三条坐标轨道都没有事件 ⇒ 不显示**（与判定线不同：没有事件就没有形状）
+    #[test]
+    fn a_zone_without_any_coordinate_event_does_not_exist() {
+        let t = tracks(&[]);
+        let s = at(&t, 0.0);
+        assert!(!s.visible, "没有坐标事件 ⇒ 不显示");
+        assert_eq!(s.v, [[0.0, 0.0]; 3], "空轨道一律 (0,0)");
+        assert!(!s.active, "没有 active 事件 ⇒ false（纯色那一档）");
+    }
+
+    /// 只有**一条**坐标轨道的首事件已经开始时，整块就算"还在"：其余顶点拿 (0,0)
+    #[test]
+    fn one_started_channel_makes_the_whole_zone_exist() {
+        let t = tracks(&[("x1", vec![ev(4.0, 8.0, 100.0, 200.0)])]);
+        // 首事件之前：不显示（"如果当前时间没有任何对应的坐标事件块，则不显示"）
+        assert!(!at(&t, 0.0).visible);
+        // 事件开始之后：显示，且 x1 走它自己的缓动
+        let s = at(&t, 4.0);
+        assert!(s.visible);
+        assert_eq!(s.v[0][0], 100.0, "块首取起始值");
+        assert_eq!(s.v[0][1], 0.0, "y1 没有事件 ⇒ (0,0)");
+        // 块内线性插值（4→8 拍的中点 = 150）
+        assert_eq!(at(&t, 6.0).v[0][0], 150.0);
+        // 末事件之后：**延续最后值**
+        assert_eq!(at(&t, 20.0).v[0][0], 200.0);
+    }
+
+    /// 块**之前**那条口径：首事件之前取首事件的起始值（`track_value` 的规则），
+    /// 但因为"没有任何已开始的事件"，此时整块本来就不显示 —— 两者一起看才对
+    #[test]
+    fn before_the_first_event_the_zone_is_hidden_but_the_value_is_the_first_start() {
+        let t = tracks(&[
+            ("x1", vec![ev(4.0, 8.0, 100.0, 200.0)]),
+            ("active", vec![ev(0.0, 4.0, 1.0, 0.0)]),
+        ]);
+        let s = at(&t, 1.0);
+        assert!(!s.visible, "坐标还没开始 ⇒ 已经不存在");
+        assert!(s.active, "active 是独立通道：1.0 ≥ 0.5 ⇒ true");
+        assert_eq!(s.v[0][0], 100.0, "x1 取首事件起始值（求值器对'块之前'的口径）");
+    }
+
+    /// `active`：同一套插值，最后按 **≥ 0.5** 二值化（斜坡在中点翻面）
+    #[test]
+    fn active_is_interpolated_then_thresholded() {
+        let t = tracks(&[("x1", vec![ev(0.0, 32.0, 0.0, 0.0)]), ("active", vec![ev(0.0, 4.0, 0.0, 1.0)])]);
+        assert!(!at(&t, 0.0).active, "0.0 < 0.5");
+        assert!(!at(&t, 1.9).active, "0.475 < 0.5");
+        assert!(at(&t, 2.1).active, "0.525 ≥ 0.5");
+        assert!(at(&t, 4.0).active, "块末 = 1");
+        assert!(at(&t, 99.0).active, "末事件之后延续终值");
+    }
+
+    /// 每个顶点两维**各自独立**求值（x 与 y 的缓动/时刻互不影响）
+    #[test]
+    fn the_two_axes_of_a_vertex_are_independent() {
+        let t = tracks(&[
+            ("x1", vec![ev(0.0, 4.0, 0.0, 400.0)]),
+            ("y1", vec![ev(8.0, 12.0, 0.0, -200.0)]),
+        ]);
+        let s = at(&t, 8.0);
+        assert!(s.visible);
+        assert_eq!(s.v[0], [400.0, 0.0], "x 已经走到末值，y 刚到起点");
+        assert_eq!(s.v[1], [0.0, 0.0], "第二个顶点完全没事件");
     }
 }

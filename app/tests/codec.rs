@@ -612,3 +612,140 @@ fn bpm_start_time_is_a_triple_like_everything_else() {
     let root2: Value = serde_json::from_str(&text2).unwrap();
     assert_eq!(root2["BPMList"][1]["startTime"], json!(78.5));
 }
+
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+/// 带一块遮蔽区的 opm 文档（走**命令路径**造，与编辑器产出的一模一样）
+fn doc_with_zone() -> Document {
+    use opm_app::core::EditCore;
+    let mut c = EditCore::new();
+    for cmd in [
+        json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [4, 1], "laneX": 100.0}),
+        json!({"op": "add_zone", "startBeat": [0, 1]}),
+        json!({"op": "add_zone_event", "zone": 0, "track": "x1", "startBeat": [8, 1],
+               "endBeat": [16, 1], "startValue": 0.0, "endValue": -400.0, "easing": "inOutCubic"}),
+        json!({"op": "add_zone_event", "zone": 0, "track": "active", "startBeat": [4, 1],
+               "endBeat": [12, 1], "startValue": false, "endValue": true}),
+    ] {
+        let r = c.exec(&cmd);
+        assert_eq!(r["ok"], json!(true), "{cmd} → {r}");
+    }
+    c.doc().clone()
+}
+
+/// opm → opm：遮蔽区逐字段一致，且**读得回来**（含 `active` 的布尔值）
+#[test]
+fn mask_zones_roundtrip_through_opm() {
+    let doc = doc_with_zone();
+    let text = serde_json::to_string_pretty(&doc.to_json()).unwrap();
+    let back = Document::from_json(serde_json::from_str(&text).unwrap()).unwrap();
+    assert_eq!(doc.to_json(), back.to_json(), "opm 原生往返必须一模一样");
+    assert_eq!(back.mask_zones.len(), 1);
+    assert_eq!(back.mask_zones[0].active[0].start_value, json!(false));
+    assert_eq!(back.mask_zones[0].x1[1].easing, "inOutCubic");
+    assert_eq!(back.min_client_capability, opm_app::doc::CAP_MASK, "能力等级必须是 4");
+}
+
+/// **没有遮蔽区的谱面：文件里不该凭空多出 `maskZones`**（既有文件的字节不变）
+#[test]
+fn a_chart_without_zones_has_no_maskzones_field() {
+    let v = Document::default().to_json();
+    assert!(v.get("maskZones").is_none(), "{v}");
+    // 但带 `maskZones: []` 的文件也读得进来（空数组等价于没有）
+    let mut with_empty = v.clone();
+    with_empty["maskZones"] = json!([]);
+    let d = Document::from_json(with_empty).unwrap();
+    assert!(d.mask_zones.is_empty());
+    assert!(d.to_json().get("maskZones").is_none(), "读进来再写出去，空数组也不落盘");
+}
+
+/// **RPE 无法表达遮蔽区**：导出必须**明确报出丢弃**，而且导出的 JSON 里不得出现它
+#[test]
+fn exporting_to_rpe_drops_mask_zones_with_a_warning() {
+    let doc = doc_with_zone();
+    let (v, fid) = rpe::to_value(&doc, rpe::RpeTarget::default());
+    assert!(v.get("maskZones").is_none(), "RPE 里不该有遮蔽区字段");
+    assert!(!fid.is_lossless(), "丢了东西就不算无损");
+    let hit = fid
+        .warnings
+        .iter()
+        .find(|w| w.contains("遮蔽区"))
+        .unwrap_or_else(|| panic!("警告里必须点名遮蔽区：{:?}", fid.warnings));
+    assert!(hit.contains("已丢弃"), "{hit}");
+    assert!(hit.contains("1 个区"), "要报出丢了几个区：{hit}");
+    // 逐条报告也是保真度报告的一部分（不是只写进日志）
+    assert!(fid.report().contains("遮蔽区"), "{}", fid.report());
+}
+
+/// 遮蔽区会影响 `chart_end`（区域的表演常常比最后一个音符更长）—— 时间轴总长靠它
+#[test]
+fn mask_events_extend_the_chart_end() {
+    let mut doc = doc_with_zone();
+    let before = doc.chart_end();
+    let end = opm_app::doc::Beat::new(512, 1);
+    doc.mask_zones[0].y1 = vec![opm_app::doc::Event::new(
+        opm_app::doc::Beat::new(500, 1),
+        end,
+        json!(0.0),
+        json!(0.0),
+        "linear",
+    )];
+    assert!(doc.chart_end() >= end, "{} < {}", doc.chart_end().to_f64(), end.to_f64());
+    assert!(doc.chart_end() > before);
+}
+
+/// 校验器：遮蔽区通道**允许空隙、允许首事件晚于拍 0**（这正是"什么时候出现"的表达），
+/// 但**不许重叠、不许倒挂、不许乱序**
+#[test]
+fn mask_channel_invariants_differ_from_judge_line_tracks() {
+    let doc = doc_with_zone();
+    let issues = validate(&doc);
+    let mask: Vec<String> = issues
+        .iter()
+        .filter(|i| i.pointer.contains("maskZones"))
+        .map(|i| format!("{} {}", i.pointer, i.message))
+        .collect();
+    assert!(mask.is_empty(), "{mask:?}");
+
+    let mut broken = doc.clone();
+    // x1 是 [0,4]（默认三角那条常量段）+ [8,16]（后插的那块）⇒ 把后者起点提到 2，造一处重叠
+    assert_eq!(broken.mask_zones[0].x1.len(), 2);
+    broken.mask_zones[0].x1[1].start = opm_app::doc::Beat::new(2, 1);
+    let issues = validate(&broken);
+    assert!(
+        issues.iter().any(|i| i.pointer.contains("maskZones") && i.severity == Severity::Error),
+        "{}",
+        issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>().join("; ")
+    );
+
+    // 首事件晚于拍 0、中间有空隙：**合法**（与判定线轨道相反）
+    let mut sparse = doc.clone();
+    sparse.mask_zones[0].x1 = vec![opm_app::doc::Event::new(
+        opm_app::doc::Beat::new(64, 1),
+        opm_app::doc::Beat::new(72, 1),
+        json!(0.0),
+        json!(0.0),
+        "linear",
+    )];
+    let issues = validate(&sparse);
+    assert!(
+        !issues.iter().any(|i| i.pointer.contains("maskZones")),
+        "遮蔽区的稀疏轨道是合法的：{}",
+        issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>().join("; ")
+    );
+}
+
+/// 能力等级：有遮蔽区却声明 3 ⇒ **错误**（读取方必须明确拒绝，而不是默默不画那块区域）
+#[test]
+fn declaring_a_capability_below_the_mask_level_is_an_error() {
+    let mut doc = doc_with_zone();
+    doc.min_client_capability = 3;
+    let issues = validate(&doc);
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.pointer == "/minClientCapability" && i.severity == Severity::Error),
+        "{}",
+        issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>().join("; ")
+    );
+}

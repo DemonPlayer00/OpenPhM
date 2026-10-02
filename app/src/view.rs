@@ -14,7 +14,7 @@
 
 use crate::doc::{Document, NoteKind};
 use crate::perf;
-use crate::state::{self, EditorState, TrackId};
+use crate::state::{self, EditorState, MaskChannel, TrackId};
 
 /// 左侧「判定线」列表的一行（视图缓存：只在 structure/属性变时重建）
 #[derive(Clone, Debug, PartialEq)]
@@ -290,6 +290,95 @@ pub fn note_stack_rows(st: &EditorState) -> Vec<NoteStackRow> {
         .collect()
 }
 
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+/// 检查器里**一条通道**的一行
+#[derive(Clone, Debug)]
+pub struct MaskChannelRow {
+    pub channel: MaskChannel,
+    /// 这条通道上有几个事件块
+    pub events: usize,
+    /// 此刻的值（空通道给 `None` —— 那不是 0，是"这条通道还没被用过"）
+    pub value: Option<f64>,
+    pub min: f32,
+    pub max: f32,
+}
+
+/// 检查器里**选中的那个事件块**的可编辑字段。
+///
+/// 值原样是 `serde_json::Value`：`active` 通道的值是**布尔**（用户口径"二值化"），
+/// 坐标通道是数字 —— 由界面按通道决定用复选框还是数字框，这里不做类型转换。
+#[derive(Clone, Debug)]
+pub struct MaskEventEdit {
+    pub index: usize,
+    pub start_beat: f64,
+    pub end_beat: f64,
+    pub start_exact: crate::doc::Beat,
+    pub end_exact: crate::doc::Beat,
+    pub start_value: serde_json::Value,
+    pub end_value: serde_json::Value,
+    pub easing: String,
+}
+
+/// 遮蔽区检查器快照（**遮蔽区编辑模式下右栏的全部内容**）
+#[derive(Clone, Debug)]
+pub struct MaskInspect {
+    pub index: usize,
+    pub zones: usize,
+    pub name: String,
+    /// 此刻的区域状态（显示与否 / 三个顶点 / active）
+    pub state: perf::MaskState,
+    /// 当前通道（列表里高亮它）
+    pub channel: MaskChannel,
+    pub channels: Vec<MaskChannelRow>,
+    /// 当前通道里选中的事件块（没选中给 `None`）
+    pub event: Option<MaskEventEdit>,
+    /// 播放头那一拍（"在播放头放一块"的缺省起点）
+    pub playhead_beat: f64,
+}
+
+/// 遮蔽区检查器快照。没选中任何区（或一个区都没有）时给 `None`。
+pub fn mask_inspect(st: &EditorState) -> Option<MaskInspect> {
+    let zone = st.selected_zone()?;
+    let beat = st.chart.tmap.beat(st.playhead);
+    let channels = MaskChannel::ALL
+        .iter()
+        .map(|c| {
+            let t = zone.track(*c);
+            MaskChannelRow {
+                channel: *c,
+                events: t.events.len(),
+                value: perf::track_value(&t.events, beat, &st.chart.tmap),
+                min: t.min,
+                max: t.max,
+            }
+        })
+        .collect();
+    let event = st.mask_sel.and_then(|i| {
+        let t = zone.track(st.selected_channel);
+        t.events.get(i).map(|e| MaskEventEdit {
+            index: i,
+            start_beat: e.start.to_f64(),
+            end_beat: e.end.to_f64(),
+            start_exact: e.start,
+            end_exact: e.end,
+            start_value: e.start_value.clone(),
+            end_value: e.end_value.clone(),
+            easing: e.easing.clone(),
+        })
+    });
+    Some(MaskInspect {
+        index: zone.index,
+        zones: st.chart.zones.len(),
+        name: zone.name.clone(),
+        state: zone.state(&st.chart.tmap, st.playhead),
+        channel: st.selected_channel,
+        channels,
+        event,
+        playhead_beat: beat,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +479,42 @@ mod tests {
         assert!(insp.event.is_none());
         assert!(insp.event_edit.is_none());
         assert!(insp.track_value.is_none());
+    }
+
+    /// 遮蔽区检查器：七条通道都列出来、此刻的值来自**唯一那份求值**、选中的块带上原始值
+    #[test]
+    fn mask_inspector_lists_channels_and_the_selected_block() {
+        let mut c = EditCore::new();
+        c.exec(&serde_json::json!({"op": "add_zone", "set": {"x1": 300.0, "active": true}}));
+        c.exec(&serde_json::json!({"op": "add_zone_event", "track": "x1", "startBeat": [8, 1],
+                                   "endBeat": [12, 1], "startValue": 300.0, "endValue": -100.0}));
+        let mut st = EditorState::new(state::chart_from_doc(c.doc()));
+        st.mask_edit = true;
+        st.select_zone(0);
+        let mi = mask_inspect(&st).expect("有遮挡区");
+        assert_eq!(mi.zones, 1);
+        assert_eq!(mi.channels.len(), 7, "七条通道");
+        assert!(mi.event.is_none(), "没选中块 ⇒ 没有可编辑字段");
+        // 此刻（拍 0）：x1 的常量事件 ⇒ 300
+        let x1 = mi.channels.iter().find(|r| r.channel == MaskChannel::X1).unwrap();
+        assert_eq!(x1.value, Some(300.0));
+        assert_eq!(x1.events, 2);
+        // active 通道此刻是 true（值是布尔，求值器按 0/1 算）
+        assert!(mi.state.active);
+        assert!(mi.state.visible, "坐标系上有事件 ⇒ 显示");
+        // 选中 x1 的第二个块（doc 下标 1）
+        st.selected_channel = MaskChannel::X1;
+        st.mask_sel = Some(1);
+        let mi = mask_inspect(&st).expect("有遮挡区");
+        let ev = mi.event.expect("选中了块");
+        assert_eq!(ev.index, 1);
+        assert_eq!(ev.start_exact.to_f64(), 8.0);
+        assert_eq!(ev.start_value, serde_json::json!(300.0));
+        assert_eq!(ev.end_value, serde_json::json!(-100.0));
+        // 没有区 ⇒ 没有快照（右栏该空着）
+        let mut empty = EditorState::new(state::chart_from_doc(&crate::doc::Document::default()));
+        empty.mask_edit = true;
+        assert!(mask_inspect(&empty).is_none());
     }
 
     /// 选中轨道没有事件时，`event_edit` 必须为 `None`（否则属性编辑器会显示一条不存在的事件）

@@ -67,6 +67,8 @@ pub struct UiStats {
     pub builds_notes: u64,
     /// 判定线**事件轨道**缓存（按线）
     pub builds_tracks: u64,
+    /// **遮蔽区**通道缓存（按区）
+    pub builds_zones: u64,
     pub builds_inspector: u64,
     pub builds_meta: u64,
     pub skipped_structure: u64,
@@ -175,6 +177,15 @@ pub enum ViewCmd {
         event: Option<usize>,
         notes: Option<Vec<usize>>,
         events: Option<Vec<(String, usize)>>,
+        /// **遮蔽区**：`{"zone":0}` 选中它，`{"zone":0,"maskEdit":true}` 顺便进编辑模式；
+        /// `"channel":"x1"` 切当前列，`"zoneEvent":2` 选中该列第 3 个事件块。
+        ///
+        /// agent 要用它把界面指到遮蔽区上（截图复核 / 检查器读数）——
+        /// 与音符/事件同一条理由：选中是**视图**状态，不走命令通道。
+        zone: Option<usize>,
+        mask_edit: Option<bool>,
+        channel: Option<String>,
+        zone_event: Option<usize>,
     },
     LoadAudio(String),
     SetOffsetMs(f64),
@@ -234,6 +245,10 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
                     })
                     .collect()
             }),
+            zone: v.get("zone").and_then(|x| x.as_u64()).map(|x| x as usize),
+            mask_edit: v.get("maskEdit").and_then(|x| x.as_bool()),
+            channel: v.get("channel").and_then(|x| x.as_str()).map(|x| x.to_owned()),
+            zone_event: v.get("zoneEvent").and_then(|x| x.as_u64()).map(|x| x as usize),
         }),
         "nudge" => Some(ViewCmd::NudgeBeats(
             v.get("beats").and_then(|x| x.as_f64()).unwrap_or(0.0),

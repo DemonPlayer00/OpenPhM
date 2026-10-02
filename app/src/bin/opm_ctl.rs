@@ -27,6 +27,7 @@ const USAGE: &str = r#"opm-ctl —— opm 谱面编辑入口（无头 / 附着�
   opm-ctl --attach [SOCKET|auto] [--cmd JSON]... [--script FILE] [--stdin] [--json]
   opm-ctl [--json] --file FILE validate       # 注意：--json 要写在子命令**之前**（解析在遇到子命令时停止）
   opm-ctl [--json] --file FILE lines [--at SEC]
+  opm-ctl [--json] --file FILE masks [--at SEC]   # 遮蔽区此刻的三角形/active（数值口径）
   opm-ctl [--json] --file FILE overlaps       # 事件重叠（0 处 → 退出码 0；有 → 4）
   opm-ctl --file FILE summary | dump | journal
   opm-ctl --file FILE render [--at SEC] [--lookahead SEC] [--width W] [--height H] --out PNG
@@ -43,6 +44,9 @@ const USAGE: &str = r#"opm-ctl —— opm 谱面编辑入口（无头 / 附着�
   判定线: add_line / set_line / del_line
   事件（移动/透明度/流速同一套）: add_event / set_event / del_event / split_event
           track ∈ moveX|moveY|rotate|alpha|speed；easing 用名字（29 种）
+  遮蔽区: add_zone / del_zone / set_zone / add_zone_event / set_zone_event
+          del_zone_event / resize_zone_event / move_zone_event
+          track ∈ x1|y1|x2|y2|x3|y3|active（active 的值是 true/false）
   不变量: set_track_constant（一步铺满全谱） / normalize（排序/补空隙/裁重叠/延到谱末）
   事务:   begin / commit / abort；或 CLI 的 --atomic（整批一次撤销）
   粒度:   默认「一条命令 = 一步撤销」—— 批内 undo 因此可用
@@ -119,7 +123,8 @@ fn parse_cli(argv: &[String]) -> Result<Cli, String> {
             "--json" => c.json = true,
             "--quiet" | "-q" => c.quiet = true,
             "--atomic" => c.atomic = true,
-            "validate" | "summary" | "dump" | "journal" | "render" | "lines" | "overlaps" => {
+            "validate" | "summary" | "dump" | "journal" | "render" | "lines" | "masks"
+            | "overlaps" => {
                 c.sub = Some(a.to_owned());
                 c.sub_args = argv[i + 1..].to_vec();
                 break;
@@ -363,6 +368,26 @@ fn run() -> i32 {
                 }
             }
             let v = opm_app::headless::lines_report(core.doc(), at);
+            println!(
+                "{}",
+                if cli.json { v.to_string() } else { serde_json::to_string_pretty(&v).unwrap_or_default() }
+            );
+        }
+        Some("masks") => {
+            // 遮蔽区在某一时刻的**数值快照**（`--at SEC`）。上面 `lines` 的注释解释过为什么
+            // 要有这条路：遮蔽区画在 egui 层，无头出图看不见它 —— 判据得走数字。
+            let mut at = 0.0_f64;
+            let mut j = 0;
+            while j < cli.sub_args.len() {
+                match cli.sub_args[j].as_str() {
+                    "--at" if j + 1 < cli.sub_args.len() => {
+                        at = cli.sub_args[j + 1].parse().unwrap_or(0.0);
+                        j += 2;
+                    }
+                    _ => j += 1,
+                }
+            }
+            let v = opm_app::headless::masks_report(core.doc(), at);
             println!(
                 "{}",
                 if cli.json { v.to_string() } else { serde_json::to_string_pretty(&v).unwrap_or_default() }

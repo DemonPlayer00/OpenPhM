@@ -364,6 +364,69 @@ pub fn validate(doc: &Document) -> Vec<Issue> {
             }
         }
     }
+
+    // ---- 遮蔽区（躁域）----
+    //
+    // **与判定线轨道的关键差别**（规范 §4.6）：遮蔽区的通道**允许空隙**、**允许首事件晚于拍 0**
+    // —— "什么时候出现"就是靠"第一条坐标事件从哪一拍开始"表达的，所以那两条判定线规则
+    // （首事件从 0 起、轨道连续）**不适用**。剩下的不变量只有三条：按 start 升序、
+    // 不许重叠、`endBeat > startBeat`（升序是求值的前提：`perf::active_event` 走二分）。
+    for (zi, z) in doc.mask_zones.iter().enumerate() {
+        let zp = format!("/maskZones[{zi}]");
+        for track in crate::doc::MASK_TRACKS {
+            let Some(events) = z.track(track) else { continue };
+            if events.is_empty() {
+                continue;
+            }
+            let tp = format!("{zp}.{track}");
+            let mut prev: Option<(&Beat, &Beat)> = None;
+            for (ei, e) in events.iter().enumerate() {
+                let ep = format!("{tp}[{ei}]");
+                if e.end <= e.start {
+                    err!(
+                        &format!("{ep}.endBeat"),
+                        format!("endBeat({}) 必须大于 startBeat({})", e.end.to_f64(), e.start.to_f64())
+                    );
+                }
+                if !is_easing(&e.easing) {
+                    err!(&format!("{ep}.easing"), format!("未知缓动 {:?}", e.easing));
+                }
+                if let Some((ps, pe)) = prev {
+                    if e.start < *ps {
+                        err!(
+                            &ep,
+                            format!(
+                                "遮蔽区通道必须按 startBeat 升序（上一事件起于 {}，本事件起于 {}）",
+                                ps.to_f64(),
+                                e.start.to_f64()
+                            )
+                        );
+                    } else if e.start < *pe {
+                        err!(
+                            &ep,
+                            format!(
+                                "遮蔽区通道不允许重叠：上一事件止于 {}，本事件起于 {}",
+                                pe.to_f64(),
+                                e.start.to_f64()
+                            )
+                        );
+                    }
+                }
+                prev = Some((&e.start, &e.end));
+            }
+        }
+    }
+    if !doc.mask_zones.is_empty() && doc.min_client_capability < crate::doc::CAP_MASK {
+        err!(
+            "/minClientCapability",
+            format!(
+                "有 {} 块遮蔽区但 minClientCapability={}（应为 {}）—— 不认识遮蔽区的读取方必须拒绝载入，\n                 否则会渲染出一份「该挡的地方没挡」的谱面",
+                doc.mask_zones.len(),
+                doc.min_client_capability,
+                crate::doc::CAP_MASK
+            )
+        );
+    }
     out
 }
 

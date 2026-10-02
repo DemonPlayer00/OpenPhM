@@ -32,6 +32,8 @@ pub struct Dirty {
     pub notes: Vec<usize>,
     /// 某条线的事件轨道缓存（doc 下标）
     pub tracks: Vec<usize>,
+    /// 某块**遮蔽区**的七条通道缓存（doc 下标）
+    pub zones: Vec<usize>,
     /// 工具栏/状态栏的文档摘要文本
     pub meta: bool,
     /// 右侧属性检查器
@@ -47,6 +49,7 @@ impl Dirty {
             || !self.props.is_empty()
             || !self.notes.is_empty()
             || !self.tracks.is_empty()
+            || !self.zones.is_empty()
             || self.meta
             || self.inspector
             || self.render
@@ -62,6 +65,7 @@ impl Dirty {
             (&mut self.props, &o.props),
             (&mut self.notes, &o.notes),
             (&mut self.tracks, &o.tracks),
+            (&mut self.zones, &o.zones),
         ] {
             for v in src {
                 if !dst.contains(v) {
@@ -115,6 +119,22 @@ pub fn dirty_of_topics(topics: &[Topic]) -> Dirty {
                 // 少这一条，面板就会停在你改之前那份快照上（改完看不出来、
                 // 缓动下拉框"总显示上一次选的"，都是这一个原因）。
                 // 音符列表仍然不重建（事件话题改不到音符），那一半的代价还是零。
+                d.inspector = true;
+                d.render = true;
+            }
+            // 遮蔽区：**集合**变化 ⇒ 整表重建（下标会挪，视图模型里的区列表要重建）；
+            // 只改某一块的七条通道 ⇒ 只重建那一块的缓存。
+            // 两者都置 `inspector`（它显示选中区的名字/通道读数）与 `render`（画面里那块红三角）。
+            TopicKind::MaskZoneList => {
+                d.structure = true;
+                d.inspector = true;
+                d.render = true;
+            }
+            TopicKind::MaskZone => {
+                match t.zone {
+                    Some(z) => d.zones.push(z),
+                    None => d.structure = true,
+                }
                 d.inspector = true;
                 d.render = true;
             }

@@ -271,6 +271,30 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 `del_event`/`set_event` 的 `layer` 必须写对：视图侧靠 `doc::EventRef`（第几层 + 该层下标）回去。
 写脚本时建议显式带 `layer`。
 
+### 遮蔽区（游戏里的「躁域」）
+
+一块**三角形区域**（屏幕空间，X ∈ ±675 / Y ∈ ±450），游戏里点进这块区域**无法与音符交互**。
+**opm 独有**：官方谱面格式与 RPE 都没有它，导出 pez 会**丢弃并报告**（见 §7）。
+
+七条通道：`x1` `y1` `x2` `y2` `x3` `y3`（三个顶点）+ `active`（外观开关，值写 `true`/`false`）。
+
+| 命令 | 说明 |
+|---|---|
+| `{"op":"add_zone","startBeat":[0,1]}` | 新建一块：在拍 0 写 6 条常量事件 = **屏幕中央的正三角形**（`active` 不写事件）。`endBeat` 缺省 = `max(谱面末尾, startBeat+4拍)`；`empty:true` 建一个**没有任何事件、因此不显示**的区 |
+| `{"op":"del_zone","index":0}` | `zone` 与 `index` 都认 |
+| `{"op":"set_zone","zone":0,"set":{"name":"右侧躁域"}}` | 目前只有 `name` |
+| `{"op":"add_zone_event","zone":0,"track":"x1","startBeat":[8,1],"endBeat":[16,1],"startValue":0,"endValue":-400,"easing":"inOutCubic"}` | **缺省值 = 该通道此刻的值**（不传 `startValue` 时，放下一刻不跳变）；`endBeat` 缺省 = 起点 + 4 拍 |
+| `{"op":"set_zone_event","zone":0,"track":"active","index":0,"set":{"startValue":true,"endValue":true}}` | `active` 的值可以是布尔或数字 |
+| `{"op":"del_zone_event","zone":0,"track":"y3","index":1}` | |
+| `{"op":"resize_zone_event","zone":0,"track":"x1","index":0,"edge":"end","toBeat":[6,1]}` | 只动这一个端点（与 `resize_event` 同一语义） |
+| `{"op":"move_zone_event","zone":0,"track":"x1","index":1,"delta":[4,1]}` | 整块平移；与邻块重叠会被拒（返回 `ok:false`，文档不动） |
+| `opm-ctl --file F masks [--at SEC] [--json]` | **遮蔽区的数值快照**：此刻显不显示、`active`、三个顶点的坐标、七条通道各有几条事件。核对"区域此刻长什么样"用这个（**无头出图的 PNG 里看不到遮蔽区** —— 它画在 egui 层，见 §7） |
+
+⚠️ **遮蔽区通道的空隙是合法的**（与判定线轨道相反）：空档里保持前一条事件的终值，
+**首事件也可以晚于拍 0** —— "这块区域什么时候出现"就是靠它表达的。
+`add_zone_event` 插入时会把被它压住的前一块**裁到它的起点**（切点上的值保持不变），
+所以"给一条铺满全谱的常量事件里插关键帧"不会留下重叠。
+
 ### 元信息与只读
 
 | 命令 | 说明 |
@@ -366,6 +390,11 @@ opm-ctl --file chart.opm.json render --at 4.0 --no-boundary --out plain.png     
 ---
 
 ## 7. 限制与未实现（明确列出，避免 agent 误用）
+
+- **遮蔽区画在 egui 层，不进 wgpu 实例管线** ⇒ `render` 出的 PNG 里**没有**遮蔽区。
+  要核对它用 `masks`（数值）或让 GUI 自截屏（`opm-app --shot`）。
+- **导出 RPE/pez 会丢掉遮蔽区**（那边没有这个字段），保真度报告里会逐个数报出来。
+- 遮蔽区编辑模式下的事件块当前只有**单选**（框选/Ctrl+多选还没做）。
 
 1. **CLI 每次调用是独立会话**：`undo` 只在本次调用的命令序列内有效，跨调用无效。需要"试错"时建议：在同一次调用里用 `--script` 提交，或先备份文件。
 2. **撤销栈有字节上限（64 MiB）**：超限时从最旧开始丢弃（内存有界优先于撤销深度）。实测 2 万音符文档上 2000 条改动耗时 0.19–0.31 s，日志字节量只与改动规模成正比（不再随文档大小放大）。

@@ -10,6 +10,7 @@
 //! · [`broadcast`] 更新广播与细粒度话题（改完就广播；无关控件不参与更新）
 //! · [`perf`]    表演求值：拍↔秒时间映射、29 个缓动、事件轨道求值
 //! · [`journal`] 更改日志（记录更改模式的撤销/重做）
+//! · [`mask`]    遮蔽区（躁域）的呈现几何：三角形、细网格裁剪、靠近发光（纯函数，可单测）
 //! · [`control`] 控制通道：让 CLI 接进正在运行的 GUI 进程
 //! · [`cli`]    命令行参数与工作区预设（纯解析，可单测）
 //! · [`cmd`]    命令解析与校验（无状态）
@@ -48,6 +49,7 @@ pub mod dirty;
 pub mod edit;
 pub mod doc;
 pub mod journal;
+pub mod mask;
 pub mod keymap;
 pub mod filedialog;
 pub mod fonts;

@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use crate::codec::{self, Fidelity, Format};
 use crate::broadcast::{topics_of, Broadcast, Origin, Subscribers, Subscription, Topic, TopicFilter, TopicKind};
 use crate::cmd::{is_easing, parse_beat};
-use crate::doc::{Beat, Document, Event, JudgeLine, Note, NoteKind, TRACKS};
-use crate::journal::{read_track, Change, Journal, LineProps};
+use crate::doc::{Beat, Document, Event, JudgeLine, MaskZone, Note, NoteKind, CAP_MASK, MASK_TRACKS, TRACKS};
+use crate::journal::{read_track, read_zone_track, Change, Journal, LineProps, ZoneProps};
 
 /// 最近广播的保留条数（调试面板 / `{"op":"broadcasts"}` 用）
 const BROADCAST_RING: usize = 512;
@@ -735,6 +735,11 @@ impl EditCore {
                 Change::InsertLine { .. } | Change::RemoveLine { .. } | Change::SetBpm { .. }
             )
         });
+        // **只动了遮蔽区 ⇒ 判定线的重叠结果一个字都不用改**（遮蔽区不属于任何线）。
+        // 少了这一条，拖一下顶点就会全量重查一遍所有线的事件重叠 —— 那是 O(全谱面)。
+        if !changes.is_empty() && changes.iter().all(Change::is_mask_only) {
+            return;
+        }
         let mut lines: Vec<usize> = Vec::new();
         if !structural {
             for c in changes {
@@ -810,7 +815,7 @@ impl EditCore {
     /// 全量话题（数据被整体替换/回退时使用）
     fn all_topics() -> Vec<Topic> {
         use TopicKind::*;
-        [Meta, Bpm, LineList, LineProps, Notes, Note, Track]
+        [Meta, Bpm, LineList, LineProps, Notes, Note, Track, MaskZoneList, MaskZone]
             .iter()
             .map(|k| Topic::new(*k, None))
             .collect()
@@ -1814,6 +1819,313 @@ impl EditCore {
                 });
                 Ok(json!({"line": index}))
             }
+            // ================================================================ 遮蔽区（躁域）
+            //
+            // 七条通道：`x1..y3`（三角形顶点，RPE 屏幕坐标）+ `active`（外观开关）。
+            // 与判定线事件的三点关键差别（**规范 §4.6**，别按判定线的直觉改这里）：
+            // · 通道**允许空隙**、**允许首事件晚于拍 0** —— "什么时候出现"就是靠这个表达的；
+            // · 没有图层：一个通道就是一份事件表，下标即文档下标；
+            // · 事件块的值可以是非数值（`active` 写 `true`/`false`），求值器按 0/1 处理。
+            "add_zone" => {
+                let start = c.get("startBeat").map(parse_beat).transpose()?.unwrap_or_else(Beat::zero);
+                // 终点：谱面已有的末端与"起点后 4 拍"取大者 —— **不学 `set_track_constant` 的
+                // `chart_end + 1024`**：那会把 `chart_end` 自己顶高 1024 拍（时间轴跟着变长）。
+                let four = add_beat(start, Beat::new(4, 1)).ok_or("拍数溢出")?;
+                let end = c
+                    .get("endBeat")
+                    .map(parse_beat)
+                    .transpose()?
+                    .unwrap_or_else(|| self.doc.chart_end().max(four));
+                if end <= start {
+                    return Err(format!(
+                        "endBeat({}) 必须大于 startBeat({})",
+                        end.to_f64(),
+                        start.to_f64()
+                    ));
+                }
+                let mut zone = if c.get("empty").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    MaskZone::default()
+                } else {
+                    // 用户口径：新建即在中央摆一个**正三角形**（六条常量事件，各一条）
+                    MaskZone::with_default_triangle(start, end)
+                };
+                if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
+                    zone.name = name.to_owned();
+                }
+                if let Some(set) = c.get("set").and_then(|v| v.as_object()) {
+                    for (k, v) in set {
+                        let list = zone
+                            .track_mut(k)
+                            .ok_or_else(|| format!("未知遮蔽区通道 {k}（可选 {MASK_TRACKS:?}）"))?;
+                        if !v.is_number() && !v.is_boolean() {
+                            return Err(format!("遮蔽区通道 {k} 的值需为数字或布尔"));
+                        }
+                        list.clear();
+                        *list = vec![Event::new(start, end, v.clone(), v.clone(), "linear")];
+                    }
+                }
+                let index = self.doc.mask_zones.len();
+                self.doc.mask_zones.push(zone.clone());
+                // 能力等级：出现遮蔽区 ⇒ 至少 4（`spec/opm-format.md` §7）
+                self.doc.min_client_capability = self.doc.min_client_capability.max(CAP_MASK);
+                self.journal.record(Change::InsertZone {
+                    index,
+                    zone: Box::new(zone),
+                });
+                Ok(json!({
+                    "index": index,
+                    "zones": self.doc.mask_zones.len(),
+                    "startBeat": start,
+                    "endBeat": end,
+                    "capability": self.doc.min_client_capability,
+                }))
+            }
+            "del_zone" => {
+                let index = zone_index_arg(c)?;
+                if index >= self.doc.mask_zones.len() {
+                    return Err(format!("遮蔽区下标 {index} 越界"));
+                }
+                let removed = self.doc.mask_zones.remove(index);
+                self.journal.record(Change::RemoveZone {
+                    index,
+                    zone: Box::new(removed),
+                });
+                // 能力等级按**内容**重算（最后一块遮蔽区没了就掉回来）—— 判据只有
+                // `doc::capability_of` 一份，别在这里手写第二份
+                self.doc.min_client_capability = crate::doc::capability_of(&self.doc)
+                    .max(if self.doc.mask_zones.is_empty() { 1 } else { CAP_MASK });
+                Ok(json!({"zones": self.doc.mask_zones.len()}))
+            }
+            "set_zone" => {
+                let index = zone_arg(c)?;
+                let before = ZoneProps::of(self.zone(index)?);
+                let mut after = before.clone();
+                if let Some(set) = c.get("set").and_then(|v| v.as_object()) {
+                    for (k, v) in set {
+                        match k.as_str() {
+                            "name" => after.name = v.as_str().unwrap_or("遮蔽区").to_owned(),
+                            other => return Err(format!("set_zone 不支持的字段 {other}")),
+                        }
+                    }
+                }
+                after.apply_to(self.zone_mut(index)?);
+                self.journal.record(Change::SetZone {
+                    index,
+                    before: Box::new(before),
+                    after: Box::new(after),
+                });
+                Ok(json!({"zone": index}))
+            }
+            "add_zone_event" => {
+                let zone_idx = zone_arg(c)?;
+                let track = zone_track_arg(c)?;
+                let start = beat_arg(c, "startBeat")?;
+                let end = match c.get("endBeat") {
+                    Some(v) => parse_beat(v)?,
+                    None => add_beat(start, Beat::new(4, 1)).ok_or("拍数溢出")?,
+                };
+                if end <= start {
+                    return Err("endBeat 必须大于 startBeat".into());
+                }
+                let easing = c
+                    .get("easing")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("linear")
+                    .to_owned();
+                if !is_easing(&easing) {
+                    return Err(format!("未知缓动 {easing:?}"));
+                }
+                // 缺省值 = **该通道此刻的值**（不让区域/外观在放下的那一刻跳变）。
+                // 这一条放在核心而不是 GUI：CLI/agent 与界面必须拿到同一个缺省值。
+                let neutral = || self.zone_neutral_value(zone_idx, &track, start);
+                let from = c.get("startValue").cloned().unwrap_or_else(neutral);
+                let to = c.get("endValue").cloned().unwrap_or_else(|| from.clone());
+                let ev = Event::new(start, end, from, to, &easing);
+                let before = self.zone_track(zone_idx, &track)?;
+                let mut after = before.clone();
+                // **先裁后插**：把被这一块压在下面的那些裁到它的起点（保持切点上的值）。
+                // 用户最常见的动作是"给一条铺满全谱的常量事件里插一个关键帧" ——
+                // 不裁的话文件里就留下一处重叠，而遮蔽区通道的不变量是"无重叠"
+                //（`validate` 会报错：自己的产物过不了自己的校验器）。
+                {
+                    let tmap = crate::perf::TimeMap::from_parts(&self.doc.bpm_list, self.doc.chart_end());
+                    let n = codec::trim_before_insert(&mut after, start, &tmap);
+                    if n > 0 {
+                        after.retain(|e| e.end > e.start); // 裁成零长度的丢掉（opm 不允许）
+                    }
+                }
+                after.push(ev.clone());
+                after.sort_by(|a, b| a.start.cmp(&b.start));
+                let index = after
+                    .iter()
+                    .position(|e| e.start == ev.start && e.end == ev.end)
+                    .unwrap_or(after.len().saturating_sub(1));
+                *self.zone_track_mut(zone_idx, &track)? = after.clone();
+                self.journal.record(Change::ZoneTrack {
+                    zone: zone_idx,
+                    track: track.clone(),
+                    before,
+                    after,
+                });
+                Ok(json!({"zone": zone_idx, "track": track, "index": index}))
+            }
+            "set_zone_event" => {
+                let zone_idx = zone_arg(c)?;
+                let track = zone_track_arg(c)?;
+                let index = usize_arg(c, "index")?;
+                let before = self.zone_track(zone_idx, &track)?;
+                let mut after = before.clone();
+                let cur = after
+                    .get(index)
+                    .ok_or_else(|| format!("事件索引 {index} 越界（共 {}）", after.len()))?;
+                let mut ev = cur.clone();
+                if let Some(o) = c.get("set").and_then(|v| v.as_object()) {
+                    for (k, v) in o {
+                        match k.as_str() {
+                            "startBeat" => ev.start = parse_beat(v)?,
+                            "endBeat" => ev.end = parse_beat(v)?,
+                            "startValue" => ev.start_value = v.clone(),
+                            "endValue" => ev.end_value = v.clone(),
+                            "easing" => {
+                                let s = v.as_str().unwrap_or("linear");
+                                if !is_easing(s) {
+                                    return Err(format!("未知缓动 {s:?}"));
+                                }
+                                ev.easing = s.to_owned();
+                            }
+                            other => return Err(format!("set_zone_event 不支持的字段 {other}")),
+                        }
+                    }
+                }
+                if ev.end <= ev.start {
+                    return Err("endBeat 必须大于 startBeat".into());
+                }
+                if ev.start < Beat::zero() {
+                    return Err("拍不能为负".into());
+                }
+                after[index] = ev;
+                ensure_sorted(&after, &format!("遮蔽区 {zone_idx} 的 {track}"))?;
+                *self.zone_track_mut(zone_idx, &track)? = after.clone();
+                self.journal.record(Change::ZoneTrack {
+                    zone: zone_idx,
+                    track,
+                    before,
+                    after,
+                });
+                Ok(json!({"zone": zone_idx, "index": index}))
+            }
+            "del_zone_event" => {
+                let zone_idx = zone_arg(c)?;
+                let track = zone_track_arg(c)?;
+                let index = usize_arg(c, "index")?;
+                let before = self.zone_track(zone_idx, &track)?;
+                if index >= before.len() {
+                    return Err(format!("事件索引 {index} 越界（共 {}）", before.len()));
+                }
+                let mut after = before.clone();
+                let removed = after.remove(index);
+                let left = after.len();
+                *self.zone_track_mut(zone_idx, &track)? = after.clone();
+                self.journal.record(Change::ZoneTrack {
+                    zone: zone_idx,
+                    track,
+                    before,
+                    after,
+                });
+                Ok(json!({
+                    "zone": zone_idx,
+                    "events": left,
+                    "removed": {"startBeat": removed.start, "endBeat": removed.end},
+                }))
+            }
+            "resize_zone_event" => {
+                let zone_idx = zone_arg(c)?;
+                let track = zone_track_arg(c)?;
+                let index = usize_arg(c, "index")?;
+                let edge = c
+                    .get("edge")
+                    .and_then(|v| v.as_str())
+                    .ok_or("resize_zone_event 需要 edge（start|end）")?
+                    .to_owned();
+                let to = beat_arg(c, "toBeat")?;
+                if to < Beat::zero() {
+                    return Err("拍不能为负".into());
+                }
+                let before = self.zone_track(zone_idx, &track)?;
+                let mut after = before.clone();
+                let cur = after
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("事件索引 {index} 越界（共 {}）", after.len()))?;
+                match edge.as_str() {
+                    "start" => {
+                        if to >= cur.end {
+                            return Err(format!("start({}) 必须早于该事件的 end({})", to.to_f64(), cur.end.to_f64()));
+                        }
+                        after[index].start = to;
+                    }
+                    "end" => {
+                        if to <= cur.start {
+                            return Err(format!("end({}) 必须晚于该事件的 start({})", to.to_f64(), cur.start.to_f64()));
+                        }
+                        after[index].end = to;
+                    }
+                    other => return Err(format!("edge 只能是 start|end，收到 {other:?}")),
+                }
+                // 与判定线同一条纪律：**只动这一个事件的这一个端点**（空隙/重叠留给检测），
+                // 但顺序不能乱 —— `perf::active_event` 的二分依赖"按 start 升序"。
+                ensure_sorted(&after, &format!("遮蔽区 {zone_idx} 的 {track}"))?;
+                *self.zone_track_mut(zone_idx, &track)? = after.clone();
+                self.journal.record(Change::ZoneTrack {
+                    zone: zone_idx,
+                    track,
+                    before,
+                    after: after.clone(),
+                });
+                Ok(json!({"zone": zone_idx, "index": index, "edge": edge}))
+            }
+            "move_zone_event" => {
+                let zone_idx = zone_arg(c)?;
+                let track = zone_track_arg(c)?;
+                let index = usize_arg(c, "index")?;
+                let delta = beat_arg(c, "delta")?;
+                let before = self.zone_track(zone_idx, &track)?;
+                let mut after = before.clone();
+                let cur = after
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("事件索引 {index} 越界（共 {}）", after.len()))?;
+                let start = add_beat(cur.start, delta).ok_or("拍数溢出")?;
+                let end = add_beat(cur.end, delta).ok_or("拍数溢出")?;
+                if start < Beat::zero() {
+                    return Err("事件起点不能为负".into());
+                }
+                // **不许越过邻块**（用户口径同判定线：有空档才跨得过去）——
+                // 顺带保证"按 start 升序"这条不变量不被破坏
+                for (i, other) in after.iter().enumerate() {
+                    if i == index {
+                        continue;
+                    }
+                    if start < other.end && other.start < end {
+                        return Err(format!(
+                            "移动后与第 {i} 个事件重叠（{}..{}）—— 通道内不允许重叠",
+                            other.start.to_f64(),
+                            other.end.to_f64()
+                        ));
+                    }
+                }
+                after[index].start = start;
+                after[index].end = end;
+                ensure_sorted(&after, &format!("遮蔽区 {zone_idx} 的 {track}"))?;
+                *self.zone_track_mut(zone_idx, &track)? = after.clone();
+                self.journal.record(Change::ZoneTrack {
+                    zone: zone_idx,
+                    track,
+                    before,
+                    after,
+                });
+                Ok(json!({"zone": zone_idx, "index": index, "startBeat": start, "endBeat": end}))
+            }
             "add_event" => {
                 let (line_idx, layer_idx, track) = layer_arg(c)?;
                 let start = beat_arg(c, "startBeat")?;
@@ -2324,6 +2636,60 @@ impl EditCore {
         lay.track_mut(track)
             .ok_or_else(|| format!("未知轨道 {track}（可选 {TRACKS:?}）"))
     }
+
+    // ---------------------------------------------------------------- 遮蔽区取用
+
+    fn zone(&self, i: usize) -> Result<&MaskZone, String> {
+        self.doc
+            .mask_zones
+            .get(i)
+            .ok_or_else(|| format!("遮蔽区下标 {i} 越界（共 {}）", self.doc.mask_zones.len()))
+    }
+    fn zone_mut(&mut self, i: usize) -> Result<&mut MaskZone, String> {
+        let n = self.doc.mask_zones.len();
+        self.doc
+            .mask_zones
+            .get_mut(i)
+            .ok_or_else(|| format!("遮蔽区下标 {i} 越界（共 {n}）"))
+    }
+    fn zone_track(&self, zone: usize, track: &str) -> Result<Vec<Event>, String> {
+        read_zone_track(&self.doc, zone, track)
+            .ok_or_else(|| format!("无法读取遮蔽区轨道 zone={zone} track={track}"))
+    }
+    fn zone_track_mut(&mut self, zone: usize, track: &str) -> Result<&mut Vec<Event>, String> {
+        self.zone_mut(zone)?
+            .track_mut(track)
+            .ok_or_else(|| format!("未知遮蔽区通道 {track}（可选 {MASK_TRACKS:?}）"))
+    }
+
+    /// 某条通道在拍 `beat` 处的当前值（新建事件块时的缺省值）。
+    ///
+    /// 走的是**唯一那份求值**（[`crate::perf::mask_state_at`]）—— 缺省值要是自己算的，
+    /// "放下一刻不跳变"这句话就不成立了。`active` 给布尔（写进文件的是 `true`/`false`）。
+    fn zone_neutral_value(&self, zone: usize, track: &str, beat: Beat) -> Value {
+        let Some(z) = self.doc.mask_zones.get(zone) else {
+            return json!(0.0);
+        };
+        let lists: Vec<Vec<Event>> = MASK_TRACKS
+            .iter()
+            .map(|t| z.track(t).cloned().unwrap_or_default())
+            .collect();
+        let r: [&[Event]; 7] = std::array::from_fn(|i| lists[i].as_slice());
+        let tmap = crate::perf::TimeMap::from_parts(&self.doc.bpm_list, self.doc.chart_end());
+        let st = crate::perf::mask_state_at(&r, beat.to_f64(), &tmap);
+        if track == "active" {
+            return json!(st.active);
+        }
+        match track {
+            "x1" => json!(st.v[0][0]),
+            "y1" => json!(st.v[0][1]),
+            "x2" => json!(st.v[1][0]),
+            "y2" => json!(st.v[1][1]),
+            "x3" => json!(st.v[2][0]),
+            "y3" => json!(st.v[2][1]),
+            _ => json!(0.0),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 容器保存时的资源名规范化
@@ -2400,6 +2766,49 @@ fn usize_arg(c: &Value, name: &str) -> Result<usize, String> {
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .ok_or_else(|| format!("缺少或非法的 {name}（需非负整数）"))
+}
+
+/// 遮蔽区下标（缺省 0 号 —— 与 `line` 缺省 0 号同一个口径）
+fn zone_arg(c: &Value) -> Result<usize, String> {
+    Ok(c.get("zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize)
+}
+
+/// `del_zone` 的区下标：`zone` 与 `index` 都收。
+///
+/// 为什么允许两个名字：删一块区时"删第几个"在别的命令里叫 `index`（`del_note`/`del_event`），
+/// 而"哪一块区"在本组命令里叫 `zone`。让 agent 猜哪个是哪个，只会换来一次报错和一次重试。
+/// **只有这一条命令**这么做 —— 别的命令里的 `index` 是"通道内第几个事件"，混用会取错区。
+fn zone_index_arg(c: &Value) -> Result<usize, String> {
+    if c.get("zone").is_some() {
+        zone_arg(c)
+    } else {
+        usize_arg(c, "index")
+    }
+}
+
+/// 遮蔽区通道名（**按 `doc::MASK_TRACKS` 校验**：可选值只有一处出处，报错里也列它）
+fn zone_track_arg(c: &Value) -> Result<String, String> {
+    let track = c
+        .get("track")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("缺少 track（可选 {MASK_TRACKS:?}）"))?
+        .to_owned();
+    if !MASK_TRACKS.contains(&track.as_str()) {
+        return Err(format!("未知遮蔽区通道 {track}（可选 {MASK_TRACKS:?}）"));
+    }
+    Ok(track)
+}
+
+/// 事件必须按 `startBeat` 升序 —— `perf::active_event` 的二分依赖它。
+///
+/// 判定线那边靠"插入时排序"维持；遮蔽区的拖动/改端点会破坏它，所以在这里显式挡一道
+/// （宁可报错，也别让求值器在一个乱序的通道上做二分 —— 那会取到随机哪一条）。
+fn ensure_sorted(list: &[Event], ptr: &str) -> Result<(), String> {
+    if list.windows(2).all(|w| w[0].start <= w[1].start) {
+        Ok(())
+    } else {
+        Err(format!("{ptr}：事件必须按 startBeat 升序（这条通道的求值依赖它）"))
+    }
 }
 
 fn num(c: &Value, name: &str) -> Option<f64> {
@@ -3008,5 +3417,196 @@ mod tests {
         assert!(r["error"].as_str().unwrap().contains("x"), "{r}");
         let r = c.exec(&serde_json::json!({"op": "set_target", "line": 0, "target": {"x": 1.0}}));
         assert_eq!(r["ok"], serde_json::json!(false), "缺 atBeat 应当报错");
+    }
+}
+
+#[cfg(test)]
+mod mask_zone_tests {
+    use super::*;
+    use crate::doc::MASK_DEFAULT_TRIANGLE;
+
+    fn exec_ok(c: &mut EditCore, cmd: Value) -> Value {
+        let r = c.exec(&cmd);
+        assert_eq!(r["ok"], json!(true), "命令失败：{cmd} → {r}");
+        r
+    }
+    fn exec_err(c: &mut EditCore, cmd: Value) -> String {
+        let r = c.exec(&cmd);
+        assert_eq!(r["ok"], json!(false), "命令本该失败：{cmd} → {r}");
+        r["error"].as_str().unwrap_or_default().to_owned()
+    }
+
+    /// 新建遮蔽区：**中央正三角形**（六条常量事件）+ 能力等级抬到 4
+    #[test]
+    fn adding_a_zone_writes_the_center_triangle_and_raises_the_capability() {
+        let mut c = EditCore::new();
+        assert_eq!(c.doc().min_client_capability, 1);
+        let r = exec_ok(&mut c, json!({"op": "add_zone", "startBeat": [0, 1]}));
+        assert_eq!(r["result"]["index"], json!(0));
+        assert_eq!(c.doc().mask_zones.len(), 1);
+        assert_eq!(c.doc().min_client_capability, CAP_MASK, "有遮蔽区就得声明能力 4");
+        let z = &c.doc().mask_zones[0];
+        for t in MASK_TRACKS {
+            let n = z.track(t).map(|l| l.len()).unwrap_or(0);
+            if t == "active" {
+                assert_eq!(n, 0, "active 不写事件（没有它时是 false）");
+            } else {
+                assert_eq!(n, 1, "{t} 应有一条常量事件");
+            }
+        }
+        // 值 = 中央正三角形，且起点 → 终点是常量（不是斜坡）
+        let x1 = &z.x1[0];
+        assert_eq!(x1.start_value, json!(MASK_DEFAULT_TRIANGLE[0][0]));
+        assert_eq!(x1.start_value, x1.end_value, "常量事件（新建时不该有斜坡）");
+        // 终点：谱面还没有内容 ⇒ 起点 + 4 拍
+        assert_eq!(z.x1[0].end.to_f64(), 4.0);
+    }
+
+    /// `empty: true` 建一个**没有任何事件**的区：预览里它不存在（三条坐标轨道都没事件）
+    #[test]
+    fn an_empty_zone_has_no_events_and_is_not_visible() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        let z = &c.doc().mask_zones[0];
+        assert_eq!(z.event_count(), 0);
+        let chart = crate::state::chart_from_doc(c.doc());
+        let st = chart.zones[0].state(&chart.tmap, 0.0);
+        assert!(!st.visible, "没有任何坐标事件 ⇒ 不显示");
+    }
+
+    /// **先裁后插**：给一条铺满全谱的常量事件里插关键帧之后，文件里不留重叠
+    /// （遮蔽区通道的不变量是"无重叠"；编辑器自己的产物必须过得了自己的校验器）
+    #[test]
+    fn inserting_an_event_trims_the_one_it_covers() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        // 一条**铺得很长**的常量事件（真实用法：新建的区往往是"整首歌都待在原地"）
+        exec_ok(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "x1", "startBeat": [0, 1], "endBeat": [64, 1],
+                   "startValue": 300.0, "endValue": 300.0}),
+        );
+        assert_eq!(c.doc().mask_zones[0].x1.len(), 1);
+        // 在拍 8 插一块（值给 0 —— 默认会给"此刻的值"，这里显式给）
+        exec_ok(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "x1", "startBeat": [8, 1], "endBeat": [16, 1],
+                   "startValue": 0.0, "endValue": -200.0}),
+        );
+        let x1 = c.doc().mask_zones[0].x1.clone();
+        assert_eq!(x1.len(), 2, "两条：被裁短的常量段 + 新块");
+        assert_eq!(x1[0].end.to_f64(), 8.0, "前一条被裁到新块起点");
+        assert_eq!(x1[0].end_value, json!(300.0), "常量段的值不变");
+        // 校验器必须放行（这正是加这道裁剪的理由）
+        let issues = crate::cmd::validate(c.doc());
+        let mask_errors: Vec<String> = issues
+            .iter()
+            .filter(|i| i.pointer.starts_with("/maskZones"))
+            .map(|i| format!("{} {}", i.pointer, i.message))
+            .collect();
+        assert!(mask_errors.is_empty(), "{mask_errors:?}");
+    }
+
+    /// 通道名按 `MASK_TRACKS` 校验（写错要报错，不能静默变成 no-op）
+    #[test]
+    fn unknown_channels_and_fields_are_rejected() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        let e = exec_err(&mut c, json!({"op": "add_zone_event", "track": "z1", "startBeat": [0, 1]}));
+        assert!(e.contains("未知遮蔽区通道"), "{e}");
+        let e = exec_err(&mut c, json!({"op": "set_zone", "set": {"zOrder": 3}}));
+        assert!(e.contains("不支持的字段"), "{e}");
+        let e = exec_err(&mut c, json!({"op": "del_zone", "index": 7}));
+        assert!(e.contains("越界"), "{e}");
+    }
+
+    /// 新建事件块的缺省值 = **该通道此刻的值**（放下那一刻不跳变）
+    #[test]
+    fn a_new_event_defaults_to_the_channels_current_value() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "set": {"x1": 300.0}}));
+        // 在拍 8 再放一条 x1：起值应当是那一刻的值（常量 300）
+        let r = exec_ok(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "x1", "startBeat": [8, 1], "endBeat": [12, 1]}),
+        );
+        assert_eq!(r["result"]["index"], json!(1));
+        let x1 = c.doc().mask_zones[0].x1.clone();
+        assert_eq!(x1[1].start_value, json!(300.0), "缺省值 = 当前值");
+        assert_eq!(x1[1].end_value, json!(300.0));
+        // active 通道的缺省值是**布尔**（此刻没有 active 事件 ⇒ false）
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1]}));
+        let a = c.doc().mask_zones[0].active.clone();
+        assert_eq!(a[0].start_value, json!(false));
+    }
+
+    /// `resize` / `move` 只动那一个事件块，且**不许越过邻块**（顺序是求值的前提）
+    #[test]
+    fn resizing_and_moving_respect_the_channel_order() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        for (a, b) in [(0, 4), (8, 12)] {
+            exec_ok(
+                &mut c,
+                json!({"op": "add_zone_event", "track": "x1", "startBeat": [a, 1], "endBeat": [b, 1],
+                       "startValue": a as f64, "endValue": b as f64}),
+            );
+        }
+        // 第三条：用来验证"顺序被打乱"这道闸
+        exec_ok(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "x1", "startBeat": [20, 1], "endBeat": [24, 1],
+                   "startValue": 20.0, "endValue": 24.0}),
+        );
+        // 把第一条的终点从 4 拖到 6：允许（还没碰到 8）
+        exec_ok(&mut c, json!({"op": "resize_zone_event", "track": "x1", "index": 0, "edge": "end", "toBeat": [6, 1]}));
+        assert_eq!(c.doc().mask_zones[0].x1[0].end.to_f64(), 6.0);
+        // 负拍：拍不能为负（"这条通道的第一条事件可以晚于拍 0"不等于可以早于 0）
+        let e = exec_err(&mut c, json!({"op": "resize_zone_event", "track": "x1", "index": 1, "edge": "start", "toBeat": [-1, 1]}));
+        assert!(e.contains("拍不能为负"), "{e}");
+        // 把第三条的起点改到 8 **之前** ⇒ 通道不再按 start 升序 ⇒ 报错（求值的二分依赖这个不变量）
+        let e = exec_err(&mut c, json!({"op": "set_zone_event", "track": "x1", "index": 2, "set": {"startBeat": [1, 1]}}));
+        assert!(e.contains("升序"), "{e}");
+        // 平移整块：与邻块重叠 ⇒ 报错
+        let e = exec_err(&mut c, json!({"op": "move_zone_event", "track": "x1", "index": 1, "delta": [-6, 1]}));
+        assert!(e.contains("重叠"), "{e}");
+        assert_eq!(c.doc().mask_zones[0].x1[1].start.to_f64(), 8.0, "失败的命令一个字节都不该改");
+        // 往空档里挪是允许的
+        exec_ok(&mut c, json!({"op": "move_zone_event", "track": "x1", "index": 1, "delta": [1, 1]}));
+        assert_eq!(c.doc().mask_zones[0].x1[1].start.to_f64(), 9.0);
+    }
+
+    /// 撤销/重做：遮蔽区的增删与通道改动都是**一步**（含 `active` 的布尔值原样回去）
+    #[test]
+    fn undo_and_redo_round_trip_the_zones() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone"}));
+        let snapshot = c.doc().to_json();
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1], "startValue": true, "endValue": true}));
+        exec_ok(&mut c, json!({"op": "del_zone", "index": 0}));
+        assert!(c.doc().mask_zones.is_empty());
+        exec_ok(&mut c, json!({"op": "undo"}));
+        assert_eq!(c.doc().mask_zones.len(), 1, "撤销删区");
+        exec_ok(&mut c, json!({"op": "undo"}));
+        assert_eq!(c.doc().to_json()["maskZones"], snapshot["maskZones"], "撤回到新建那一刻");
+        // 能力等级随后退回去（最后一块区没了 ⇒ 不再需要 4）
+        exec_ok(&mut c, json!({"op": "del_zone", "index": 0}));
+        assert_eq!(c.doc().min_client_capability, 1);
+    }
+
+    /// **`maskZones` 空数组不写进文件**：没有遮蔽区的谱面与加这个字段之前逐字节相同
+    #[test]
+    fn a_chart_without_zones_has_no_maskzones_key() {
+        let c = EditCore::new();
+        let v = c.doc().to_json();
+        assert!(v.get("maskZones").is_none(), "空数组不该写进文件：{v}");
+        // 有一块区时才出现，且 opm → opm 原样读回
+        let mut c2 = EditCore::new();
+        exec_ok(&mut c2, json!({"op": "add_zone"}));
+        let v = c2.doc().to_json();
+        assert!(v.get("maskZones").is_some());
+        let back = Document::from_json(v).expect("opm 读回");
+        assert_eq!(back.mask_zones.len(), 1);
+        assert_eq!(back.mask_zones[0].x2, c2.doc().mask_zones[0].x2);
     }
 }

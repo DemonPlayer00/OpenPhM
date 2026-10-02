@@ -345,6 +345,35 @@ pub fn const_hold(from: crate::doc::Beat, to: crate::doc::Beat, v: Value) -> cra
     crate::doc::Event::new(from, to, v.clone(), v, "linear")
 }
 
+/// **插入一条事件之前，把被它压在下面的那些事件裁到它的起点** —— 与 [`normalize_track`]
+/// 处理"重叠"时**是同一条规则**（后一条从它的起点起生效，前一条到此为止）。
+///
+/// 为什么单列出来：判定线那边的 `add_event` **不裁**（重叠由冲突浏览器报出来、由用户自己修），
+/// 而遮蔽区还没有那份浏览器 —— 编辑器自己造出来的重叠会让"校验谱面"当场报错，
+/// 那是"自己的产物过不了自己的校验器"，比不一致更糟。
+///
+/// **保值是硬要求**：裁一条**斜坡**必须把 `endValue` 改成它在切点上的值
+/// （`perf::event_value`，带缓动），否则"插一块"就把这段表演的斜率改了 ——
+/// 与 [`normalize_track`] 里那句注释是同一件事。
+///
+/// 返回被裁掉的事件条数。
+pub fn trim_before_insert(
+    list: &mut Vec<crate::doc::Event>,
+    start: Beat,
+    tmap: &crate::perf::TimeMap,
+) -> usize {
+    let mut trimmed = 0;
+    for e in list.iter_mut() {
+        if e.start < start && e.end > start {
+            let cut = serde_json::json!(crate::perf::event_value(e, start.to_f64(), tmap));
+            e.end = start;
+            e.end_value = cut;
+            trimmed += 1;
+        }
+    }
+    trimmed
+}
+
 /// 轨道规范化的统计（给保真度报告用）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NormalizeStats {
@@ -558,4 +587,62 @@ pub fn load_bytes(bytes: &[u8]) -> Result<(Document, Fidelity), String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("既不是 ZIP 也不是 UTF-8 JSON: {e}"))?;
     let v: Value = serde_json::from_str(text).map_err(|e| format!("JSON 解析失败: {e}"))?;
     to_document(v)
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+    use crate::doc::{Beat, BpmEntry, Document, Event};
+
+    fn tmap120() -> crate::perf::TimeMap {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![BpmEntry {
+            start: Beat::zero(),
+            bpm: 120.0,
+            foreign: Default::default(),
+        }];
+        crate::perf::TimeMap::from_doc(&doc)
+    }
+
+    fn ev(a: f64, b: f64, v0: f64, v1: f64) -> Event {
+        Event::new(
+            Beat::new((a * 4.0) as i64, 4),
+            Beat::new((b * 4.0) as i64, 4),
+            serde_json::json!(v0),
+            serde_json::json!(v1),
+            "linear",
+        )
+    }
+
+    /// 常量事件被裁短：直接改 `end`（值不变）
+    #[test]
+    fn a_constant_event_is_shortened_in_place() {
+        let tmap = tmap120();
+        let mut list = vec![ev(0.0, 64.0, 300.0, 300.0)];
+        assert_eq!(trim_before_insert(&mut list, Beat::new(8, 1), &tmap), 1);
+        assert_eq!(list[0].start, Beat::zero());
+        assert_eq!(list[0].end, Beat::new(8, 1));
+        assert_eq!(list[0].end_value, serde_json::json!(300.0), "值原样");
+    }
+
+    /// **斜坡被裁短必须保住切点上的值**（否则"插一块"会把斜率改掉 = 重载之后动得更快）
+    #[test]
+    fn a_ramp_keeps_its_value_at_the_cut() {
+        let tmap = tmap120();
+        let mut list = vec![ev(0.0, 8.0, 0.0, 400.0)];
+        // 在拍 6 插一块：0→400 的斜坡在 6 拍处是 300
+        assert_eq!(trim_before_insert(&mut list, Beat::new(6, 1), &tmap), 1);
+        assert_eq!(list[0].end, Beat::new(6, 1));
+        assert_eq!(list[0].end_value, serde_json::json!(300.0));
+    }
+
+    /// 只裁"压得住"的那些：起点晚于插入点 / 终点早于插入点的一律不碰
+    #[test]
+    fn only_events_spanning_the_insert_point_are_trimmed() {
+        let tmap = tmap120();
+        let mut list = vec![ev(0.0, 4.0, 1.0, 1.0), ev(8.0, 12.0, 2.0, 2.0)];
+        assert_eq!(trim_before_insert(&mut list, Beat::new(6, 1), &tmap), 0);
+        assert_eq!(list[0].end, Beat::new(4, 1), "早结束的不碰");
+        assert_eq!(list[1].start, Beat::new(8, 1), "晚开始的不碰");
+    }
 }

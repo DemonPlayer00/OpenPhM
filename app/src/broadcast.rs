@@ -30,23 +30,35 @@ pub enum TopicKind {
     Note,
     /// 某条轨道（事件模式：移动/透明度/流速）
     Track,
+    /// **遮蔽区集合本身**（增删、顺序）
+    MaskZoneList,
+    /// 某一块遮蔽区（它的属性与七条通道）
+    MaskZone,
 }
 
-/// 一个具体话题：类别 + （可选）判定线下标
+/// 一个具体话题：类别 + （可选）判定线下标 / 遮蔽区下标
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Topic {
     pub kind: TopicKind,
     pub line: Option<usize>,
+    /// 遮蔽区下标。**与 `line` 分开**：两者属于不同的对象空间（0 号线与 0 号遮蔽区
+    /// 毫无关系），合成一个字段之后，"只关心 3 号线的订阅者"会收到 3 号遮蔽区的广播。
+    pub zone: Option<usize>,
 }
 
 impl Topic {
     pub fn new(kind: TopicKind, line: Option<usize>) -> Self {
-        Self { kind, line }
+        Self { kind, line, zone: None }
+    }
+    /// 遮蔽区话题（`line` 恒为空）
+    pub fn mask(kind: TopicKind, zone: Option<usize>) -> Self {
+        Self { kind, line: None, zone }
     }
     pub fn label(&self) -> String {
-        match self.line {
-            Some(l) => format!("{:?}[{l}]", self.kind),
-            None => format!("{:?}", self.kind),
+        match (self.line, self.zone) {
+            (_, Some(z)) => format!("{:?}@{z}", self.kind),
+            (Some(l), None) => format!("{:?}[{l}]", self.kind),
+            (None, None) => format!("{:?}", self.kind),
         }
     }
 }
@@ -93,6 +105,10 @@ impl TopicFilter {
             return false;
         }
         if self.lines.is_empty() {
+            return true;
+        }
+        // 遮蔽区话题与"哪条判定线"无关：按线过滤的订阅者收不收它，只看类别
+        if t.zone.is_some() {
             return true;
         }
         match t.line {
@@ -191,6 +207,14 @@ pub fn topics_of(change: &Change) -> Vec<Topic> {
                 }
             }
             out
+        }
+        // 遮蔽区：集合本身变化（增删）让 GUI 整表重建；只改通道 ⇒ 只重建那一块。
+        // 两者都置 `Render` 的落点在 `dirty.rs`（画面里那块红三角会跟着变）。
+        Change::InsertZone { .. } | Change::RemoveZone { .. } => {
+            vec![Topic::mask(MaskZoneList, None)]
+        }
+        Change::SetZone { index, .. } | Change::ZoneTrack { zone: index, .. } => {
+            vec![Topic::mask(MaskZone, Some(*index))]
         }
     }
 }

@@ -16,6 +16,8 @@ pub enum TreeAction {
     SelectTrack(state::TrackId),
     SelectEvent(usize),
     SelectNote(usize),
+    /// 选中一块**遮蔽区**（视图动作：切"当前正在编的是哪一块"）
+    SelectZone(usize),
     Cmd(serde_json::Value),
 }
 
@@ -30,6 +32,62 @@ pub fn line_tree_ui(
 ) {
     let tmap = &st.chart.tmap;
     let playhead = st.playhead;
+
+    // ⓪ **遮蔽区**（与判定线并列的根级对象）：名字 + 通道/事件计数 + 此刻显示与否。
+    //
+    // 放在最前面：遮蔽区编辑模式下它就是主对象（编辑区整片都是它的七条通道），
+    // 而普通模式下它只是"另一个根级列表"，排在这里不影响判定线的可达性（那一段还开着）。
+    egui::CollapsingHeader::new(format!(
+        "遮蔽区（{} 块{}）",
+        st.chart.zones.len(),
+        if st.mask_edit { "；编辑模式" } else { "" }
+    ))
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("新建（播放头）")
+                .on_hover_text("在播放头摆一个中央正三角形（与属性编辑器里的「新建」同一条命令）")
+                .clicked()
+            {
+                let anchor = opm_app::codec::beat_from_f64(
+                    st.snap_beat(tmap.beat(playhead)).max(0.0),
+                );
+                acts.push(TreeAction::Cmd(opm_app::edit::add_zone_command(anchor)));
+            }
+            if ui
+                .add_enabled(!st.chart.zones.is_empty(), egui::Button::new("删除").small())
+                .on_hover_text("删掉当前选中的那块（Ctrl+Z 可撤销）")
+                .clicked()
+            {
+                acts.push(TreeAction::Cmd(opm_app::edit::del_zone_command(st.selected_zone)));
+            }
+        });
+        if st.chart.zones.is_empty() {
+            ui.label("（没有遮蔽区）");
+        }
+        for (i, z) in st.chart.zones.iter().enumerate() {
+            let state = z.state(tmap, playhead);
+            let mark = if i == st.selected_zone { "▶" } else { " " };
+            // 一行必须放得下（面板约 300px）：名字截 5 字 + 计数 + 状态
+            let name: String = z.name.chars().take(5).collect();
+            let now = if state.visible {
+                format!("●({:.0},{:.0})", state.v[0][0], state.v[0][1])
+            } else {
+                "○不显示".to_owned()
+            };
+            let text = format!(
+                "{mark}#{i} {:<5} {}块 {} {}",
+                name,
+                z.tracks.iter().map(|t| t.events.len()).sum::<usize>(),
+                if state.active { "A" } else { "-" },
+                now
+            );
+            if ui.monospace(text).clicked() {
+                acts.push(TreeAction::SelectZone(i));
+            }
+        }
+    });
 
     // ① 判定线（父对象）：每行直接显示该线**此刻的表演值** —— 事件是否生效先看数字
     egui::CollapsingHeader::new(format!(
