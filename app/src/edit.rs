@@ -605,6 +605,36 @@ pub fn add_mask_event_command(
     })
 }
 
+/// **草稿态**下"先建区、再应用编辑"的命令序列（用户口径 2026-10-02）。
+///
+/// "遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件，当用户执行任意编辑后
+/// 创建遮蔽区并应用编辑（可撤销）"——于是草稿态的第一条编辑要带上 `add_zone`，
+/// 而且**与那条编辑同属一个事务**（一次 Ctrl+Z 全回去）。
+///
+/// 为什么放在库里：`begin`/`commit` 的配对与 `add_zone` 的**顺序**是这条口径的全部内容，
+/// 而它有两个调用点（编辑区的双击放块、属性编辑器那一列按钮）—— 各写一遍就会有一处漏掉 commit。
+pub fn zone_draft_edits(draft: bool, start: crate::doc::Beat, edits: Vec<Value>) -> Vec<Value> {
+    if edits.is_empty() || !draft {
+        return edits;
+    }
+    let mut out = Vec::with_capacity(edits.len() + 3);
+    out.push(begin_command("新建遮蔽区并应用编辑"));
+    out.push(add_zone_command(start));
+    out.extend(edits);
+    out.push(commit_command());
+    out
+}
+
+/// **草稿态下开始一次拖动**：只需要 `begin` + `add_zone`（`add_zone` 只能出现一次 ——
+/// 同一帧里"拖动开始"与"改跨度"会各发一条命令，两条都带建区就会凭空多出一块）。
+pub fn zone_draft_begin(draft: bool, start: crate::doc::Beat, label: &str) -> Vec<Value> {
+    if draft {
+        vec![begin_command("新建遮蔽区并应用编辑"), add_zone_command(start)]
+    } else {
+        vec![begin_command(label)]
+    }
+}
+
 /// 改遮蔽区事件块（起止拍用精确有理数；值可以是数字或布尔 —— `active` 通道就是布尔）
 pub fn set_mask_event_command(
     zone: usize,
@@ -1233,5 +1263,26 @@ mod mask_command_tests {
         assert_eq!(del_mask_event_command(1, MaskChannel::X2, 0)["op"], serde_json::json!("del_zone_event"));
         assert_eq!(del_zone_command(4)["index"], serde_json::json!(4));
         assert_eq!(set_zone_command(0, serde_json::json!({"name": "x"}))["op"], serde_json::json!("set_zone"));
+    }
+
+    /// **草稿态**：第一条编辑要带上 `add_zone`，且**整段是一个事务**（一次撤销全回去）
+    #[test]
+    fn a_draft_edit_creates_the_zone_inside_the_same_transaction() {
+        let start = Beat::new(8, 1);
+        let edit = add_mask_event_command(0, MaskChannel::X1, Beat::new(8, 1), Beat::new(12, 1));
+        let seq = zone_draft_edits(true, start, vec![edit.clone()]);
+        let ops: Vec<&str> = seq.iter().filter_map(|c| c["op"].as_str()).collect();
+        assert_eq!(ops, vec!["begin", "add_zone", "add_zone_event", "commit"], "{seq:?}");
+        assert_eq!(seq[1]["startBeat"], serde_json::json!([8, 1]), "起点用界的吸附结果");
+        // 已经有区（或不在编辑模式）：原样返回那条编辑，不额外建区
+        assert_eq!(zone_draft_edits(false, start, vec![edit.clone()]), vec![edit.clone()]);
+        assert!(zone_draft_edits(true, start, Vec::new()).is_empty(), "没有编辑就什么都不做");
+        // 拖动开始：**只建一次区**
+        let begin = zone_draft_begin(true, start, "拖动遮蔽区事件");
+        let ops: Vec<&str> = begin.iter().filter_map(|c| c["op"].as_str()).collect();
+        assert_eq!(ops, vec!["begin", "add_zone"], "{begin:?}");
+        let begin = zone_draft_begin(false, start, "拖动遮蔽区事件");
+        assert_eq!(begin.len(), 1);
+        assert_eq!(begin[0]["op"], serde_json::json!("begin"));
     }
 }

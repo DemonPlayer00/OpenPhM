@@ -162,6 +162,12 @@ pub struct InspectorOut {
     /// **视图**动作：在通道列表里点了某一条 ⇒ 把编辑区的"当前列"切过去
     /// （与 `select_note` 同一条理由：选中不是文档数据，不走命令通道）
     pub select_channel: Option<opm_app::state::MaskChannel>,
+    /// `commands` 里**有没有遮蔽区面板发的命令**。
+    ///
+    /// 为什么要这一位：遮蔽区一块都还没有时（草稿态）那些命令要先建区再应用，
+    /// 而那段包装只有调用方做得到（见 `main.rs` 的 `mask_commands_many`）——
+    /// 让面板自己塞 `add_zone` 会把"顺序与事务"这件调用方的事漏进面板。
+    pub mask_edits: bool,
 }
 
 /// 画属性编辑器，返回这一帧的产物（见 [`InspectorOut`]）。
@@ -592,6 +598,8 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
         );
         return;
     };
+    // 有命令产出的那一刻就置位（草稿态下调用方要先建区再应用，见 `InspectorOut::mask_edits`）
+    let mask_edits_mark = ec.len();
 
     // ---- 名字 ----
     ui.horizontal(|ui| {
@@ -786,6 +794,7 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
     {
         ec.push(opm_app::edit::del_mask_event_command(mi.index, ch, ev.index));
     }
+    out.mask_edits = ec.len() > mask_edits_mark;
 }
 
 #[cfg(test)]

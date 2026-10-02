@@ -158,7 +158,7 @@ fn new_chart_packs_audio_and_illustration_into_the_container() {
 /// **「上次没有正常退出」→「继续此谱面」**：连同**未保存的改动**一起恢复（用户选的做法）。
 ///
 /// 这条链路的每一步都是"会丢数据"的判断，所以整条走一遍：
-/// 缓存目录（含 `session.json`）→ `session::gui_leftovers` 认出它 → `load_session_into` →
+/// 缓存目录（含 `session.json` 与 `lock.pid`）→ `session::inspect` 认成 **Crashed** → `load_session_into` →
 /// 保存目标指回**原文件**（不是缓存目录）→ 保存后缓存里的快照跟着变成"已保存"。
 #[test]
 fn a_leftover_cache_dir_resumes_with_its_unsaved_edits() {
@@ -197,19 +197,34 @@ fn a_leftover_cache_dir_resumes_with_its_unsaved_edits() {
     )
     .unwrap();
 
-    // ---- 启动时的那一问：这条目录会被认成"GUI 上次没退干净" ----
-    // （扫的是真的缓存根目录，所以按目录过滤出我们这一份 —— 别人的遗留不该影响这条断言）
-    let offered: Vec<_> = opm_app::session::gui_leftovers(&container::cache_root())
-        .into_iter()
-        .filter(|l| l.dir == cache)
-        .collect();
-    assert_eq!(offered.len(), 1, "该认出这份遗留");
-    assert_eq!(offered[0].name(), "崩溃前的名字");
-    assert!(offered[0].has_unsaved(), "会话元数据说还有未保存改动");
+    // ---- **丢弃那个进程**，再照"打开这份谱面时"的判据问一次 ----
+    //
+    // 崩溃的现场就是：锁文件里写着 pid 999999，而那个进程早已不在（锁没人持、ping 也不通）。
+    // 这份缓存目录落在真的缓存根目录下（只有那里的目录才算"我们摊出来的"），
+    // 于是 `inspect` 会给出 `Crashed` —— 用户口径 2026-10-02："谱面文件夹存在 ∧ pid 锁的持有者
+    // ping 不通 ⇒ 崩溃恢复谱面"。（写 pid 锁这一步本来由 `session::acquire` 做，这里手工造现场。）
+    std::fs::write(
+        opm_app::session::lock_path(&cache),
+        serde_json::to_vec(&container::Session {
+            pid: 999_999,
+            exe: "opm-app".to_owned(),
+            source: Some(source.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    match opm_app::session::inspect(&cache) {
+        opm_app::session::CacheState::Crashed(h) => assert_eq!(h.pid, 999_999),
+        other => panic!("这份缓存该被认成崩溃遗留，得到 {other:?}"),
+    }
+    let offered = opm_app::session::leftover_of(&cache);
+    assert_eq!(offered.name(), "崩溃前的名字");
+    assert!(offered.has_unsaved(), "会话元数据说还有未保存改动");
     assert!(
-        offered[0].details().join("\n").contains("未保存的改动"),
+        offered.details().join("\n").contains("未保存的改动"),
         "对话框正文要说清这一点：{:?}",
-        offered[0].details()
+        offered.details()
     );
 
     // ---- 选「继续」----
@@ -240,14 +255,19 @@ fn a_leftover_cache_dir_resumes_with_its_unsaved_edits() {
         serde_json::from_slice(&std::fs::read(cache.join(container::CHART_NAME)).unwrap()).unwrap();
     assert_eq!(on_disk["meta"]["name"], json!("又改了"), "快照写的是当前文档");
     assert!(container::read_session(&cache).unwrap().dirty, "快照要记下'当时是脏的'");
-    // 快照不该在缓存目录里留下垃圾：只剩谱面、资源、会话元数据这三样
+    // 快照不该在缓存目录里留下垃圾：谱面 + 资源 + 会话元数据 + **pid 锁**，就这四样
+    // （`lock.pid` 是"这份缓存归谁写"的凭据，它必须在；`.tmp` 之类才是不该留的）
     let mut names: Vec<String> = std::fs::read_dir(&cache)
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["opm.json", "session.json", "song.ogg"], "快照不该留下临时文件");
+    assert_eq!(
+        names,
+        vec!["lock.pid", "opm.json", "session.json", "song.ogg"],
+        "快照不该留下临时文件"
+    );
 
     std::fs::remove_dir_all(&cache).ok();
     std::fs::remove_dir_all(dir).ok();
@@ -431,6 +451,7 @@ fn a_read_only_stage_leaves_another_sessions_cache_alone() {
     maker.save_as(&target, SaveFormat::OpmPacked).unwrap();
 
     // ① 先在同一个缓存目录里造出"别人的会话"（换个 pid，写完再改回去）
+    discard_cache_of(&target); // 先清掉上一次运行可能留下的、带未保存改动的那一份
     let mut owner = EditCore::new();
     owner.load_into(&target).unwrap();
     let cache = owner.asset_dir().map(std::path::Path::to_path_buf).expect("容器载入要摊出缓存目录");
@@ -444,6 +465,7 @@ fn a_read_only_stage_leaves_another_sessions_cache_alone() {
     let before = std::fs::read(cache.join(container::CHART_NAME)).unwrap();
 
     // ② 一次性读取（opm-ctl 的路径）：文档照常读出来，但缓存目录**一个字节都不许动**
+    // （这一条**不能**先丢弃缓存的模拟动作 —— 那正好把这个用例要验的东西删掉了）
     let staged = EditCore::stage_file_as(&target, CacheClaim::ReadOnly).unwrap();
     assert_eq!(staged.doc.meta.name, "被占用", "读出来的仍是**容器里**的文档");
     let mut reader = EditCore::new();
@@ -451,6 +473,9 @@ fn a_read_only_stage_leaves_another_sessions_cache_alone() {
     assert_eq!(container::read_session(&cache).unwrap(), s, "会话元数据不该被改写");
     assert_eq!(std::fs::read(cache.join(container::CHART_NAME)).unwrap(), before, "快照不该被覆盖");
 
+    // 缓存里那份"别人的未保存改动"要靠用户选「丢弃并重新打开」才会走掉 —— 这一步就是那个选择。
+    // 不丢的话，认领会话的装载会**拒绝**（那是刻意的：不能悄悄覆盖别人没保存的编辑）。
+    discard_cache_of(&target);
     // ③ 反之，认领会话的装载（GUI 那条路）会把这一份接管过来
     let mut gui = EditCore::new();
     gui.load_into(&target).unwrap();
@@ -753,6 +778,7 @@ fn a_background_snapshot_matches_the_synchronous_one() {
     maker.save_as(&chart, SaveFormat::OpmPacked).unwrap();
 
     // ② 载入 → 改一处 ⇒ 脏（脏才会写快照）
+    discard_cache_of(&chart); // 上一次运行的遗留会让打开停下来问用户（测试里没人能点）
     let mut core = EditCore::load(&chart).unwrap();
     let cache = core.asset_dir().expect("容器载入要摊出缓存目录").to_path_buf();
     core.exec(&json!({"op": "set_meta", "set": {"charter": "我"}}));
@@ -800,6 +826,21 @@ fn a_bare_chart_has_no_snapshot_job() {
     assert!(core.asset_dir().is_none(), "裸谱面不摊缓存目录");
     assert!(core.snapshot_job().is_err());
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// 清掉某个容器在当前缓存根目录下的那一份（**模拟用户选「丢弃并重新打开」**）。
+///
+/// 为什么测试需要它：缓存摊在**真的** `<临时目录>/opm` 下（"那份目录算不算我们的"就按它判），
+/// 于是上一次运行（或上一次被 Ctrl-C 掉的运行）留下的、**带未保存改动**的缓存会让"打开"
+/// 停下来问用户 —— 那正是要的行为（不能覆盖人家没保存的编辑），可测试里没人能点那个按钮。
+/// 想"从头打开"就得像用户一样先丢弃。
+fn discard_cache_of(container_path: &std::path::Path) {
+    use opm_app::codec::container;
+    let Ok(bytes) = std::fs::read(container_path) else { return };
+    if !opm_app::zip::looks_like_zip(&bytes) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(container::extract_dir(&container::cache_key(&bytes)));
 }
 
 /// **遮蔽区要活过一次真实的保存/打开**（四种形态里 opm 那两种；RPE 两种必须明确丢弃并报告）。

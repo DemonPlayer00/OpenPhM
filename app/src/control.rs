@@ -268,8 +268,70 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
 
 /// 自动 socket 路径：`$XDG_RUNTIME_DIR/opm-<pid>.sock`（退回到临时目录）
 pub fn auto_path() -> PathBuf {
+    path_for_pid(std::process::id())
+}
+
+/// **某个 pid** 的控制通道路径。
+///
+/// 为什么要有 pid 版：判"某个谱面缓存的主人还在不在"时要问**那个进程**（见 `session::inspect`），
+/// 而它的 socket 名字里就带 pid —— 于是不需要把 socket 路径也写进锁文件，
+/// 少一份"两边不一致"的可能（pid 与路径的换算是纯函数，只有这一处）。
+pub fn path_for_pid(pid: u32) -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(dir).join(format!("opm-{}.sock", std::process::id()))
+    PathBuf::from(dir).join(format!("opm-{pid}.sock"))
+}
+
+/// **ping 一个正在跑的进程**（连它的控制通道，问一条 `{"op":"ping"}`）。
+///
+/// 两件事一起核：① 那个 socket 上确实有个 OpenPhM 在应答；② 它自报的 pid 就是我们要找的那个
+/// （socket 文件不会随进程消失，只连上不核对 pid 会把"死进程留下的文件"当成活的）。
+///
+/// 返回它的应答（含 `pid`/`revision`/`cacheDir`）。**任何一步失败都算"没应答"**：
+/// 连接被拒、超时、回的不是 JSON、`pong` 不是 true、pid 对不上 —— 调用方按"不通"处理。
+#[cfg(unix)]
+pub fn ping(path: &Path, timeout: std::time::Duration) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|e| format!("连接 {} 失败: {e}", path.display()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("设置读超时失败: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("设置写超时失败: {e}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("复制连接失败: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    // 连上就先收一条 `hello`（服务端行为），再问 ping —— 顺序由服务端决定，这里照它来
+    let mut hello = String::new();
+    let _ = reader.read_line(&mut hello);
+    writer
+        .write_all(b"{\"op\":\"ping\"}\n")
+        .map_err(|e| format!("写 ping 失败: {e}"))?;
+    writer.flush().map_err(|e| format!("刷新 ping 失败: {e}"))?;
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("读 ping 应答失败: {e}"))?;
+    // 应答前可能还夹着别的行（统计/广播）：往后找第一条能解析的对象
+    for cand in std::iter::once(line.as_str()).chain(hello.lines()) {
+        if let Ok(v) = serde_json::from_str::<Value>(cand.trim()) {
+            if v.get("op").and_then(|o| o.as_str()) == Some("ping") {
+                return Ok(v);
+            }
+        }
+    }
+    Err(format!("{} 没有回应 ping（收到 {line:?}）", path.display()))
+}
+
+/// 非 Unix：控制通道本身还不存在（见 `spawn_server`）⇒ ping **不可用**。
+///
+/// 调用方必须把"不可用"与"不通"分开：判崩溃的第一判据是**锁没人持**（Unix `flock` /
+/// Windows `LockFileEx`，两边都有），ping 只是补一道核对。
+#[cfg(not(unix))]
+pub fn ping(path: &Path, _timeout: std::time::Duration) -> Result<Value, String> {
+    Err(format!("本平台没有控制通道，无法 ping {}（判据退回到"锁没人持"）", path.display()))
 }
 
 /// 发现最新的 opm socket（给 `--attach auto` 用）

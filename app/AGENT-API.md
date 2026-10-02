@@ -314,6 +314,18 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 
 ---
 
+### 同时开多份谱面 / 缓存归谁（`--file` 与打开时的检查）
+
+- **每份谱面一把锁**：解压缓存目录里的 `lock.pid`（pid 锁）+ 一句 `ping`。
+  **不同谱面可以同时被不同进程读**；同一份容器被第二个进程打开时会**明确拒绝**。
+- `opm-ctl --file X …` 走的是 `CacheClaim::ReadOnly`：**不抢锁、不写缓存**，
+  所以 GUI 开着 X 时 agent 照样能读它（只是不覆盖它的快照与会话元数据）。
+- **崩溃遗留**（缓存目录在 ∧ `lock.pid` 那个 pid ping 不通）在**打开时**才判定：
+  界面会问「继续 / 丢弃」；`--doc` 启动那条路用 `OPM_RESUME_AUTO=continue|discard` 无人值守地走完，
+  没给就拒绝启动（**不会**静默覆盖那份没保存的快照）。
+- `{"op":"ping"}` 现在**自报身份**：`{pong, revision, pid, exe, chart, cacheDir}` ——
+  判"那份缓存的主人还在不在"就靠它核对 pid。`opm-ctl --attach` 用的同一条控制通道。
+
 ## 4. 响应与退出码
 
 每条命令回一行：

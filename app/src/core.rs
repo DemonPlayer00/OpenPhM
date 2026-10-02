@@ -64,7 +64,7 @@ pub struct Resumed {
 /// 它只回答"这份输入是什么、摊到哪儿了"，**不碰任何会话字段** —— 于是"打开文件"与
 /// "从崩溃缓存继续"共用同一个装载入口 [`EditCore::load_staged`]，而两者的差别（保存目标、
 /// 脏位）在这一层就已经定下来，装载那一步不需要知道输入是 zip 还是目录。
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Staged {
     /// **我们摊出来的**临时目录（`None` = 这份输入本来就是可编辑的真实文件/文件夹，没什么可摊的）。
     /// 有值 ⇒ 会话退出时要负责删掉（一个进程至多留一份）。
@@ -84,6 +84,67 @@ pub struct Staged {
     pub folder: Option<PathBuf>,
     /// 缓存里有**未保存的改动**（只有"从崩溃缓存继续"会为真）
     pub unsaved: bool,
+    /// 这份缓存目录的**独占锁**（`<缓存目录>/lock.pid`）。
+    ///
+    /// 它必须活到会话结束：`Drop` 即"我不再写这份缓存了"。放在 `Staged` 里而不是就地拿着，
+    /// 是因为"摊缓存"与"装载进核心"是两步（`stage_file` 是静态函数，装载要 `&mut self`）——
+    /// 锁的对象得跟着数据一起旅行，否则函数一返回锁就掉了（第二个进程立刻能抢到，等于没锁）。
+    pub lock: Option<crate::session::ChartLock>,
+}
+
+/// [`EditCore::stage_into_cache`] 的产物：缓存目录 + 它的锁（锁要活到会话结束）
+struct StagedCache {
+    dir: PathBuf,
+    lock: Option<crate::session::ChartLock>,
+}
+
+/// **能不能由我们接手这份缓存**（`open_file` 与 `stage_into_cache` 共用同一判据）。
+///
+/// 三条规则，都是从"会不会丢东西 / 会不会两个人写"出发的：
+/// · `Free` ⇒ 可以；
+/// · **崩溃遗留**（锁没人持、那个 pid ping 不通）⇒ **只有还留着未保存改动时**才拦下来问用户；
+///   没有可丢的东西就直接重摊（拦下来问"要不要继续"而那里其实什么都没有，只会让人白点一下）；
+/// · `Busy` ⇒ 别人正开着 ⇒ 拦；**自己开着**（同一个进程里的另一个 `EditCore`）⇒ 拦，
+///   因为那也是"有人在写这份缓存"，覆盖它就是覆盖那个会话的工作副本。
+///
+/// 返回 `Ok(())` = 接手；`Err((dir, holder, crashed))` = 交给调用方去问用户/报错。
+fn claim_blocker(
+    dir: &Path,
+    state: &crate::session::CacheState,
+) -> Result<(), (PathBuf, codec::container::Session, bool)> {
+    match state {
+        crate::session::CacheState::Free => Ok(()),
+        crate::session::CacheState::Busy { holder, .. } => {
+            Err((dir.to_path_buf(), holder.clone(), false))
+        }
+        crate::session::CacheState::Crashed(h) => {
+            let lost = codec::container::read_session(dir).is_some_and(|s| s.has_unsaved());
+            if lost {
+                Err((dir.to_path_buf(), h.clone(), true))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// **打开一份谱面的结果**（用户口径 2026-10-02：崩溃检查放在"打开谱面文件"时，不是启动时）。
+///
+/// 三种情形都要让调用方分得清：能开、有人在用、上次没退干净 ——
+/// 第三种**没有动缓存一个字节**（那份快照就是用户没保存的编辑）。
+#[derive(Debug)]
+pub enum OpenOutcome {
+    Ready(Box<Staged>),
+    /// 另一份进程正开着它（pid 锁被持有，或那个 pid 还应答）
+    Busy {
+        dir: PathBuf,
+        holder: codec::container::Session,
+    },
+    /// 有 pid 锁、但锁没人持且那个 pid ping 不通 ⇒ **崩溃遗留**
+    Crashed {
+        dir: PathBuf,
+        holder: codec::container::Session,
+    },
 }
 
 pub struct EditCore {
@@ -140,6 +201,12 @@ pub struct EditCore {
     /// 这条链以前只写了 `container::extract_assets`，**没人调用** ⇒ 从 `.opm` 打开的谱面
     /// 永远"音乐没装上"（用户报的"音乐应有时长"就是这个：包里有 41MB 的 flac，却解析到谱面旁边去找）。
     asset_dir: Option<PathBuf>,
+    /// **这份谱面缓存目录的独占锁**（见 [`crate::session::ChartLock`]）。
+    ///
+    /// 它活到"换谱面/退出"为止：中途掉了就等于放弃了"只有我在写这份缓存"这条承诺
+    /// （第二个进程会以为自己可以写，两边互相覆盖快照）。`--doc` 之外的入口都经
+    /// [`EditCore::open_file`] ⇒ [`EditCore::load_staged`] 装上它。
+    chart_lock: Option<crate::session::ChartLock>,
     /// 上次保存用的（形态, 目标路径）：同路径再存要回到**同一个形态**。
     /// 文件夹形态下 `path` 是目录里的谱面文件，光看扩展名会把"文件夹"误判成"单文件"。
     last_save: Option<(SaveShape, PathBuf)>,
@@ -411,6 +478,7 @@ impl EditCore {
             overlaps: Vec::new(),
             last_save: None,
             asset_dir: None,
+            chart_lock: None,
         }
     }
 
@@ -436,6 +504,50 @@ impl EditCore {
         Self::stage_file_as(path, CacheClaim::Session)
     }
 
+    /// **打开一份谱面**：先看它的缓存目录归谁，再决定摊不摊（见 [`OpenOutcome`]）。
+    ///
+    /// 与 [`EditCore::stage_file`] 的差别只有一条：**不把"有人在用/上次没退干净"压成一句错误**，
+    /// 而是原样交给调用方（GUI 要据此问用户"继续上次编辑还是丢弃重开"）。
+    /// 不落缓存的输入（裸 JSON、用户的工程文件夹）一律 `Ready` —— 它们没有缓存目录可争。
+    pub fn open_file(path: &Path) -> Result<OpenOutcome, String> {
+        // 目录形态：只有"就在缓存根目录里"的那些才可能被别人占着（用户自己的工程文件夹不是共享物）
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            if path.starts_with(codec::container::cache_root()) {
+                if let Err((dir, holder, crashed)) =
+                    claim_blocker(path, &crate::session::inspect(path))
+                {
+                    return Ok(if crashed {
+                        OpenOutcome::Crashed { dir, holder }
+                    } else {
+                        OpenOutcome::Busy { dir, holder }
+                    });
+                }
+            }
+            return Ok(OpenOutcome::Ready(Box::new(Self::stage_folder(path)?)));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+        if !crate::zip::looks_like_zip(&bytes) {
+            return Ok(OpenOutcome::Ready(Box::new(Self::stage_bytes(path, bytes, CacheClaim::Session)?)));
+        }
+        // 容器/包：**先按内容算出缓存目录**，看一眼它归谁 —— 这一眼必须在摊之前，
+        // 因为摊会把别人（或上次崩溃）留下的快照覆盖掉
+        let dir = codec::container::extract_dir(&codec::container::cache_key(&bytes));
+        match claim_blocker(&dir, &crate::session::inspect(&dir)) {
+            Err((dir, holder, crashed)) => Ok(if crashed {
+                OpenOutcome::Crashed { dir, holder }
+            } else {
+                OpenOutcome::Busy { dir, holder }
+            }),
+            Ok(()) => Ok(OpenOutcome::Ready(Box::new(Self::stage_bytes(
+                path,
+                bytes,
+                CacheClaim::Session,
+            )?))),
+        }
+    }
+
     /// 同 [`EditCore::stage_file`]，但显式说明"这次摊缓存算不算认领一个会话"（见 [`CacheClaim`]）。
     pub fn stage_file_as(path: &Path, claim: CacheClaim) -> Result<Staged, String> {
         let meta = std::fs::metadata(path)
@@ -444,6 +556,12 @@ impl EditCore {
             return Self::stage_folder(path);
         }
         let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+        Self::stage_bytes(path, bytes, claim)
+    }
+
+    /// 从一个**已经读进内存**的输入摊出会话（文件与容器共用的那一段：
+    /// `open_file` 与 `stage_file_as` 都走它，免得两条路各写一份"裸 JSON 怎么办"）。
+    fn stage_bytes(path: &Path, bytes: Vec<u8>, claim: CacheClaim) -> Result<Staged, String> {
         if !crate::zip::looks_like_zip(&bytes) {
             // 裸 JSON：按**内容**判 opm / RPE（`codec::load_bytes` 就是那条判据）
             let (doc, fid) = codec::load_bytes(&bytes)?;
@@ -456,6 +574,7 @@ impl EditCore {
                 target: Some(path.to_path_buf()),
                 folder: None, // 裸 JSON 是文件，不是文件夹
                 unsaved: false,
+                lock: None, // 裸 JSON 不摊缓存 ⇒ 没有缓存目录可锁
             });
         }
         let mut fid = codec::Fidelity::new("opm", "容器（zip）".to_owned());
@@ -470,9 +589,9 @@ impl EditCore {
         // 容器/包：**摊到 `<临时目录>/opm/<内容 hash>`**（同一个包反复打开落在同一个目录）。
         // `meta.audio` 里写的是**包内文件名**，只有摊成真实文件，"按路径装载音频"才找得到它。
         let key = codec::container::cache_key(&bytes);
-        let dir = Self::stage_into_cache(&doc, &assets, &key, Some(path), format, claim, &mut fid)?;
+        let staged = Self::stage_into_cache(&doc, &assets, &key, Some(path), format, claim, &mut fid)?;
         Ok(Staged {
-            dir: Some(dir),
+            dir: Some(staged.dir),
             doc,
             assets,
             format,
@@ -480,6 +599,7 @@ impl EditCore {
             target: Some(path.to_path_buf()),
             folder: None, // 包（zip）不是文件夹
             unsaved: false,
+            lock: staged.lock,
         })
     }
 
@@ -498,8 +618,8 @@ impl EditCore {
                 subdirs.push(name); // 无压缩形态是**平的**（见 `write_entries_to_dir`）
                 continue;
             }
-            // 解压缓存里的会话元数据 / 半截临时文件都不是资源
-            if name == codec::container::SESSION_NAME || name.ends_with(".tmp") {
+            // 解压缓存里的会话元数据 / pid 锁 / 半截临时文件都不是资源（判据只有一处）
+            if codec::container::is_internal_entry(&name) {
                 continue;
             }
             let data = std::fs::read(&p).map_err(|e| format!("读 {name} 失败: {e}"))?;
@@ -551,6 +671,9 @@ impl EditCore {
             // 用户的工程文件夹（不是我们摊的缓存）⇒ 记下来：**第一次**保存就得回到"文件夹"形态
             folder: (!ours).then(|| dir.to_path_buf()),
             unsaved,
+            // 打开的若是**缓存目录本身**（继续上次编辑那条路）：它已经归我们了（有锁就是我们的），
+            // 这里不重新抢锁 —— 抢锁发生在 `stage_into_cache`
+            lock: None,
         })
     }
 
@@ -565,8 +688,37 @@ impl EditCore {
         format: codec::Format,
         claim: CacheClaim,
         fid: &mut codec::Fidelity,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<StagedCache, String> {
         let dir = codec::container::extract_dir(key);
+        // **先看这份缓存归谁，再决定动不动它**（用户口径 2026-10-02：锁落到每份谱面自己的目录上）。
+        //
+        // 判据在 `session::inspect`：`Busy` = 另一份进程正拿它当工作副本（锁被持有或它还应答）；
+        // `Crashed` = 有 pid 锁但主人已经不在了（**崩溃遗留**，`open_file` 会在此之前拦下来问用户；
+        // 走到这里说明调用方没先问过，那就按"不动缓存"处理 —— 覆盖它等于把人家没保存的编辑删掉）。
+        let state = crate::session::inspect(&dir);
+        if claim == CacheClaim::Session {
+            if let Err((dir, holder, crashed)) = claim_blocker(&dir, &state) {
+                return Err(if crashed {
+                    format!(
+                        "缓存目录 {} 里有上次没退干净的编辑（pid {} 已经不在了）—— \
+                         先在界面上选「继续上次编辑 / 丢弃并重新打开」再打开",
+                        dir.display(),
+                        holder.pid
+                    )
+                } else if holder.pid == std::process::id() {
+                    format!(
+                        "缓存目录 {} 已经由本进程的另一个会话占着（pid {}）—— 先关掉那一份再打开",
+                        dir.display(),
+                        holder.pid
+                    )
+                } else {
+                    format!(
+                        "这份谱面已经在另一个 OpenPhM 里打开着（pid {}，{}）—— 先关掉那一个，或改开别份谱面",
+                        holder.pid, holder.exe
+                    )
+                });
+            }
+        }
         // **别人已经认领的目录，一次性读取者一个字节都不碰**。
         //
         // 为什么要有这条：缓存目录按**容器内容**命名，而 `session.json` 与那份 `opm.json`
@@ -574,14 +726,32 @@ impl EditCore {
         // 崩溃留下的元数据与未保存快照一起覆盖掉 —— "上次没退干净"那条提示连同用户一小时
         // 的改动就这么没了（实测：一次 `opm-ctl --file X dump` 就能抹掉）。
         let existing = codec::container::read_session(&dir);
-        let claimed_by_other = existing.as_ref().is_some_and(|s| s.pid != std::process::id());
+        let claimed_by_other = !state.is_free()
+            || existing.as_ref().is_some_and(|s| s.pid != std::process::id());
         if claimed_by_other && claim == CacheClaim::ReadOnly {
             fid.note(format!(
-                "缓存目录 {} 已被另一个会话占用（pid {}）：本次只读不动它（不覆盖它的快照与会话元数据）",
+                "缓存目录 {} 已被另一个会话占用（{}）：本次只读不动它（不覆盖它的快照与会话元数据）",
                 dir.display(),
-                existing.map(|s| s.pid).unwrap_or(0)
+                state
+                    .holder()
+                    .map(|h| format!("pid {}", h.pid))
+                    .unwrap_or_else(|| "有来源不明的元数据".to_owned())
             ));
+            return Ok(StagedCache { dir, lock: None });
+        }
+        // **认领一份会话**：抢到锁才写（抢不到上面已经返回了）。只读的一次性用途**不抢锁** ——
+        // 抢了就成"认领"了，而它承诺过不碰别人的会话状态。
+        let lock = if claim == CacheClaim::Session {
+            Some(crate::session::acquire(&dir, source.and_then(|p| p.to_str())).map_err(|e| {
+                match e {
+                    crate::session::Refused::Busy(h) => format!("这份谱面已经被 pid {} 占用", h.pid),
+                    crate::session::Refused::Io(e) => e,
+                }
+            })?)
         } else {
+            None
+        };
+        {
             codec::container::extract_container_into(&dir, doc, assets)?;
             // 记下"这份缓存是谁、什么时候、为哪个谱面摊出来的"（见 `codec::container::Session`）：
             // 正常退出会删掉它，于是**下次启动时还躺着的 GUI 目录 = 上个进程被强杀或崩溃**，
@@ -616,7 +786,7 @@ impl EditCore {
             }
         ));
         fid.finalize();
-        Ok(dir)
+        Ok(StagedCache { dir, lock })
     }
 
     /// ② **正式加载编辑**：把 [`Staged`] 装进这个会话（**唯一**一个入口）。
@@ -626,7 +796,7 @@ impl EditCore {
     ///
     /// **换谱面时上一份解压目录立刻删掉** ⇒ 一个进程至多留一份（缓存是进程独占的）。
     pub fn load_staged(&mut self, staged: Staged) -> Result<codec::Fidelity, String> {
-        let Staged { dir, doc, assets, fid, format, target, folder, unsaved } = staged;
+        let Staged { dir, doc, assets, fid, format, target, folder, unsaved, lock } = staged;
         let origin = self.origin;
         self.doc = doc;
         self.assets = assets;
@@ -638,6 +808,10 @@ impl EditCore {
             }
         }
         self.asset_dir = dir;
+        // 换谱面就把**上一份的锁放掉**（它的目录紧接着会被删），拿上这一份的
+        // （`lock: None` 只出现在"裸 JSON/用户文件夹"与"直接打开缓存目录继续编辑"两条路上：
+        //   前者没有缓存目录，后者那份缓存本来就归我们）
+        self.chart_lock = lock;
         self.path = target;
         self.source_format = format;
         if let Some(folder) = folder {
@@ -1466,7 +1640,18 @@ impl EditCore {
             // 校验结果 JSON **只有一份实现**（`cmd::validate_json`）：`opm-ctl --file x validate`
             // 与 GUI 的这条命令出去的是同一份文本，不给"命令行说有错、界面说没有"留缝
             "validate" => return Ok(crate::cmd::validate_json(&self.doc)),
-            "ping" => return Ok(json!({"pong": true, "revision": self.revision})),
+            // `ping` 顺带**自报身份**：判"某个谱面缓存的主人还在不在"要靠它核对
+            // （见 `session::inspect`）——只连得上不够，还得确认那个进程认领的正是这份缓存。
+            "ping" => {
+                return Ok(json!({
+                    "pong": true,
+                    "revision": self.revision,
+                    "pid": std::process::id(),
+                    "exe": codec::container::exe_name(),
+                    "chart": self.path.as_ref().map(|p| p.display().to_string()),
+                    "cacheDir": self.asset_dir.as_ref().map(|p| p.display().to_string()),
+                }))
+            }
             "save" => {
                 let path = c.get("path").and_then(|v| v.as_str()).map(PathBuf::from);
                 let fmt = SaveFormat::parse(c.get("format").and_then(|v| v.as_str()));
@@ -1828,14 +2013,15 @@ impl EditCore {
             // · 事件块的值可以是非数值（`active` 写 `true`/`false`），求值器按 0/1 处理。
             "add_zone" => {
                 let start = c.get("startBeat").map(parse_beat).transpose()?.unwrap_or_else(Beat::zero);
-                // 终点：谱面已有的末端与"起点后 4 拍"取大者 —— **不学 `set_track_constant` 的
-                // `chart_end + 1024`**：那会把 `chart_end` 自己顶高 1024 拍（时间轴跟着变长）。
-                let four = add_beat(start, Beat::new(4, 1)).ok_or("拍数溢出")?;
+                // 终点：`MaskZone::default_span`（谱面末尾与"起点后 4 拍"取大者）——
+                // **不学 `set_track_constant` 的 `chart_end + 1024`**：那会把 `chart_end` 自己
+                // 顶高 1024 拍（时间轴跟着变长）。这条规则与界面的草稿三角共用一份（见 `default_span`）。
+                let (_, default_end) = MaskZone::default_span(start, self.doc.chart_end());
                 let end = c
                     .get("endBeat")
                     .map(parse_beat)
                     .transpose()?
-                    .unwrap_or_else(|| self.doc.chart_end().max(four));
+                    .unwrap_or(default_end);
                 if end <= start {
                     return Err(format!(
                         "endBeat({}) 必须大于 startBeat({})",

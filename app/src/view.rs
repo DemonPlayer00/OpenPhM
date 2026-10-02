@@ -339,7 +339,10 @@ pub struct MaskInspect {
 
 /// 遮蔽区检查器快照。没选中任何区（或一个区都没有）时给 `None`。
 pub fn mask_inspect(st: &EditorState) -> Option<MaskInspect> {
-    let zone = st.selected_zone()?;
+    // 走 `mask_edit_view`：一个区都没有时给的是**草稿区**（用户口径："数量为 0 时也能进入
+    // 遮蔽区编辑，此时有默认的绘制三角形事件"）—— 面板因此不必为"没有区"分一套空状态。
+    let zone = st.mask_edit_view()?;
+    let zone = zone.as_ref();
     let beat = st.chart.tmap.beat(st.playhead);
     let channels = MaskChannel::ALL
         .iter()
@@ -511,10 +514,31 @@ mod tests {
         assert_eq!(ev.start_exact.to_f64(), 8.0);
         assert_eq!(ev.start_value, serde_json::json!(300.0));
         assert_eq!(ev.end_value, serde_json::json!(-100.0));
-        // 没有区 ⇒ 没有快照（右栏该空着）
-        let mut empty = EditorState::new(state::chart_from_doc(&crate::doc::Document::default()));
-        empty.mask_edit = true;
+        // 没有区、也不在遮蔽区编辑模式 ⇒ 没有快照（右栏该空着）
+        let empty = EditorState::new(state::chart_from_doc(&crate::doc::Document::default()));
         assert!(mask_inspect(&empty).is_none());
+    }
+
+    /// **零区草稿**（用户口径："遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件"）：
+    /// 一个区都没有也能进模式，此时面板显示的就是 `add_zone` 会写出来的那块中央正三角形 ——
+    /// 只是它还**不在文档里**（`zones == 0`），用户动一下编辑才 materialize。
+    #[test]
+    fn the_mask_inspector_shows_a_draft_triangle_when_there_are_no_zones() {
+        let mut st = EditorState::new(state::chart_from_doc(&crate::doc::Document::default()));
+        st.mask_edit = true;
+        let mi = mask_inspect(&st).expect("零区 + 编辑模式 ⇒ 草稿区");
+        assert_eq!(mi.zones, 0, "文档里一块区都没有");
+        assert_eq!(mi.channels.len(), 7);
+        for row in &mi.channels {
+            let want = if row.channel == MaskChannel::Active { 0 } else { 1 };
+            assert_eq!(row.events, want, "{}", row.channel.key());
+        }
+        // 草稿三角就是"中央正三角形"：此刻的值 = 常量那三个坐标
+        assert!(mi.state.visible, "六条常量事件从起点就开始 ⇒ 显示");
+        assert!(!mi.state.active, "active 没有事件 ⇒ false（纯色那一档）");
+        assert_eq!(mi.state.v[0], [0.0, 200.0]);
+        assert_eq!(mi.state.v[1], [-173.205, -100.0]);
+        assert!(mi.event.is_none(), "草稿里没有选中的块");
     }
 
     /// 选中轨道没有事件时，`event_edit` 必须为 `None`（否则属性编辑器会显示一条不存在的事件）

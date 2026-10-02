@@ -22,6 +22,7 @@
 //! · [`codec`]  格式编解码（opm 原生 + RPE 导入导出；枚举表以 `spec/*.json` 为单一数据源）
 //! · [`filedialog`] 系统文件对话框（kdialog/zenity）与"在文件管理器中显示"
 //! · [`keymap`]  快捷键的状态规则（空格＝单点切播 / 长按试听，纯逻辑可单测）
+//! · [`digest`] SHA-256（自研、有官方测试向量）：给缓存目录算一个不会撞的键
 //! · [`dirty`]  广播话题 → 面板脏位（唯一映射表；纯函数，有单测）
 //! · [`fps`]    **帧率指示**（底栏那一格）：只统计已经发生的帧、从不主动要求重绘；
 //!   显示值最多每 0.5 秒更新一次（用户口径）
@@ -45,6 +46,7 @@ pub mod control;
 pub mod core;
 pub mod dialog;
 pub mod demo;
+pub mod digest;
 pub mod dirty;
 pub mod edit;
 pub mod doc;

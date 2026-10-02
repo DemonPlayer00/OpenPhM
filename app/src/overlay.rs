@@ -1093,7 +1093,7 @@ pub fn draw(
     //
     // 放在"取选中判定线"**之前**：这个模式下不需要判定线，没有判定线也能编遮蔽区。
     if mask_mode {
-        draw_mask_pane(ui, st, rect, lanes, keys_enabled, &y_of, &beat_of, actions);
+        draw_mask_pane(ui, st, rect, lanes, cfg, &y_of, &beat_of, actions);
         return OverlayOut::default();
     }
 
@@ -1870,13 +1870,16 @@ pub fn draw(
 /// 差别只在数据源与动作：这里发 `Mask*` 动作，调用方翻译成 `*_zone_event` 命令。
 /// 单文件里两套列布局并存是刻意的 —— 判定线那边还挂着多选、组拖动、框选、跨图层合并地址，
 /// 把这些一起泛化会让 3000 行的叠加层多出一层抽象，而收益只是"少写 120 行"。
+///
+/// 它**没有自己的键位**（放块靠双击、删除靠全局 Del），滚轮换算与普通模式**逐字相同** ——
+/// 用户口径："统一两个模式下的滚轮滑动速度"。
 #[allow(clippy::too_many_arguments)]
 fn draw_mask_pane(
     ui: &mut egui::Ui,
     st: &EditorState,
     rect: egui::Rect,
     lanes: egui::Rect,
-    keys_enabled: bool,
+    cfg: &OverlayCfg,
     y_of: &impl Fn(f64) -> f32,
     beat_of: &impl Fn(f32) -> f64,
     actions: &mut Vec<OverlayAction>,
@@ -1885,18 +1888,12 @@ fn draw_mask_pane(
     let tmap = &st.chart.tmap;
     let beat_now = tmap.beat(st.playhead);
     let zone_idx = st.selected_zone;
-    let Some(zone) = st.selected_zone() else {
-        p.text(
-            lanes.center(),
-            egui::Align2::CENTER_CENTER,
-            "还没有遮蔽区 —— 在左边的「遮蔽区」面板里新建一块（工具栏的「遮蔽区」按钮切换本模式）",
-            egui::FontId::monospace(11.0),
-            egui::Color32::from_rgb(220, 170, 170),
-        );
-        // 这一帧没有列可点：仍然吃掉指针（否则点到的是下面的演奏区）
-        ui.interact(rect, egui::Id::new("opm_mask_pane"), egui::Sense::click_and_drag());
+    // 一个区都没有时这里是**草稿区**（`add_zone` 会写出来的那一块）：七列照常画、照常编，
+    // 用户真的动一下编辑才 materialize（用户口径 2026-10-02，见 `App::mask_commands_many`）
+    let Some(zone) = st.mask_edit_view() else {
         return;
     };
+    let zone = zone.as_ref();
 
     let n = MaskChannel::ALL.len();
     let col_w = lanes.width() / n as f32;
@@ -2197,8 +2194,11 @@ fn draw_mask_pane(
         }
     }
 
-    // 滚轮：与普通模式同一件事（滚动 = 改播放头；Ctrl+滚轮 = 缩放）
-    if resp.hovered() && keys_enabled {
+    // 滚轮：**与普通模式逐字相同**（用户口径："统一两个模式下的滚轮滑动速度"）——
+    // 同一个公式、同一个门控（`resp.hovered()`，不额外看 keys_enabled）。
+    // 曾经这里另写了一条 `beats/32*2` 的换算，于是同一个滚轮动作在两个模式下手感不同；
+    // 换算只有一份实现（`scroll_delta_to_beats`），参数也只有一处（`OverlayCfg`）。
+    if resp.hovered() {
         let (dy, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
         if (zoom - 1.0).abs() > 1e-4 {
             actions.push(OverlayAction::ZoomBeats(zoom_delta_to_beats_factor(zoom)));
@@ -2206,7 +2206,7 @@ fn draw_mask_pane(
             actions.push(OverlayAction::ScrollBeats(scroll_delta_to_beats(
                 dy,
                 st.overlay_beats.max(4.0),
-                st.overlay_beats.max(4.0) / 32.0 * 2.0,
+                cfg.scroll_beats_per_notch,
             )));
         }
     }

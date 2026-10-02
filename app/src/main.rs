@@ -180,17 +180,107 @@ enum GuardAction {
 
 /// 「上次没有正常退出」这次要问的是哪一份遗留缓存。
 ///
-/// `others` = 更旧的遗留份数（只报个数：本次只处理最新那份，别的留给用户下次决定）。
+/// 用户口径（2026-10-02）：这个检查**只在"打开一份谱面"时**发生 —— 于是它总是带着
+/// "用户本来要打开的那个路径"：选「丢弃」之后就接着把那份正常打开（而不是把人扔回启动页）。
 #[derive(Clone, Debug)]
 struct ResumeOffer {
     item: opm_app::session::Leftover,
-    others: usize,
+    /// 用户本来要打开的文件（`None` = 没有待办的打开动作，比如从控制通道触发的检查）
+    open: Option<std::path::PathBuf>,
 }
 
 /// 启动耗时探针：把"进程启动 → 首帧画完"之间每一步的**累计**与**本步**耗时打出来。
 ///
 /// 为什么要它：启动慢的原因靠猜十有八九猜错（字体解析？7z 探测？Vulkan 初始化？窗口映射？），
 /// 而这条链路跨了 `main` 与首帧两处，只有打点才能分辨。默认关（`--trace-startup` / `OPM_TRACE_STARTUP=1`）。
+/// `--doc` 这条启动路径：**过一次"打开谱面"的检查**再装载（见 [`opm_app::core::EditCore::open_file`]）。
+///
+/// 三条出口，都是**明确**的：
+/// · 没人在用、也没有遗留 ⇒ 装载（正常路径）；
+/// · 另一份进程正开着它 ⇒ 拒绝启动（两个进程写同一份缓存 = 互相覆盖快照）；
+/// · 上次没退干净（pid 锁没人持、那个 pid 也 ping 不通）⇒ **不静默覆盖那份快照**：
+///   `OPM_RESUME_AUTO=continue|discard` 可以无人值守地走完（与界面弹窗同一套开关），
+///   没给就把三条路（继续 / 丢弃重开 / 不带 `--doc` 启动去界面上选）写出来并退出。
+fn load_doc_at_startup(path: &str) -> core::EditCore {
+    let p = std::path::Path::new(path);
+    let mut c = core::EditCore::new();
+    fn load(c: &mut core::EditCore, path: &str, staged: opm_app::core::Staged) -> bool {
+        match c.load_staged(staged) {
+            Ok(_) => {
+                println!("  已载入文档        : {path}");
+                true
+            }
+            Err(e) => {
+                eprintln!("载入 {path} 失败: {e}");
+                false
+            }
+        }
+    }
+    match opm_app::core::EditCore::open_file(p) {
+        Err(e) => {
+            eprintln!("载入 {path} 失败: {e}");
+            std::process::exit(2);
+        }
+        Ok(opm_app::core::OpenOutcome::Ready(staged)) => {
+            if !load(&mut c, path, *staged) {
+                std::process::exit(2);
+            }
+            c
+        }
+        Ok(opm_app::core::OpenOutcome::Busy { dir, holder }) => {
+            eprintln!(
+                "这份谱面已经在另一个 OpenPhM 里打开着（pid {}，缓存 {}）",
+                holder.pid,
+                dir.display()
+            );
+            eprintln!("先关掉那一个，或改开别的谱面。");
+            std::process::exit(3);
+        }
+        Ok(opm_app::core::OpenOutcome::Crashed { dir, holder }) => {
+            let item = opm_app::session::leftover_of(&dir);
+            match std::env::var("OPM_RESUME_AUTO").ok().as_deref().map(str::trim) {
+                Some("continue") => match c.load_session_into(&dir) {
+                    Ok(_) => {
+                        println!("  已从缓存继续      : {}", dir.display());
+                        c
+                    }
+                    Err(e) => {
+                        eprintln!("从缓存继续失败: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Some("discard") => {
+                    opm_app::session::discard(std::slice::from_ref(&item));
+                    println!("  已丢弃遗留缓存    : {}", dir.display());
+                    match opm_app::core::EditCore::open_file(p) {
+                        Ok(opm_app::core::OpenOutcome::Ready(staged)) => {
+                            if !load(&mut c, path, *staged) {
+                                std::process::exit(2);
+                            }
+                            c
+                        }
+                        other => {
+                            eprintln!("丢掉遗留缓存之后仍然打不开：{other:?}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "缓存 {} 里有上次没退干净的编辑（pid {} 已经不在了）。",
+                        dir.display(),
+                        holder.pid
+                    );
+                    eprintln!("· 继续那份编辑   ：OPM_RESUME_AUTO=continue opm-app --doc {path}");
+                    eprintln!("· 丢掉它重新打开 ：OPM_RESUME_AUTO=discard  opm-app --doc {path}");
+                    eprintln!("· 或者不带 --doc 启动，在界面上选（会显示缓存里的谱面名与改动时间）");
+                    std::process::exit(3);
+                }
+            }
+        }
+    }
+}
+
 struct Trace {
     t0: std::time::Instant,
     last: std::time::Instant,
@@ -317,64 +407,23 @@ fn main() -> eframe::Result<()> {
     }
 
     trace.mark("启动横幅（stdout）");
-    // ---- **单会话**（用户要求：同一时刻最多一个）----
+    // ---- **不再有全局单会话锁**（用户口径 2026-10-02）----
     //
-    // 抢的是解压缓存根目录上的**独占锁**（`<临时目录>/opm/.session.lock`）。为什么必须独占：
-    // 缓存是"一个进程至多留一份、退出即清、切换即删"的东西，两个会话同时跑会互相删对方正在用的
-    // 那份。锁用 `File::try_lock`（Unix `flock` / Windows `LockFileEx`）：**锁随句柄存在**，
-    // 进程被强杀时由内核释放 —— 不需要 pid 存活检测，也不会留下"假的活锁"。
+    // 以前这里抢的是缓存**根目录**上的独占锁（`<临时目录>/opm/.session.lock`），于是同一时刻
+    // 只能开一个 OpenPhM。现在锁落到**每份谱面自己的缓存目录**（`<缓存目录>/lock.pid`，
+    // 见 `opm_app::session`）：读 A 的进程与读 B 的进程互不相干，读**同一份**谱面才互斥
+    // —— 缓存是那份谱面的共享工作副本，两边都写就会互相覆盖未保存的快照。
     //
-    // 抢不到**不等于**放弃：本实例会开一个窗口，用关不掉的模态说清"已经有一个在跑"，
-    // 而**什么都不碰**（不载入文档、不占控制 socket、退出也不清理任何东西）。
-    let cache_root = opm_app::codec::container::cache_root();
-    let mut session_lock = None;
-    let mut busy_who: Option<opm_app::codec::container::Session> = None;
-    match opm_app::session::acquire(&cache_root) {
-        Ok(lock) => {
-            println!("  会话锁            : {}（同一时刻只允许一个会话）", lock.path().display());
-            session_lock = Some(lock);
-        }
-        Err(opm_app::session::Refused::Busy(who)) => {
-            println!("  会话锁            : 已被占用 —— 本实例什么都不碰（见窗口里的提示）");
-            busy_who = Some(who.unwrap_or_default());
-        }
-        Err(opm_app::session::Refused::Io(e)) => {
-            // 保证不了独占就别动缓存（那比"多开一个"更危险）
-            eprintln!("会话锁获取失败: {e}");
-            eprintln!("按「同一时刻只允许一个会话」的约定，本实例不启动。");
-            std::process::exit(4);
-        }
-    }
-    // 上一轮**没退干净**的遗留缓存：只有 GUI 留下的那份才算（`opm-ctl` 的缓存按设计不清理）。
-    // 判定在库 `session` 里（有单测），这里只把结果交给界面。
-    let mut leftovers = Vec::new();
-    if session_lock.is_some() {
-        let unknown = opm_app::session::unidentified(&cache_root);
-        if !unknown.is_empty() {
-            println!("  遗留缓存          : {} 份出处不明（命令行或旧版本留下的），本次不动它们", unknown.len());
-        }
-        leftovers = opm_app::session::gui_leftovers(&cache_root);
-        if let Some(l) = leftovers.first() {
-            println!(
-                "  遗留缓存          : {} 份上次没退干净的（最新：{}）—— 启动时问用户要不要继续",
-                leftovers.len(),
-                l.headline()
-            );
-        }
-    }
-    // 编辑文档：--doc 载入真实 opm 文件，否则按 --notes 生成演示谱面
-    let doc_arg = args.doc.clone().filter(|_| session_lock.is_some() && busy_who.is_none());
+    // 崩溃检查也从这里搬走了（用户口径："不要启动时检查崩溃，而是在打开谱面文件时检查"）：
+    // 启动时不再扫缓存根目录；谁在打开哪份谱面，就在那一刻查那一份（见 `App::open_doc`）。
+    println!(
+        "  解压缓存根目录    : {}（每份谱面一把锁：lock.pid）",
+        opm_app::codec::container::cache_root().display()
+    );
+
+    let doc_arg = args.doc.clone();
     let core0 = match &doc_arg {
-        Some(path) => match core::EditCore::load(std::path::Path::new(path)) {
-            Ok(s) => {
-                println!("  已载入文档        : {path}");
-                s
-            }
-            Err(e) => {
-                eprintln!("载入 {path} 失败: {e}");
-                std::process::exit(2);
-            }
-        },
+        Some(path) => load_doc_at_startup(path),
         None => core::EditCore::new(),
     };
     trace.mark("文档核心就绪（--doc 时含读盘+解析）");
@@ -406,7 +455,7 @@ fn main() -> eframe::Result<()> {
     };
     trace.mark("7z 探测（起一次 `7z i` 真跑一遍）");
     let mut core0 = core0;
-    if doc_arg.is_none() && args.notes > 0 && busy_who.is_none() {
+    if doc_arg.is_none() && args.notes > 0 {
         // 演示谱面也**走命令**（实现在库里 `opm_app::demo`）：文档只有 EditCore 能写，
         // 客户端（GUI/CLI/测试）一律发命令。这条路径此前是"直接改 doc"的最后一块飞地，
         // 现在没了 —— 由私有字段在编译期兜住。
@@ -555,9 +604,9 @@ fn main() -> eframe::Result<()> {
         );
     }
     let mut ctrl_path: Option<std::path::PathBuf> = None;
-    // 已经有会话在跑时不接控制通道：那个 socket 是**已有实例**的（`opm-ctl --attach` 打的就是它），
-    // 这里抢过来会让正在跑的那个失去远程入口
-    if let Some(spec) = args.control.as_ref().filter(|_| session_lock.is_some()) {
+    // 控制通道的 socket 名字里带 **pid**（`opm-<pid>.sock`）⇒ 多个实例各自有各自的入口，
+    // 不再需要"已经有会话在跑时别抢 socket"那条判断（全局单会话锁已经拆掉，见上面）
+    if let Some(spec) = args.control.as_ref() {
         let path = if spec == "auto" {
             control::auto_path()
         } else {
@@ -576,10 +625,7 @@ fn main() -> eframe::Result<()> {
     // 窗口**一开始就是编辑器尺寸**（两页共用），只有标题按启动阶段给：启动页是"选择谱面"，
     // 进了编辑页再换成"曲名（文件）"（见 `enter_editor`）。
     let on_launcher = doc_arg.is_none() && !args.bench_only() && !args.stress;
-    let launch_phase = if busy_who.is_some() {
-        // 被"已经有一个会话"挡住：走的是一屏独立提示（`App::busy_page`），阶段无所谓，但别进编辑页
-        LaunchPhase::StartScreen
-    } else if on_launcher {
+    let launch_phase = if on_launcher {
         LaunchPhase::StartScreen
     } else {
         LaunchPhase::Editor
@@ -587,9 +633,7 @@ fn main() -> eframe::Result<()> {
     let (title, size) = match launch_phase {
         // 缺 7z 时标题直接说明门槛是什么（尺寸仍是启动页那一套：底下那屏照画，只是盖了模态）
         LaunchPhase::StartScreen => (
-            if busy_who.is_some() {
-                "OpenPhM — 已经有一个会话在运行"
-            } else if seven_zip_missing.is_some() {
+            if seven_zip_missing.is_some() {
                 "OpenPhM — 缺少 7-Zip"
             } else {
                 LAUNCH_TITLE
@@ -800,7 +844,7 @@ fn main() -> eframe::Result<()> {
             let t_app = std::time::Instant::now();
             let app = App::new(
                 state, shared, stats, sub, ctx_slot, audio, view, meta_name, doc_lines, doc_notes, a,
-                recents, seven_zip_missing, launch_phase, busy_who, leftovers,
+                recents, seven_zip_missing, launch_phase,
             );
             if trace_on {
                 println!(
@@ -956,10 +1000,11 @@ struct App {
     /// `OPM_RESUME_AUTO=continue|discard|later`：遗留缓存对话框替人做选择（截图/CI 用）。
     /// 与 `launch_auto` 同类 —— **只在启动时读一次**。
     resume_auto: Option<String>,
+    /// 这一帧**问过用户**"那份缓存要不要继续"吗（`launch_page` 靠它避免同一帧做第二个决定）
+    resume_asked: bool,
     /// 「上次没有正常退出」这份待问的遗留缓存（`None` = 没有 / 已经问过）
     resume: Option<ResumeOffer>,
     /// 被"已经有一个会话在运行"挡住时那个持有者的身份（`None` = 没被挡）
-    busy_who: Option<opm_app::codec::container::Session>,
     /// 上次把文档快照写回解压缓存的时刻（节流用；见 `App::maybe_snapshot`）
     snapshot_at: Instant,
     /// 上一次快照失败的原因（**只在变化时报一次**：失败会每两秒重试，不能每两秒刷一行日志）
@@ -1076,11 +1121,10 @@ impl App {
         recents: recents::Recents,
         seven_zip_missing: Option<String>,
         launch_phase: LaunchPhase,
-        // 「已经有一个会话在运行」时那个持有者的身份（`None` = 没被挡住）
-        busy_who: Option<opm_app::codec::container::Session>,
-        // 上次没退干净的遗留缓存（新→旧）；启动页上问用户要不要继续
-        leftovers: Vec<opm_app::session::Leftover>,
     ) -> Self {
+        // 注：以前这里还收「已经有一个会话在运行」的持有者与"启动期遗留缓存"列表 ——
+        // 全局单会话锁拆掉之后（2026-10-02），"有人在用"只在**打开某份谱面**那一刻才有意义
+        // （当场变成一句提示），遗留缓存也改成在那一刻问（见 `App::open_doc`）。
         let args_ws = args.ws.unwrap_or(Workspace::Compose);
         // 顶栏拖动框的初值来自状态（`--window-offset` 已在这一步之前作用于 state）
         let state_window_offset = state.window_offset_x;
@@ -1194,14 +1238,11 @@ impl App {
             // 启动期钩子：遗留缓存对话框怎么选（`continue|discard|later`）—— 与 `OPM_LAUNCH_AUTO`
             // 同类，只在启动时读一次，给 agent 一条"把这一步走完"的路（没人能替它点鼠标）
             resume_auto: std::env::var("OPM_RESUME_AUTO").ok(),
-            resume: {
-                // 新→旧：问最新那份；更旧的那些只报个数（本次不动它们）
-                let mut it = leftovers.into_iter();
-                let first = it.next();
-                let others = it.count();
-                first.map(|item| ResumeOffer { item, others })
-            },
-            busy_who,
+            // **启动时不问任何遗留缓存**（用户口径 2026-10-02：崩溃检查放在打开谱面那一刻）——
+            // 这一格只在"要打开的那份谱面正好有没退干净的编辑"时被填上（见 `App::open_doc`）
+            resume: None,
+            // 帧首的 `resume_step` 会重置它
+            resume_asked: false,
             close_auto: std::env::var("OPM_CLOSE_AUTO")
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok()),
@@ -1539,7 +1580,7 @@ impl App {
                 OverlayAction::MaskDragStart => {
                     if !self.drag_active {
                         self.drag_active = true;
-                        cmds.push(opm_app::edit::begin_command("拖动遮蔽区事件"));
+                        self.mask_materialize(&mut cmds);
                     }
                 }
                 OverlayAction::MaskSetSpan { zone, channel, index, start, end } => {
@@ -1561,13 +1602,15 @@ impl App {
                     }
                 }
                 OverlayAction::MaskPlace { zone, channel, start, end } => {
-                    cmds.push(serde_json::json!({
+                    let one = serde_json::json!({
                         "op": "add_zone_event",
                         "zone": zone,
                         "track": channel.key(),
                         "startBeat": self.state.beat_json(start),
                         "endBeat": self.state.beat_json(end),
-                    }));
+                    });
+                    // 草稿态：先建区再应用，**一个撤销步**（用户口径）
+                    cmds.extend(self.mask_commands_many(vec![one]));
                     self.file_message = Some((
                         true,
                         format!(
@@ -1809,34 +1852,36 @@ impl App {
     /// 两件事不在这一层做：
     /// · **命令怎么拼**（尤其是"同一张表里按下标降序发"这条正确性规则）在 `edit.rs`；
     /// · **哪些下标还算数**由 `EditCore` 判（越界会明确报错，这里不预筛）。
-    /// 在**预览里**画所有可见的遮蔽区（用户口径：三条坐标轨道都没有"已开始"的事件就不显示）。
+    /// 画所有**可见**的遮蔽区（用户口径：三条坐标轨道都没有"已开始"的事件就不显示）。
     ///
-    /// 三条来自用户口径的硬约束（2026-10-02）：
-    /// · **本体属于预览**：它是游戏画面的一部分（跟判定线、音符同层），画在 wgpu 播放区**之上**、
-    ///   编辑区叠加层**之下** —— 编辑区是编辑器 chrome，遮蔽区不是；
-    /// · **在判定线和音符上方**：egui 这一层永远盖在 wgpu 实例之上，所以它天然压住线与音符
-    ///   （游戏里也是如此：这块红区盖住里面的音符）；
-    /// · **不做手柄**：顶点不画可拖的把手（"日后有更好的方案"），坐标靠编辑区的通道列与属性编辑器改。
+    /// 三条硬约束（都是用户口径）：
+    /// · **和 note 等一样显示**：画在编辑区叠加层**之上**（与音符选择框、事件块同层）——
+    ///   编辑器里它是"看得见的数据"，不是被 chrome 压暗的预览；
+    /// · **不对事件响应**（2026-10-02）：没有悬停发光、没有点击选中、顶点也没有手柄 ——
+    ///   它纯粹是画出来的东西；选哪一块、改哪个坐标，走左栏列表 / 属性编辑器 / 通道列；
+    /// · **一个区都没有时**（遮蔽区编辑模式下）画**草稿三角** = `add_zone` 会写出来的那一块，
+    ///   用户动一下编辑才真正建区（见 `mask_commands`）。
     ///
-    /// 唯一与指针有关的是**发光**（用户口径："靠近鼠标的遮蔽区发光"）：它只是读数，
-    /// 不占交互区 —— 所以不会把编辑区通道列上的点击抢走。
-    fn draw_mask_zones(&self, ui: &mut egui::Ui, play_rect: egui::Rect, scale_pts: f32, outline_only: bool) {
-        if self.state.chart.zones.is_empty() {
+    /// 它同时压住 wgpu 播放区里的判定线与音符（egui 这一层永远在上面），与游戏里的观感一致。
+    fn draw_mask_zones(&self, ui: &mut egui::Ui, play_rect: egui::Rect, scale_pts: f32) {
+        // 草稿区（还没进文档的那一块）只在"遮蔽区编辑模式 + 一个区都没有"时存在
+        let draft = (self.state.mask_edit && self.state.chart.zones.is_empty())
+            .then(|| self.state.mask_edit_view())
+            .flatten();
+        let zones: Vec<&opm_app::state::MaskZoneView> = match &draft {
+            Some(z) => vec![z.as_ref()],
+            None => self.state.chart.zones.iter().collect(),
+        };
+        if zones.is_empty() {
             return;
         }
         let center = play_rect.center();
         let rpe_of = |x: f32, y: f32| center + egui::vec2(x * scale_pts, -y * scale_pts);
         let tmap = &self.state.chart.tmap;
         let playhead = self.state.playhead;
-        // 发光只在遮蔽区编辑模式下算：那时"哪一块在等着被编"才是要看的信息
-        let pointer = if self.state.mask_edit {
-            ui.input(|i| i.pointer.hover_pos())
-        } else {
-            None
-        };
+        let red = opm_app::mask::MASK_RED;
         let p = ui.painter();
-        for i in 0..self.state.chart.zones.len() {
-            let Some(zone) = self.state.chart.zones.get(i) else { continue };
+        for zone in zones {
             let st = zone.state(tmap, playhead);
             if !st.visible {
                 continue; // 还没有任何坐标事件 ⇒ 这块区域此刻不存在
@@ -1851,58 +1896,25 @@ impl App {
             if opm_app::mask::triangle_is_degenerate(&tri_px) {
                 continue; // 三个顶点重合/共线：没有可画的东西
             }
-            let glow = pointer
-                .map(|q| {
-                    opm_app::mask::mask_glow(opm_app::mask::point_triangle_distance(
-                        [q.x, q.y],
-                        &tri_px,
-                    ))
-                })
-                .unwrap_or(0.0);
-            let red = opm_app::mask::MASK_RED;
-            let stroke_w = 1.4 + 1.8 * glow;
-            let stroke = egui::Color32::from_rgba_unmultiplied(
+            let style = opm_app::mask::mask_style(st.active);
+            let fill = egui::Color32::from_rgba_unmultiplied(
                 red[0],
                 red[1],
                 red[2],
-                (150.0 + 105.0 * glow) as u8,
+                (style.fill_alpha * 255.0) as u8,
             );
-            // **发光**：先描一圈更宽的半透明轮廓（在填充之下），看起来才像"亮起来了"。
-            // 编辑区叠加层开着时会把预览整体压暗，所以这一圈刻意画粗一点 ——
-            // 压暗之后仍要认得出"哪一块在等你"。
-            if glow > 0.01 {
-                p.add(egui::Shape::closed_line(
-                    pts.clone(),
-                    egui::Stroke::new(
-                        stroke_w + 9.0,
-                        egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], (80.0 * glow) as u8),
-                    ),
-                ));
-            }
-            if outline_only {
-                // 遮蔽区编辑模式在叠加层**之上**补的一遍：**只在指针靠近时**描一圈细轮廓
-                //（"靠近鼠标的遮蔽区发光"就是它），平时一笔都不画 ——
-                // 七列数据是编辑的主体，不能被常驻的 chrome 压住。
-                if glow > 0.01 {
-                    p.add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(stroke_w, stroke)));
-                }
-                continue;
-            }
-            let style = opm_app::mask::mask_style(st.active);
-            let fill_a = ((style.fill_alpha + 0.30 * glow).min(1.0) * 255.0) as u8;
-            let fill = egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], fill_a);
-            p.add(egui::Shape::convex_polygon(pts.clone(), fill, egui::Stroke::new(stroke_w, stroke)));
+            p.add(egui::Shape::convex_polygon(
+                pts.clone(),
+                fill,
+                egui::Stroke::new(1.4, egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], 150)),
+            ));
             // **细网格**（active 那一档）：间距按当前缩放折算，锚在屏幕原点
             // （三角形移动时网格跟着走 —— 网格属于"屏幕"，不属于这块区）
             if style.grid {
                 let step_px = opm_app::mask::MASK_GRID_STEP * scale_pts;
                 let origin_px = rpe_of(0.0, 0.0);
-                let grid_col = egui::Color32::from_rgba_unmultiplied(
-                    red[0].saturating_add(40),
-                    red[1].saturating_add(40),
-                    red[2].saturating_add(40),
-                    (120.0 + 60.0 * glow) as u8,
-                );
+                let grid_col =
+                    egui::Color32::from_rgba_unmultiplied(red[0].saturating_add(40), red[1].saturating_add(40), red[2].saturating_add(40), 120);
                 for seg in opm_app::mask::mask_grid_lines(
                     &tri_px,
                     step_px.max(2.0),
@@ -1915,6 +1927,33 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 遮蔽区编辑模式下**动第一下**时的命令序列。
+    ///
+    /// 用户口径："遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件，
+    /// 当用户执行任意编辑后创建遮蔽区并应用编辑（可撤销）"。
+    /// ⇒ 还没有区时把 `add_zone` 与该条编辑放进**同一个事务**（一次 Ctrl+Z 全回去）；
+    ///   已经有区时原样返回那条编辑。
+    fn mask_commands_many(&self, edits: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        let (start, _) = self.state.mask_new_zone_span();
+        opm_app::edit::zone_draft_edits(self.mask_draft(), start, edits)
+    }
+
+    /// 草稿态下**只建区**（拖动开始用：这一帧还会紧跟着发一条改跨度的命令，
+    /// 两条命令**不能各自建一次区** —— 那会凭空多出一块）
+    fn mask_materialize(&self, cmds: &mut Vec<serde_json::Value>) {
+        let (start, _) = self.state.mask_new_zone_span();
+        cmds.extend(opm_app::edit::zone_draft_begin(
+            self.mask_draft(),
+            start,
+            "拖动遮蔽区事件",
+        ));
+    }
+
+    /// 现在是不是"**草稿态**"：在遮蔽区编辑模式下、而文档里一块区都没有
+    fn mask_draft(&self) -> bool {
+        self.state.mask_edit && self.state.chart.zones.is_empty()
     }
 
     /// 切换**遮蔽区编辑模式**（编辑区整片换形态）。
@@ -1938,7 +1977,9 @@ impl App {
             self.file_message = Some((
                 true,
                 if n == 0 {
-                    "遮蔽区编辑模式：还没有遮蔽区 —— 左栏「遮蔽区」面板里点「新建」".to_owned()
+                    "遮蔽区编辑模式：还没有遮蔽区 —— 编辑区里画的是**默认的中央正三角形**，\
+                     动一下编辑（双击放块 / 属性编辑器）就会先建区再应用，一次 Ctrl+Z 全回去"
+                        .to_owned()
                 } else {
                     format!("遮蔽区编辑模式：当前 #{}（共 {n} 块）", self.state.selected_zone)
                 },
@@ -2341,6 +2382,78 @@ impl App {
     /// 打开一个谱面文件：**按内容判格式**（opm / RPE 都行），走核心的 `load` 命令 ——
     /// 于是 CLI（`--attach` + `{"op":"load"}`）、GUI 按钮、控制台是**同一条路径**。
     fn open_doc(&mut self, path: &str) {
+        // **打开一份谱面时**检查它的缓存归谁（用户口径 2026-10-02："不要启动时检查崩溃，
+        // 而是在打开谱面文件时检查"）——三种情形都在 `EditCore::open_file` 里定：
+        // 能开 / 别人正开着 / 上次没退干净。第三种**不覆盖那份快照**，先问用户。
+        let p = std::path::Path::new(path);
+        match opm_app::core::EditCore::open_file(p) {
+            Err(e) => {
+                self.console_log.push((false, format!("打开失败：{e}")));
+                return;
+            }
+            Ok(opm_app::core::OpenOutcome::Busy { dir, holder }) => {
+                self.console_log.push((
+                    false,
+                    format!(
+                        "这份谱面已经在另一个 OpenPhM 里打开着（pid {}）—— 先关掉那一个再开；缓存：{}",
+                        holder.pid,
+                        dir.display()
+                    ),
+                ));
+                self.file_message = Some((
+                    false,
+                    format!("这份谱面正被另一个 OpenPhM（pid {}）编辑着", holder.pid),
+                ));
+                return;
+            }
+            Ok(opm_app::core::OpenOutcome::Crashed { dir, .. }) => {
+                // 有问题的是**这一份**：把弹窗挂上，并把"用户本来要打开的那个路径"一起带着
+                self.resume = Some(ResumeOffer {
+                    item: opm_app::session::leftover_of(&dir),
+                    open: Some(p.to_path_buf()),
+                });
+                return;
+            }
+            Ok(opm_app::core::OpenOutcome::Ready(staged)) => {
+                let loaded = {
+                    let mut c = self.core.lock().unwrap();
+                    c.load_staged(*staged)
+                };
+                match loaded {
+                    Ok(fid) => {
+                        let (lines, notes) = {
+                            let c = self.core.lock().unwrap();
+                            (c.doc().judge_lines.len(), c.doc().note_count())
+                        };
+                        self.console_log.push((
+                            true,
+                            format!("已打开 {path}（{} 线 / {notes} 音符）", lines),
+                        ));
+                        // 保真度报告：有降级就说出来，别让"能打开"冒充"没丢东西"
+                        if fid.is_lossless() {
+                            self.console_log.push((true, "导入无降级".to_owned()));
+                        } else {
+                            for w in &fid.warnings {
+                                self.console_log.push((false, format!("导入降级：{w}")));
+                            }
+                            self.console_log.push((
+                                false,
+                                format!("共 {} 项降级（其余字段已按原义转换）", fid.warnings.len()),
+                            ));
+                        }
+                        self.after_document_loaded("打开谱面");
+                    }
+                    Err(e) => self.console_log.push((false, format!("打开失败：{e}"))),
+                }
+                return;
+            }
+        }
+    }
+
+    /// 老路径（命令层）：`{"op":"load"}` —— 控制台与 CLI 用它（那边**没有**交互式询问，
+    /// 所以"别人在用 / 上次没退干净"会作为命令错误返回，由调用方决定怎么办）
+    #[allow(dead_code)]
+    fn open_doc_via_command(&mut self, path: &str) {
         let resp = {
             let mut c = self.core.lock().unwrap();
             c.exec(&serde_json::json!({"op": "load", "path": path}))
@@ -3396,29 +3509,89 @@ impl App {
         self.core.lock().map(|c| c.is_dirty() as u8).unwrap_or(2)
     }
 
-    /// **被"已经有一个会话在运行"挡住的那一屏**。
-    ///
-    /// 这一份实例**什么都不碰**：没抢到锁 ⇒ 不载入文档、不占控制 socket、退出也不清理任何缓存
-    /// （清理会删掉正在跑的那个会话的工作副本）。给用户的出口只有"关闭"。
-    fn busy_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.painter()
-            .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_rgb(20, 22, 30));
-        // 模态底下仍照画一屏（模态会把它压暗）：与启动页同一族配色
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.heading("OpenPhM");
-            opm_app::dialog::hint(ui, "这一份没有启动：同一时刻只允许一个会话");
-        });
-        if opm_app::recents::session_busy_modal(ctx, self.busy_who.as_ref()) {
-            self.quit_now(ctx);
-        }
-        self.finish_launch_frame(ctx);
-    }
-
     /// 启动页/阻断页每帧的收尾：自截屏 → 统计 → 帧计数 → 心跳。
     ///
-    /// 抽出来是因为它有三个出口（正常走完、遗留缓存对话框选了"继续"、阻断页），
+    /// 抽出来是因为它有几个出口（正常走完、打开时的"继续上次编辑"选了"继续"），
     /// 少调一个就会出现"截屏永远超时 / 统计不动 / 页面卡住不再重绘"这类难查的毛病。
+
+    /// 「打开这份谱面时发现缓存里有没退干净的编辑」弹窗的**每帧一步**。
+    ///
+    /// 用户口径（2026-10-02）：这个检查发生在**打开谱面**那一刻（不是启动时扫缓存根目录），
+    /// 所以弹窗可能在任何一页上出现（`egui::Modal` 的层级与调用顺序无关）——
+    /// 于是它从 `launch_page` 里抽出来，两页都调。
+    ///
+    /// 返回 `true` = **这一帧问过用户**（调用方别再让别的钩子在同一帧替他做第二个决定）。
+    /// 选"继续"且装载成功时要换页，所以这里顺带把这一帧收尾（`finish_launch_frame` 是页无关的：
+    /// 自截屏 + 统计 + 帧计数 + 心跳）。
+    fn resume_step(&mut self, ctx: &egui::Context) -> bool {
+        // 帧首重置：这一帧问过用户之后，别的启动期钩子不该在同一帧替用户做第二个决定
+        self.resume_asked = false;
+        let Some(offer) = self.resume.clone() else {
+            return false;
+        };
+        self.resume_asked = true;
+        let choice = match self.resume_auto.as_deref().map(str::trim) {
+            // 自动化钩子：没人能替 agent 点这个按钮（与 `OPM_LAUNCH_AUTO` 同类）
+            Some("continue") => Some(opm_app::recents::ResumeChoice::Continue),
+            Some("discard") => Some(opm_app::recents::ResumeChoice::Discard),
+            Some("later") => Some(opm_app::recents::ResumeChoice::Later),
+            Some(other) => {
+                eprintln!("  ⚠️ OPM_RESUME_AUTO：只认 continue/discard/later，收到 {other:?}");
+                opm_app::recents::resume_cache_modal(ctx, &offer.item)
+            }
+            None => opm_app::recents::resume_cache_modal(ctx, &offer.item),
+        };
+        // `None` = 用户还没点：**弹窗继续开着**（帧照画，遮罩把底下那一页压暗）
+        let Some(choice) = choice else {
+            return true;
+        };
+        self.resume = None;
+        match choice {
+            opm_app::recents::ResumeChoice::Continue => {
+                if self.continue_cached(&offer.item.dir) {
+                    self.enter_editor(ctx);
+                } else {
+                    // 继续失败（缓存被外力删了之类）：留在原页，原因已经进了控制台日志
+                    self.file_message = Some((
+                        false,
+                        format!("继续「{}」失败——缓存可能已经被清理掉了", offer.item.name()),
+                    ));
+                }
+                self.finish_launch_frame(ctx);
+            }
+            opm_app::recents::ResumeChoice::Discard => {
+                let (n, freed) = opm_app::session::discard(std::slice::from_ref(&offer.item));
+                self.console_log.push((
+                    true,
+                    format!(
+                        "已丢弃遗留缓存 {n} 份 / {}（谱面文件没动）",
+                        opm_app::session::size_text(freed)
+                    ),
+                ));
+                self.file_message =
+                    Some((true, format!("已丢弃「{}」的遗留缓存", offer.item.name())));
+                // 用户本来就是要打开这份谱面：丢掉缓存之后**接着开**
+                // （老行为是留在启动页 —— 那是"启动时扫描"留下的，现在检查发生在打开动作里）
+                if let Some(p) = offer.open.clone() {
+                    self.open_doc(&p.display().to_string());
+                    self.enter_editor(ctx);
+                    self.finish_launch_frame(ctx);
+                }
+            }
+            opm_app::recents::ResumeChoice::Later => {
+                // "先不动它" = **取消这次打开**（缓存一个字节都不删；下次打开这份谱面再问）
+                self.console_log.push((
+                    true,
+                    format!(
+                        "已取消打开：缓存留着 {}（下次打开这份谱面时会再问）",
+                        offer.item.dir.display()
+                    ),
+                ));
+            }
+        }
+        true
+    }
+
     fn finish_launch_frame(&mut self, ctx: &egui::Context) {
         self.handle_shot(ctx);
         self.publish_stats(&ctx, false);
@@ -3433,65 +3606,9 @@ impl App {
 
     fn launch_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.pump_launch_new(ctx);
-        // 这一帧问过遗留缓存吗（问了就不再让别的启动期钩子在同一帧替用户做第二个决定）
-        let mut asked_this_frame = false;
-        // ---- 「上次没有正常退出」：**先问这个** ----
-        //
-        // 它画在列表之上（`egui::Modal` 自带遮罩并吞掉下层输入），而且**先于**列表处理 Esc ——
-        // 于是这个 Esc 归弹窗（`dialog::modal` 内部 `consume_key`），列表的"跳过直接进编辑器"
-        // 看不见它（这条归属规则在 `dialog` 模块的单测里钉着）。
-        if let Some(offer) = self.resume.clone() {
-            asked_this_frame = true;
-            let choice = match self.resume_auto.as_deref().map(str::trim) {
-                // 自动化钩子：没人能替 agent 点这个按钮（与 `OPM_LAUNCH_AUTO` 同类）
-                Some("continue") => Some(opm_app::recents::ResumeChoice::Continue),
-                Some("discard") => Some(opm_app::recents::ResumeChoice::Discard),
-                Some("later") => Some(opm_app::recents::ResumeChoice::Later),
-                Some(other) => {
-                    eprintln!("  ⚠️ OPM_RESUME_AUTO：只认 continue/discard/later，收到 {other:?}");
-                    opm_app::recents::resume_cache_modal(ctx, &offer.item, offer.others)
-                }
-                None => opm_app::recents::resume_cache_modal(ctx, &offer.item, offer.others),
-            };
-            // `None` = 用户还没点：**弹窗继续开着**（帧照画，遮罩会把底下的启动页压暗）
-            if let Some(choice) = choice {
-                self.resume = None;
-                match choice {
-                    opm_app::recents::ResumeChoice::Continue => {
-                        if self.continue_cached(&offer.item.dir) {
-                            self.enter_editor(ctx);
-                        } else {
-                            // 继续失败（缓存被外力删了之类）：留在启动页，原因已经进了控制台日志
-                            self.file_message = Some((
-                                false,
-                                format!("继续「{}」失败——缓存可能已经被清理掉了", offer.item.name()),
-                            ));
-                        }
-                        // 这一帧到此为止（与列表动作那条路一样要收尾：截屏/统计/帧计数/心跳）
-                        self.finish_launch_frame(ctx);
-                        return;
-                    }
-                    opm_app::recents::ResumeChoice::Discard => {
-                        let (n, freed) = opm_app::session::discard(std::slice::from_ref(&offer.item));
-                        self.console_log.push((
-                            true,
-                            format!(
-                                "已丢弃遗留缓存 {n} 份 / {}（谱面文件没动）",
-                                opm_app::session::size_text(freed)
-                            ),
-                        ));
-                        self.file_message =
-                            Some((true, format!("已丢弃「{}」的遗留缓存", offer.item.name())));
-                    }
-                    opm_app::recents::ResumeChoice::Later => {
-                        self.console_log.push((
-                            true,
-                            format!("遗留缓存留在 {}（下次启动再问）", offer.item.dir.display()),
-                        ));
-                    }
-                }
-            }
-        }
+        // 这一帧问过"那份缓存要不要继续"吗（问了就不再让别的启动期钩子在同一帧替用户做第二个决定）。
+        // 那件事现在是 `resume_step`（帧首、两页共用），这里只读它的回执。
+        let asked_this_frame = self.resume_asked;
         let screen = ui.max_rect();
         let native = filedialog::availability();
         let msg = self.file_message.clone();
@@ -3729,6 +3846,13 @@ impl eframe::App for App {
         // 于是启动页与编辑页共用同一个守卫 —— 关窗不再有"哪一页才有效"的区别。
         self.unsaved_guard(&ctx);
 
+        // 「打开时发现缓存里有没退干净的编辑」：**两页共用**（编辑页里点"打开"也会遇到），
+        // 于是放在这里、而不是某一页的绘制里。选了"继续"要换页 ⇒ 这一帧到此为止。
+        if self.resume_step(&ctx) && self.resume.is_none() && self.phase == LaunchPhase::Editor {
+            self.finish_launch_frame(&ctx);
+            return;
+        }
+
         // ---- 自动化钩子：`OPM_KEY_AUTO=[帧号:]按键[,按键…]` ----
         //
         // 例：`OPM_KEY_AUTO=40:Delete`、`OPM_KEY_AUTO=ctrl+z`。
@@ -3772,13 +3896,6 @@ impl eframe::App for App {
             if injected > 0 {
                 println!("  OPM_KEY_AUTO     : 帧 {} 注入 {injected} 次按键（{spec}）", self.frames);
             }
-        }
-
-        // ---- 「已经有一个会话在运行」：这一份实例什么都不碰，只说明情况 ----
-        // 放在最前面（除退出处理之外）：它不该进编辑页、不该碰缓存、也不该跑任何启动期动作。
-        if self.busy_who.is_some() {
-            self.busy_page(ui, &ctx);
-            return;
         }
 
         // ---- 启动页：**一屏**（谱面列表）+ 盖在它上面的模态 ----
@@ -4586,7 +4703,14 @@ impl eframe::App for App {
             // 写在"调试工作区"分支里 ⇒ 其它工作区改什么都不生效）。拖动类控件用事务包住
             //（松手才 commit），所以"拖一次 = 一个撤销步"。
             let ins_out = inspector::inspector_ui(ui, &self.state, self.insp.as_mut());
-            pending_edits.extend(ins_out.commands);
+            // 遮蔽区面板产出的命令：草稿态（还没有区）下要先建区再应用，一个撤销步。
+            // **只有这一路**这么包 —— 控制台里手打的命令不该顺手建出一块区来。
+            let commands = if ins_out.mask_edits {
+                self.mask_commands_many(ins_out.commands)
+            } else {
+                ins_out.commands
+            };
+            pending_edits.extend(commands);
             // 重叠组里点了某个音符 ⇒ 换选区（**视图**动作，不是文档命令）。
             // 换完立刻重建快照：列表里的"← 当前"与下面那些字段必须当场对上，
             // 否则点了没反应（下一帧才变的界面，用户会当成点空了）。
@@ -4739,9 +4863,6 @@ impl eframe::App for App {
                 },
             ));
 
-            // ---- 遮蔽区**本体**：画在预览里（播放区之上、编辑区之下），两种模式都画 ----
-            self.draw_mask_zones(ui, play_rect, scale_pts, false);
-
             // 边界与判定线的标注（文字与端点标记走 egui，几何线走 wgpu，两者用同一个映射公式）
             // 编辑区开着时不再画窗口文字：两套 chrome 叠在同一角会互相糊掉（边框本身还在）
             if self.state.show_boundary && !self.overlay_visible {
@@ -4826,10 +4947,8 @@ impl eframe::App for App {
                 self.state.set_note_stack(Vec::new());
             }
 
-            // ---- 遮蔽区编辑模式：在叠加层**之上**补一遍细轮廓（只描边，不盖数据、不做手柄）----
-            if self.state.mask_edit {
-                self.draw_mask_zones(ui, play_rect, scale_pts, true);
-            }
+            // ---- 遮蔽区：**和 note 等一样显示**（画在编辑区之上，两种模式都画、不对事件响应）----
+            self.draw_mask_zones(ui, play_rect, scale_pts);
 
             // 对齐自检：用与着色器相同的映射公式，把同一批 RPE 坐标画成十字。
             // 若自研管线的方块与这些十字重合，说明 viewport 映射在任意缩放/布局下都正确。

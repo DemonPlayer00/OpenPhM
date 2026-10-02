@@ -1,90 +1,154 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 DemonPlayer
-//! **单会话**（同一时刻只允许一个 OpenPhM）与「上次没退干净」的判定。
+//! **每份谱面一把锁**（`<缓存目录>/lock.pid`）与「上次没退干净」的判定。
 //!
-//! 两件事是同一个问题的两面：解压缓存目录是**进程独占**的（一个进程至多留一份，退出即清），
-//! 所以 ①两个会话同时跑会互相删对方的缓存（`prune_cache` 与退出清理都会动手），
-//! ②一个**没人清理**的缓存目录 = 上一个进程被强杀或崩溃留下的。
+//! 历史（2026-10-02 改）：原先是**全局单会话**（`<临时目录>/opm/.session.lock`），
+//! 同一时刻只允许一个 OpenPhM。用户口径改成："支持不同进程读取不同谱面" ——
+//! 于是锁落到**每份谱面自己的缓存目录**上：读 A 的进程与读 B 的进程互不相干，
+//! 而**读同一份谱面**的两个进程仍然互斥（缓存目录是共享工作副本，两边都写就互相覆盖快照）。
 //!
-//! 判据全部来自**文件系统**，不写 pid 文件里那种"谁死谁活"的猜测：
+//! 崩溃判定（用户口径）：**只在打开谱面时**检查（不是启动时扫缓存根目录），
+//! 判据是"**谱面文件夹存在** ∧ **pid 锁的持有者 ping 不通**"：
 //!
-//! - **独占**用 [`std::fs::File::try_lock`]（Unix `flock` / Windows `LockFileEx`）：
-//!   锁随**句柄**存在，进程被杀时由内核释放 —— 于是"锁没人拿"与"进程已经不在"是同一件事，
-//!   不需要 pid 存活检测，也不会有"上次崩溃留下一个假的 pid 文件"这种自欺。
-//! - **出处**用每个缓存目录里的 `session.json`（见 [`crate::codec::container::Session`]）：
-//!   只有进程名是 `opm-app` 的才算"GUI 上次没退干净"；`opm-ctl` 的缓存按设计不清理。
+//! - 先看 `lock.pid` 在不在 —— 不在就没人认领过这份缓存（`Free`）；
+//! - 再用 [`std::fs::File::try_lock`]（Unix `flock` / Windows `LockFileEx`）问一句
+//!   "锁还在手上吗"：**锁随句柄存在**，进程被杀时由内核释放，所以"锁没人持"与
+//!   "那个进程已经不在"在绝大多数情况下是同一件事；
+//! - 最后**ping** 一下那个 pid 的控制通道（[`crate::control::ping`]）：锁没人持但它还应答，
+//!   说明它（或它的另一份缓存句柄）还在 ⇒ 也算占着。反过来，锁没人持、ping 也不通
+//!   ⇒ 认定**崩溃遗留**，问用户要不要继续上次的编辑。
 //!
-//! 于是启动顺序是：**先抢锁**（抢不到 = 已经有会话在跑，本实例什么都不碰就退出）→
-//! 再扫缓存根目录（还躺着的 GUI 目录 = 崩溃遗留，问用户要不要继续）。
+//! **不做"pid 存活检测"**：pid 会被复用，`/proc/<pid>` 存在说明不了什么；
+//! 锁 + ping 这两条都是"对方自己给的证据"。
 
 use std::path::{Path, PathBuf};
 
 use crate::codec::container::{self, CacheDir, Session};
 
-/// 锁文件的名字（放在缓存根目录`<临时目录>/opm`里；**不是目录**，所以扫描缓存时不会被当成一份谱面）
-pub const LOCK_NAME: &str = ".session.lock";
+/// 锁文件的名字（放在**该谱面的缓存目录里**，与 `opm.json` 同级）
+pub const LOCK_NAME: &str = "lock.pid";
 
-/// 拿到的独占会话锁。**持有它**就是"我是唯一的会话"；随 `Drop`（进程退出/被杀）由内核释放。
-pub struct Lock {
-    /// 句柄必须活着 —— 锁跟着它走（`File` 一关，锁就没了）
+/// ping 的等待上限：判据要快（打开文件时同步做），而本机 socket 的往返在微秒级
+pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 一份缓存目录的锁实体（同一个进程里**再认领一次**时共享它）
+struct LockEntry {
+    /// 句柄必须活着 —— 锁跟着它走（`File` 一关，锁就没了）。
+    /// 它**只被"活着"这件事用到**（读都不读），所以名字带下划线：别让读者以为它还有别的用途。
     _file: std::fs::File,
-    path: PathBuf,
+    dir: PathBuf,
 }
 
-impl Lock {
+/// **进程内**已认领的缓存目录（`dir → Weak<LockEntry>`）。
+///
+/// 为什么需要它：同一个进程里可以有多个 [`crate::core::EditCore`]（测试、CLI 批处理都这样），
+/// 而 `flock` 是**按打开文件描述**算的 —— 已经拿着的锁再用一个新 fd 去 `try_lock` 会 `WouldBlock`，
+/// 于是"自己占着自己的目录"会被判成"别人占着"。这里让第二次认领**共享同一个实体**
+/// （`try_clone` 出的 fd 与原 fd 属于同一个打开文件描述，锁是同一把）。
+///
+/// `Weak` 而不是 `Arc`：最后一个 `ChartLock` 一掉，条目就没了（
+/// 否则锁会一直挂在进程里，退出前再也不释放）。
+fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<LockEntry>>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<LockEntry>>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 拿到的**谱面缓存独占锁**。**持有它**就是"这份缓存归我写"；随 `Drop`（进程退出/被杀）由内核释放。
+pub struct ChartLock {
+    /// 共享的实体：同一个进程里的第二次认领拿的是同一份（见 [`registry`]）
+    _entry: std::sync::Arc<LockEntry>,
+    path: PathBuf,
+    /// 是不是**这一次**调用真的去抢了内核锁（复用时为 false，只为日志/诊断）
+    freshly_acquired: bool,
+}
+
+impl ChartLock {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    /// 这份锁看管的缓存目录（打开谱面时告诉用户"哪一份"）
+    pub fn dir(&self) -> &Path {
+        &self._entry.dir
+    }
+    /// 这一次是**新抢到**的，还是"本进程已经拿着、复用"的（诊断用）
+    pub fn is_fresh(&self) -> bool {
+        self.freshly_acquired
+    }
+    /// 这份缓存是不是**本进程**在写（`inspect` 用它区分"别人占着"与"我自己占着"）
+    pub fn is_mine(dir: &Path) -> bool {
+        registry()
+            .lock()
+            .map(|m| m.get(dir).is_some_and(|w| w.strong_count() > 0))
+            .unwrap_or(false)
     }
 }
 
 /// 只打路径：`File` 的 Debug 会带上句柄与内部状态，对日志没意义
-impl std::fmt::Debug for Lock {
+impl std::fmt::Debug for ChartLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Lock").field("path", &self.path).finish_non_exhaustive()
+        f.debug_struct("ChartLock")
+            .field("dir", &self._entry.dir)
+            .finish_non_exhaustive()
     }
 }
 
 /// 抢锁失败的原因
 #[derive(Clone, Debug)]
 pub enum Refused {
-    /// 已经有会话在跑。里面是它的身份（从锁文件读出来的；读不到就是 `None`）
-    Busy(Option<Session>),
-    /// 连锁文件都开不了（临时目录不可写之类）—— 这是**真错误**，不是"有人在用"。
-    /// 按"只允许一个会话"的契约，这时候也**不该继续**：保证不了独占，就别动缓存。
+    /// 这份谱面已经有会话在跑。里面是它的身份（从锁文件读出来的）
+    Busy(Session),
+    /// 连锁文件都开不了（目录不可写之类）—— 这是**真错误**，不是"有人在用"。
+    /// 保证不了独占就别动缓存：把别人的工作副本搅了比"打不开"严重得多。
     Io(String),
 }
 
 /// 锁文件路径
-pub fn lock_path(root: &Path) -> PathBuf {
-    root.join(LOCK_NAME)
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join(LOCK_NAME)
 }
 
-/// **抢会话锁**。成功 ⇒ 本进程是唯一的会话；失败 ⇒ 别碰缓存（见 [`Refused`]）。
+/// **抢这份谱面缓存的锁**。成功 ⇒ 本进程可以写它；失败 ⇒ 别碰（见 [`Refused`]）。
 ///
-/// 成功后把自己的身份写进锁文件：第二个实例要靠它说清"谁在占着"（只给人看，不参与判定）。
-pub fn acquire(root: &Path) -> Result<Lock, Refused> {
-    std::fs::create_dir_all(root)
-        .map_err(|e| Refused::Io(format!("建缓存根目录失败 {}: {e}", root.display())))?;
-    let path = lock_path(root);
+/// 成功后把自己的身份写进锁文件（pid/进程名/来源/时间）：① 第二个实例要靠它说清"谁在占着"；
+/// ② 崩溃之后它就是"上次是谁、在为哪个谱面摊的这份缓存"——继续编辑对话框读的正是它。
+pub fn acquire(dir: &Path, source: Option<&str>) -> Result<ChartLock, Refused> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Refused::Io(format!("建缓存目录失败 {}: {e}", dir.display())))?;
+    let path = lock_path(dir);
+    // 本进程已经认领过这一份 ⇒ 复用（`flock` 认的是打开文件描述，再开一个 fd 去抢会被拒）
+    if let Some(entry) = registry()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(dir).and_then(std::sync::Weak::upgrade))
+    {
+        return Ok(ChartLock { _entry: entry, path, freshly_acquired: false });
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| Refused::Io(format!("打开会话锁失败 {}: {e}", path.display())))?;
+        .map_err(|e| Refused::Io(format!("打开谱面锁失败 {}: {e}", path.display())))?;
     match file.try_lock() {
         Ok(()) => {
             let me = Session {
                 pid: std::process::id(),
                 exe: container::exe_name(),
+                source: source.map(str::to_owned),
                 started: container::now_secs(),
                 ..Default::default()
             };
             let _ = write_holder(&file, &me); // 写失败不影响独占性（锁已经在手上）
-            Ok(Lock { _file: file, path })
+            let entry = std::sync::Arc::new(LockEntry { _file: file, dir: dir.to_path_buf() });
+            if let Ok(mut m) = registry().lock() {
+                m.insert(dir.to_path_buf(), std::sync::Arc::downgrade(&entry));
+            }
+            Ok(ChartLock { _entry: entry, path, freshly_acquired: true })
         }
-        Err(std::fs::TryLockError::WouldBlock) => Err(Refused::Busy(holder(root))),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Refused::Busy(holder(dir).unwrap_or_default())),
         Err(std::fs::TryLockError::Error(e)) => {
             Err(Refused::Io(format!("对 {} 加锁失败: {e}", path.display())))
         }
@@ -92,8 +156,8 @@ pub fn acquire(root: &Path) -> Result<Lock, Refused> {
 }
 
 /// 锁文件里那份身份（谁在占着）。读不到 ⇒ `None`。
-pub fn holder(root: &Path) -> Option<Session> {
-    container::read_session_file(&lock_path(root))
+pub fn holder(dir: &Path) -> Option<Session> {
+    container::read_session_file(&lock_path(dir))
 }
 
 /// 把身份写进**已经打开的**锁文件（截断重写；锁句柄不换，锁不会掉）
@@ -107,7 +171,114 @@ fn write_holder(file: &std::fs::File, s: &Session) -> Result<(), String> {
     f.flush().map_err(|e| format!("刷新锁文件失败: {e}"))
 }
 
+/// 那把锁现在**被持有**吗（修剪缓存时也要问：**不许删别人正拿着的目录**）（内核事实：`try_lock` 拿不到就是有人拿着）。
+///
+/// 注意"拿得到"这一支会**立刻放掉**（文件句柄在这里析构）—— 这个函数只问一句，不占锁。
+pub(crate) fn lock_is_held(dir: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(lock_path(dir)) else {
+        return false; // 文件没了/开不了：没人持
+    };
+    match file.try_lock() {
+        Ok(()) => false, // 拿到了 ⇒ 没人持（句柄随后析构，锁随之释放）
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+/// 那个持有者还**应答**吗（连它的控制通道问一句 ping，核对 pid）
+fn holder_answers(h: &Session) -> bool {
+    if h.pid == 0 || h.pid == std::process::id() {
+        return false; // 没有 pid 可问；自己问自己没有意义（锁没持有时这种情况说明状态不对）
+    }
+    ping_at(&crate::control::path_for_pid(h.pid), h.pid)
+}
+
+/// 在**给定路径**上 ping 指定 pid（`holder_answers` 的可测版本：socket 路径由调用方给，
+/// 于是测试不必去改 `XDG_RUNTIME_DIR` 那种进程级全局状态）
+fn ping_at(path: &Path, pid: u32) -> bool {
+    match crate::control::ping(path, PING_TIMEOUT) {
+        Ok(v) => v
+            .get("result")
+            .and_then(|r| r.get("pid"))
+            .and_then(|p| p.as_u64())
+            .is_some_and(|got| got == pid as u64),
+        Err(_) => false,
+    }
+}
+
+/// **打开一份谱面之前**：这份缓存目录的处境
+#[derive(Clone, Debug, PartialEq)]
+pub enum CacheState {
+    /// 目录不存在 / 没有 `lock.pid` / 旧版本留下但没有未保存改动 ⇒ 没有别人，也没有可恢复的东西
+    Free,
+    /// 有活着的会话占着（锁被持有，或那个 pid 还应答）
+    Busy {
+        holder: Session,
+        /// 占着它的是**本进程自己**（同一个进程里可以有多个 `EditCore`：测试与批处理都这样）
+        mine: bool,
+    },
+    /// 有 pid 锁、但**锁没人持且那个 pid ping 不通** ⇒ 崩溃遗留（用户口径的判据）
+    Crashed(Session),
+}
+
+impl CacheState {
+    pub fn is_free(&self) -> bool {
+        matches!(self, CacheState::Free)
+    }
+    pub fn holder(&self) -> Option<&Session> {
+        match self {
+            CacheState::Free => None,
+            CacheState::Busy { holder, .. } => Some(holder),
+            CacheState::Crashed(h) => Some(h),
+        }
+    }
+}
+
+/// 判一份缓存目录的处境（**纯查询**，不写任何东西；见 [`CacheState`] 与模块头）。
+///
+/// 旧版本留下的目录（有 `session.json`、没有 `lock.pid`）也认：
+/// GUI 会话 + **未保存改动**时算 `Crashed`（否则那些改动会在下次打开时被静默覆盖）；
+/// 其余一律 `Free`。
+pub fn inspect(dir: &Path) -> CacheState {
+    match holder(dir) {
+        Some(h) => {
+            // "占着"的两条证据：内核锁还在手上（`flock`），或者那个 pid 还应答 ping。
+            // `mine` 只说明"占用者是自己" —— 同一个进程里可以有多个 `EditCore`，调用方据此
+            // 区分"接管自己的"与"别人正开着"（见 `core::claim_blocker`）。
+            let mine = ChartLock::is_mine(dir) && h.pid == std::process::id();
+            if lock_is_held(dir) || holder_answers(&h) {
+                CacheState::Busy { holder: h, mine }
+            } else {
+                CacheState::Crashed(h)
+            }
+        }
+        None => {
+            // 没有 pid 锁的旧缓存：只在"GUI 留下 + 有未保存改动"时当成崩溃遗留
+            match container::read_session(dir) {
+                Some(s) if s.is_gui() && s.has_unsaved() => CacheState::Crashed(s),
+                _ => CacheState::Free,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 遗留缓存
+
+/// **某一份缓存目录**的处境快照（打开谱面时"要不要问用户"用的就是它）。
+///
+/// 与 [`gui_leftovers`]（扫根目录，用于"启动时把所有遗留列出来"那条旧路）不同：
+/// 它只回答**这一份**，而且不需要目录里有 `session.json` —— 判据是 pid 锁。
+pub fn leftover_of(dir: &Path) -> Leftover {
+    match container::cache_dir_of(dir) {
+        Some(c) => Leftover::of(c),
+        None => Leftover {
+            dir: dir.to_path_buf(),
+            session: holder(dir).or_else(|| container::read_session(dir)),
+            bytes: container::dir_bytes(dir),
+            age_secs: 0,
+        },
+    }
+}
 
 /// 缓存根目录里**还躺着**的一份解压缓存
 #[derive(Clone, Debug)]
@@ -195,23 +366,9 @@ impl Leftover {
     }
 }
 
-/// GUI 会话留下的缓存（**启动时该问用户的那些**），新→旧
-pub fn gui_leftovers(root: &Path) -> Vec<Leftover> {
-    container::cache_dirs(root)
-        .into_iter()
-        .map(Leftover::of)
-        .filter(Leftover::is_gui)
-        .collect()
-}
-
-/// 出处不明的缓存目录（旧版本、命令行、或摊到一半就被杀）：**只在日志里报一句**，不打断用户
-pub fn unidentified(root: &Path) -> Vec<Leftover> {
-    container::cache_dirs(root)
-        .into_iter()
-        .map(Leftover::of)
-        .filter(|l| l.session.is_none())
-        .collect()
-}
+// 注：这里曾有 `gui_leftovers` / `unidentified`（扫缓存根目录，列出所有那次没退干净的会话）——
+// 用户口径改成"崩溃检查放在打开谱面那一刻"之后，那条路没有了：现在只查**正在打开的那一份**
+// （[`inspect`] + [`leftover_of`]）。留着扫全根目录的 API 只会让人再写一次启动期检查。
 
 /// 丢掉这些遗留缓存（**只删目录**，锁文件与根目录不动）
 pub fn discard(items: &[Leftover]) -> (usize, u64) {
@@ -249,96 +406,169 @@ mod tests {
 
     // 临时目录助手：实现搬到 `testkit`（`codec::container` 那边也有一份一模一样的）
     use crate::testkit::tmp_dir as tmp;
+    use container::extract_dir_in;
 
-    /// 缓存目录（带一份会话元数据）；`exe` 决定它算谁的
-    fn cache_dir(root: &Path, key: &str, exe: &str, dirty: bool) -> PathBuf {
-        let d = container::extract_dir_in(root, key);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join(container::CHART_NAME), b"{}").unwrap();
-        container::write_session(
-            &d,
-            &Session {
-                pid: 4242,
-                exe: exe.to_owned(),
+    /// **同一份谱面、同一进程**：再认领一次是**复用**（不是第二次抢锁 —— `flock` 认打开文件描述，
+    /// 自己再抢一次会被拒，于是"自己占着自己的目录"会被误判成"别人占着"）。
+    #[test]
+    fn re_claiming_the_same_chart_in_one_process_is_reuse() {
+        let root = tmp("lock");
+        let dir = extract_dir_in(&root, "chart-a");
+        let first = acquire(&dir, Some("/charts/a.opm")).expect("第一次");
+        assert!(first.is_fresh(), "第一次是真抢到");
+        let second = acquire(&dir, Some("/charts/a.opm")).expect("同进程再认领要复用");
+        assert!(!second.is_fresh(), "第二次是复用");
+        assert!(ChartLock::is_mine(&dir), "这份缓存是本进程在写");
+        assert_eq!(first.path(), lock_path(&dir));
+        assert_eq!(first.dir(), dir);
+        drop(second);
+        assert!(ChartLock::is_mine(&dir), "还留着一个句柄 ⇒ 仍然算我的");
+        drop(first);
+        assert!(!ChartLock::is_mine(&dir), "全放掉之后就不是我的了");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// **同一个进程之外**：锁被持有、而锁文件里写的是别的 pid ⇒ `inspect` 判 Busy
+    /// （`EditCore::stage_into_cache` 就是靠它拒绝"两个人写同一份缓存"的）。
+    #[test]
+    fn a_chart_held_by_another_pid_reads_as_busy() {
+        let root = tmp("lock-other");
+        let dir = extract_dir_in(&root, "chart-a");
+        let lock = acquire(&dir, Some("/charts/a.opm")).expect("拿到锁");
+        // 把身份改成"别的进程"（锁本身还在我们手上 —— 模拟"另一个进程正拿着它"）
+        std::fs::write(
+            lock_path(&dir),
+            serde_json::to_vec(&Session {
+                pid: std::process::id().wrapping_add(1),
+                exe: "opm-app".to_owned(),
                 source: Some("/charts/a.opm".to_owned()),
-                format: "opm 容器".to_owned(),
-                name: "朝色の紙飛行機".to_owned(),
-                started: container::now_secs().saturating_sub(120),
-                snapshot: container::now_secs().saturating_sub(30),
-                dirty,
-            },
+                ..Default::default()
+            })
+            .unwrap(),
         )
         .unwrap();
-        d
-    }
-
-    /// **同一个时刻只能有一个会话**：第二个 `acquire` 被拒，并说得出是谁在占着
-    #[test]
-    fn the_second_session_is_refused() {
-        let root = tmp("lock");
-        let first = acquire(&root).expect("第一个会话该拿到锁");
-        assert_eq!(first.path(), lock_path(&root));
-        match acquire(&root) {
-            Err(Refused::Busy(Some(who))) => {
-                assert_eq!(who.pid, std::process::id(), "锁文件里写的是持有者自己的身份");
-                assert!(!who.exe.is_empty(), "锁文件里该写下进程名（第二个实例要靠它说清是谁）");
+        match inspect(&dir) {
+            CacheState::Busy { holder, mine } => {
+                assert_eq!(holder.pid, std::process::id().wrapping_add(1));
+                assert!(!mine, "不是自己占的");
             }
-            other => panic!("第二个会话必须被拒：{other:?}"),
+            other => panic!("别人拿着锁 ⇒ Busy，得到 {other:?}"),
         }
-        // 释放之后又能拿到（**锁随句柄**：被强杀的进程也一样会被内核放掉）
-        //
-        // 注意：`drop` 之后**不一定立刻**能拿到。`flock` 属于**打开文件描述**，而进程 fork 出来的
-        // 子进程（同一进程里并行的别的用例正起着 7z / `sh`）在 exec 之前短暂持有同一份描述的副本
-        // ⇒ 锁要等那个子进程 exec（fd 带 CLOEXEC，随即关掉）才真的放开。实测：147 个用例并行跑时
-        // 大约每十几次复现一次 `Busy`。所以这里重试到 1 秒 —— 断言的仍是"会放开"，不是"立刻放开"。
-        drop(first);
-        let mut again = acquire(&root);
-        for _ in 0..20 {
-            if again.is_ok() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            again = acquire(&root);
-        }
-        assert!(again.is_ok(), "释放之后该能重新拿到：{again:?}");
+        drop(lock);
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// 遗留缓存：只挑 **GUI** 留下的那份；命令行/无出处的都不问用户
+    /// **不同谱面互不影响**（用户口径 2026-10-02："支持不同进程读取不同谱面"）——
+    /// 每份谱面一个缓存目录、一把锁，两个会话可以同时开着各自那份
     #[test]
-    fn only_gui_leftovers_are_offered() {
-        let root = tmp("leftover");
-        let gui = cache_dir(&root, "aaa", "opm-app", true);
-        cache_dir(&root, "bbb", "opm-ctl", false);
-        std::fs::create_dir_all(root.join("ccc")).unwrap(); // 无 session.json：出处不明
-        std::fs::write(root.join(LOCK_NAME), b"{}").unwrap(); // 锁文件不是缓存
-
-        let offered = gui_leftovers(&root);
-        assert_eq!(offered.len(), 1, "只问 GUI 留下的");
-        let l = &offered[0];
-        assert_eq!(l.dir, gui);
-        assert_eq!(l.name(), "朝色の紙飛行機");
-        assert!(!l.source_exists(), "路径不存在：那是测试编的");
-        assert!(l.headline().contains("朝色"), "抬头要点出是哪份谱面：{}", l.headline());
-        let text = l.details().join("\n");
-        assert!(text.contains("未保存的改动"), "有未保存改动必须说清楚：{text}");
-        assert!(text.contains("已经不在了"), "原文件不在也要说清楚：{text}");
-        assert_eq!(unidentified(&root).len(), 1, "无出处的只在日志里报一句");
-        assert_eq!(discard(&offered).0, 1);
-        assert!(!gui.exists() && root.join("bbb").exists(), "只删被丢弃的那份");
-        assert!(root.join(LOCK_NAME).exists(), "锁文件不是缓存，别删");
+    fn different_charts_do_not_block_each_other() {
+        let root = tmp("lock-many");
+        let a = extract_dir_in(&root, "chart-a");
+        let b = extract_dir_in(&root, "chart-b");
+        let la = acquire(&a, Some("/charts/a.opm")).expect("A 的锁");
+        let lb = acquire(&b, Some("/charts/b.opm")).expect("B 的锁");
+        assert_ne!(la.path(), lb.path());
+        assert!(matches!(inspect(&a), CacheState::Busy { .. }), "A 被自己占着");
+        assert!(matches!(inspect(&b), CacheState::Busy { .. }), "B 被自己占着");
+        drop(la);
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// 没有未保存改动时，正文不许说成"有改动"（说反了会让人不敢丢弃）
+    /// `inspect` 的三种判决：没有锁文件 = Free；锁被持有 = Busy；
+    /// **有 pid 锁、锁没人持、那个 pid 也 ping 不通 = Crashed**（用户口径的判据）
     #[test]
-    fn details_do_not_claim_unsaved_changes() {
-        let root = tmp("clean");
-        cache_dir(&root, "aaa", "opm-app", false);
-        let l = &gui_leftovers(&root)[0];
-        let text = l.details().join("\n");
-        assert!(!text.contains("未保存的改动"), "{text}");
-        assert!(text.contains("一致"), "{text}");
+    fn inspect_verdicts_follow_the_lock_and_the_ping() {
+        let root = tmp("inspect");
+        let free = extract_dir_in(&root, "free");
+        std::fs::create_dir_all(&free).unwrap();
+        assert_eq!(inspect(&free), CacheState::Free, "没有锁文件 ⇒ Free");
+
+        // 别人拿着锁 ⇒ Busy
+        let held = extract_dir_in(&root, "held");
+        let lock = acquire(&held, Some("/charts/held.opm")).unwrap();
+        match inspect(&held) {
+            CacheState::Busy { mine, .. } => assert!(mine, "把自己占着的认成自己"),
+            other => panic!("锁被持有 ⇒ Busy，得到 {other:?}"),
+        }
+        drop(lock);
+
+        // 锁没人持、pid 又不可能存在 ⇒ Crashed（这就是"崩溃遗留"）
+        let dead = extract_dir_in(&root, "dead");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(
+            lock_path(&dead),
+            serde_json::to_vec(&Session {
+                pid: 4_000_000_000,
+                exe: "opm-app".to_owned(),
+                started: container::now_secs().saturating_sub(600),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        match inspect(&dead) {
+            CacheState::Crashed(h) => assert_eq!(h.pid, 4_000_000_000),
+            other => panic!("锁没人持 + ping 不通 ⇒ 崩溃遗留，得到 {other:?}"),
+        }
+
+        // 旧版本留下的目录（有 session.json、没有 lock.pid）：GUI + 未保存改动才算崩溃遗留
+        let legacy = extract_dir_in(&root, "legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let s = Session {
+            pid: 4242,
+            exe: "opm-app".to_owned(),
+            name: "旧缓存".to_owned(),
+            dirty: true,
+            ..Default::default()
+        };
+        container::write_session(&legacy, &s).unwrap();
+        assert!(matches!(inspect(&legacy), CacheState::Crashed(_)), "旧缓存 + 脏 ⇒ 也算遗留");
+        container::write_session(&legacy, &Session { dirty: false, ..s }).unwrap();
+        assert_eq!(inspect(&legacy), CacheState::Free, "旧缓存 + 干净 ⇒ 不值得问");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// **锁没人持但那个 pid 还应答 ⇒ 仍然算在用**（ping 这一道的意义：
+    /// 锁可能因为"目录被重建/换过 inode"而看起来没人持，而进程其实还开着那份谱面）。
+    ///
+    /// 这条同时把 `control::ping` 端到端跑了一遍（起一个假的控制通道，连上去问 ping）。
+    #[cfg(unix)]
+    #[test]
+    fn a_holder_that_still_answers_ping_counts_as_alive() {
+        use std::io::{BufRead, BufReader, Write};
+        let root = tmp("ping");
+        let sock = root.join("fake.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("绑一个假控制通道");
+        let me = std::process::id();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = writeln!(stream, "{{\"ok\":true,\"op\":\"hello\",\"result\":{{\"pid\":{me}}}}}");
+                let _ = stream.flush();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_ok() {
+                    let _ = writeln!(
+                        stream,
+                        "{{\"ok\":true,\"op\":\"ping\",\"result\":{{\"pong\":true,\"pid\":{me}}}}}"
+                    );
+                    let _ = stream.flush();
+                }
+            }
+        });
+        assert!(ping_at(&sock, me), "假控制通道应答了 ping ⇒ 算活着");
+        assert!(!ping_at(&sock, me + 1), "应答里的 pid 对不上 ⇒ 不算");
+        // 没有监听者的路径：连不上 ⇒ 不通（判"崩溃"的那一半）
+        assert!(!ping_at(&root.join("nobody.sock"), me));
+        let _ = server.join();
+        // `inspect` 在"锁没人持 + ping 不通"时给 Crashed —— 与上面那条测试合起来就是完整判据
+        let dir = extract_dir_in(&root, "d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            lock_path(&dir),
+            serde_json::to_vec(&Session { pid: 4_000_000_000, ..Default::default() }).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(inspect(&dir), CacheState::Crashed(_)));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -301,6 +301,13 @@ pub fn prune_cache(root: &Path, cap: u64) -> (usize, u64) {
     let mut removed = 0usize;
     let mut freed = 0u64;
     for (_, path, bytes) in entries {
+        // **别人正拿着的目录一个都不删**（2026-10-02：每份谱面一把锁之后，
+        // 修剪有可能删掉另一个进程正在用的工作副本 —— 它的锁文件随之消失，
+        // 于是第三个进程会以为"没人认领"而重新摊一份，两边各写各的）
+        if crate::session::lock_is_held(&path) {
+            kept += bytes;
+            continue;
+        }
         if kept + bytes <= cap {
             kept += bytes;
             continue;
@@ -333,9 +340,27 @@ pub fn extract_container_into(
     Ok(out)
 }
 
-/// 缓存 key：容器内容的 hash（同样的包落到同一个目录，省得反复解压）
+/// 这个条目名是**我们自己的内部文件**吗（不是谱面的资源）。
+///
+/// 判据只有这一处：摊开缓存时会写进 `session.json`（会话元数据）与 `lock.pid`（pid 锁），
+/// 保存/解压时还会留 `.tmp` 半截文件 —— 它们都**不是**谱面的资源。
+/// 这条判据曾在"读文件夹摊成条目"那里手抄过一份，于是加 `lock.pid` 时漏掉了它：
+/// 锁文件被当成资源算进"几个文件"，保存容器时还会被塞进包里。
+pub fn is_internal_entry(name: &str) -> bool {
+    name == SESSION_NAME || name == crate::session::LOCK_NAME || name.ends_with(".tmp")
+}
+
+/// 缓存 key：**容器内容的 SHA-256 前 128 位**（32 个十六进制字符）。
+///
+/// 用户口径（2026-10-02）："谱面的缓存目录使用谱面文件哈希计算出随机唯一值，
+/// 这样读取相同谱面就会发生重合" —— 同一个包反复打开落在**同一个**目录（省得反复解压、
+/// 也才能认出"上次没退干净的编辑"），而不同的谱面**不会**落进同一个目录。
+///
+/// 为什么从 crc32（32 位）换成 128 位：crc32 是**检错**用的，撞了不报错、只是安静地共用目录。
+/// 在"同一时刻允许多个进程各读一份谱面"之后，一次碰撞的后果是**两个进程互相覆盖对方的
+/// 未保存快照** —— 那属于"不能靠概率过关"的一类。128 位下这个概率可以当它不存在。
 pub fn cache_key(bytes: &[u8]) -> String {
-    format!("{:08x}", zip::crc32(bytes))
+    crate::digest::hex(&crate::digest::sha256(bytes))[..32].to_owned()
 }
 
 // ---------------------------------------------------------------- 会话元数据 / 遗留缓存
@@ -447,32 +472,30 @@ pub struct CacheDir {
     pub age_secs: u64,
 }
 
-/// 扫出 `<root>` 下的**解压目录**（新→旧）。只认目录，于是锁文件之类的东西不会被卷进来。
-pub fn cache_dirs(root: &Path) -> Vec<CacheDir> {
-    let now = now_secs();
-    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
-    let mut out: Vec<(std::time::SystemTime, CacheDir)> = rd
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            let m = e.metadata().ok()?;
-            if !m.is_dir() {
-                return None;
-            }
-            let when = m.modified().ok()?;
-            let age = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| now.saturating_sub(d.as_secs()))
-                .unwrap_or(0);
-            Some((
-                when,
-                CacheDir { dir: p.clone(), session: read_session(&p), bytes: dir_bytes(&p), age_secs: age },
-            ))
-        })
-        .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0)); // 新的在前
-    out.into_iter().map(|(_, c)| c).collect()
+/// **某一个**目录的缓存元数据（[`cache_dirs`] 的单目录版：打开谱面时只关心这一份）。
+///
+/// 给出 `None` 说明那个路径不是目录 —— 调用方据此退回"只有锁文件里的身份"。
+pub fn cache_dir_of(dir: &Path) -> Option<CacheDir> {
+    let m = std::fs::metadata(dir).ok()?;
+    if !m.is_dir() {
+        return None;
+    }
+    let age = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| now_secs().saturating_sub(d.as_secs()))
+        .unwrap_or(0);
+    Some(CacheDir {
+        dir: dir.to_path_buf(),
+        session: read_session(dir),
+        bytes: dir_bytes(dir),
+        age_secs: age,
+    })
 }
+
+// 注：这里曾有 `cache_dirs(root)`（扫全根目录列缓存）。用户口径 2026-10-02 之后，
+// 只有"正在打开的那一份"需要查（`cache_dir_of`），扫全根目录的那条路已经没有了。
 
 /// 删掉这些目录，返回（删了几个、释放多少字节）。**只删目录** —— 缓存根目录本身与锁文件都不动。
 pub fn discard_dirs(dirs: &[PathBuf]) -> (usize, u64) {
@@ -766,41 +789,6 @@ mod cache_tests {
     }
 
     /// 扫缓存：只认目录（锁文件之类不算）、新的在前、带得出会话元数据
-    #[test]
-    fn cache_dirs_scan_dirs_newest_first() {
-        let root = tmp("scan");
-        for (key, exe) in [("old", None), ("new", Some("opm-app"))] {
-            let d = extract_dir_in(&root, key);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join(CHART_NAME), b"{}").unwrap();
-            if let Some(exe) = exe {
-                write_session(&d, &Session { pid: 1, exe: exe.to_owned(), ..Default::default() }).unwrap();
-            }
-        }
-        // 目录 mtime = "多久以前动过"。**不保证每个平台都设得动**（Windows 上目录不能这样当文件打开）
-        // ⇒ 设不动就只查集合，不硬编一个平台相关的期望
-        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-        let aged = std::fs::File::open(root.join("old")).and_then(|f| f.set_modified(when)).is_ok();
-        std::fs::write(root.join("not-a-dir.txt"), b"x").unwrap();
-        let got = cache_dirs(&root);
-        assert_eq!(got.len(), 2, "只认目录：根目录里的普通文件不算缓存");
-        assert!(got[0].dir.ends_with("new"), "新→旧：{}", got[0].dir.display());
-        let old = got.iter().find(|c| c.dir.ends_with("old")).expect("旧目录还在");
-        assert!(old.session.is_none(), "没有 session.json 的目录：出处未知");
-        assert!(got[0].session.as_ref().unwrap().is_gui());
-        assert!(got[0].bytes >= 2, "字节数要算得出来");
-        if aged {
-            assert!(old.age_secs >= 7000, "按 mtime 报年龄：{}", old.age_secs);
-        }
-        // 丢弃：删指定目录，根目录与别的文件都不动
-        let (n, _) = discard_dirs(&[old.dir.clone()]);
-        assert_eq!(n, 1);
-        assert!(!old.dir.exists() && root.join("not-a-dir.txt").exists());
-        assert_eq!(discard_dirs(&[root.join("nope")]).0, 0, "删不存在的不算数、也不 panic");
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    /// 把 mtime 往回拨（用 `filetime` 那种系统调用；这里直接用标准库的 set_modified，无需新依赖）
     fn filetime_like(p: &Path, when: std::time::SystemTime) {
         let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
         let _ = f.set_modified(when);

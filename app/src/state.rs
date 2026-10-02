@@ -874,7 +874,15 @@ pub fn tracks_of(doc: &Document, index: usize, tmap: &TimeMap) -> [TrackView; 5]
 
 /// 取**一块遮蔽区**的七条通道缓存（与 [`tracks_of`] 同构，只是没有图层）。
 pub fn mask_zone_of(doc: &Document, index: usize, tmap: &TimeMap) -> Option<MaskZoneView> {
-    let src = doc.mask_zones.get(index)?;
+    Some(mask_view_of_zone(doc.mask_zones.get(index)?, index, tmap))
+}
+
+/// 从一个 [`crate::doc::MaskZone`] 建视图。
+///
+/// 与 [`mask_zone_of`] 分开，是为了让**草稿区**（还没进文档的那一块，见
+/// [`EditorState::mask_edit_view`]）走同一条建视图的路：草稿与真区的列/曲线/读数
+/// 必须一模一样，否则"动手那一刻"画面会跳一下。
+pub fn mask_view_of_zone(src: &crate::doc::MaskZone, index: usize, tmap: &TimeMap) -> MaskZoneView {
     let mut out = MaskZoneView {
         index,
         name: src.name.clone(),
@@ -902,7 +910,7 @@ pub fn mask_zone_of(doc: &Document, index: usize, tmap: &TimeMap) -> Option<Mask
             max: if max.is_finite() { max } else { 0.0 },
         };
     }
-    Some(out)
+    out
 }
 
 /// 把文档整体转成视图（引导期 / BPM 或判定线集合变化时用）
@@ -1764,6 +1772,38 @@ impl EditorState {
         self.chart.zones.get(self.selected_zone)
     }
 
+    /// **遮蔽区编辑模式下当前要编的那一块** —— 有真区给真区，一个区都没有时给一块**草稿**。
+    ///
+    /// 用户口径（2026-10-02）："遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件，
+    /// 当用户执行任意编辑后创建遮蔽区并应用编辑（可撤销）"。于是草稿就是
+    /// **`add_zone` 会写出来的那块东西**（中央正三角形，起止同一条规则见
+    /// [`crate::doc::MaskZone::default_span`]）——它**不在文档里**，用户真的动一下编辑才 materialize
+    /// （见 `main.rs` 的 `mask_commands`）。
+    ///
+    /// 返回 `Cow`：真区借用（不每帧克隆七条通道缓存），草稿才现造（6 条事件，代价可忽略）。
+    pub fn mask_edit_view(&self) -> Option<std::borrow::Cow<'_, MaskZoneView>> {
+        if let Some(z) = self.selected_zone() {
+            return Some(std::borrow::Cow::Borrowed(z));
+        }
+        if !self.mask_edit {
+            return None;
+        }
+        let (start, end) = self.mask_new_zone_span();
+        let zone = crate::doc::MaskZone::with_default_triangle(start, end);
+        Some(std::borrow::Cow::Owned(mask_view_of_zone(&zone, 0, &self.chart.tmap)))
+    }
+
+    /// 新建遮蔽区那颗三角形的**起止拍**：起点 = 吸附过的播放头，终点 = `default_span` 的规则。
+    ///
+    /// 界面（草稿视图 + `add_zone` 命令）与核心那边用的是**同一个** `default_span`，
+    /// 所以"屏幕上画的那个三角"与"真正建出来的那个"不会分家。
+    pub fn mask_new_zone_span(&self) -> (crate::doc::Beat, crate::doc::Beat) {
+        let start = crate::codec::beat_from_f64(
+            self.snap_beat(self.chart.tmap.beat(self.playhead)).max(0.0),
+        );
+        crate::doc::MaskZone::default_span(start, crate::codec::beat_from_f64(self.content_end_beat))
+    }
+
     /// 选中区的那条通道
     pub fn mask_track(&self) -> Option<&TrackView> {
         self.selected_zone().map(|z| z.track(self.selected_channel))
@@ -1807,9 +1847,11 @@ impl EditorState {
     /// 选中区/选中块的下标**夹回合法范围**（增删之后调；遮蔽区的视图下标与文档下标同源）
     pub fn clamp_mask(&mut self) {
         if self.chart.zones.is_empty() {
+            // **不退出编辑模式**（用户口径 2026-10-02：一个区都没有也能进遮蔽区编辑）——
+            // 那时编辑区显示的是**草稿三角**（`mask_edit_view`），用户动一下编辑才真正建区。
+            // 早先这里顺手把 `mask_edit` 关掉，于是"零区进模式"根本进不去（按钮点了没反应）。
             self.selected_zone = 0;
             self.mask_sel = None;
-            self.mask_edit = false;
             return;
         }
         self.selected_zone = self.selected_zone.min(self.chart.zones.len() - 1);

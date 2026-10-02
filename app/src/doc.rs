@@ -294,6 +294,17 @@ impl MaskZone {
             .sum()
     }
 
+    /// 新建遮蔽区的**默认跨度**：`[起点, max(谱面末尾, 起点 + 4 拍)]`。
+    ///
+    /// **核心的 `add_zone` 与界面的草稿三角形都调它**（用户口径 2026-10-02：
+    /// "遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件"）——
+    /// 两处各算一次的后果是"屏幕上画的那个三角"与"动手之后真正建出来的那个"不一样，
+    /// 而那个跳变正好发生在用户第一次点击的瞬间。
+    pub fn default_span(start: Beat, chart_end: Beat) -> (Beat, Beat) {
+        let four = Beat::new(start.n + 4 * start.d, start.d.max(1));
+        (start, if chart_end > four { chart_end } else { four })
+    }
+
     /// **新建遮蔽区**：默认名字 + 三条（顶点）各一对常量事件 = 屏幕中央的正三角形。
     ///
     /// `[start, end)` 是这六条事件共同的跨度 —— 之后怎么动由事件决定；`active` **不写事件**
