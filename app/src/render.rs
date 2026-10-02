@@ -85,6 +85,33 @@ impl NoteInstance {
     }
 }
 
+/// **遮蔽区**（躁域）的顶点：位置 + 颜色 + 发光参数。
+///
+/// 与判定线/音符共用**同一个 `Playfield`、同一份 viewport 映射、同一次 `PlayfieldFrame`**
+/// （用户口径 2026-10-02："将屏蔽区的显示代码和判定线共用"）—— 于是它天然落在演奏区那一层：
+/// 编辑区叠加层盖在它上面，播放时它和判定线一起出现、一起消失。
+///
+/// 三角形用 `TriangleList`（判定线那边是实例化的四边形）：遮罩区本来就是**任意**三角形/梯形，
+/// 塞进轴对齐矩形那套实例里只能靠拆成很多小矩形。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MaskVertex {
+    /// 位置（RPE 单位，绝对坐标）
+    pos: [f32; 2],
+    color: [f32; 4],
+    /// 发光：`[光标x, 光标y, 半径(px), 强度]` —— **在片元着色器里按"到光标的距离"算径向光**
+    ///
+    /// 为什么放在着色器里而不是 CPU 端：① 才有逐像素的坐标（CPU 端只能按顶点着色，
+    /// 光晕会随三角形剖分看出棱角）；② "不超出遮蔽区边界"天然成立 —— 填充几何本身就是那块区域。
+    glow: [f32; 4],
+}
+
+impl MaskVertex {
+    pub fn new(pos: [f32; 2], color: [f32; 4], glow: [f32; 4]) -> Self {
+        Self { pos, color, glow }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -100,11 +127,18 @@ const QUAD: [Vertex; 4] = [
 
 pub struct Playfield {
     pipeline: wgpu::RenderPipeline,
+    /// 遮蔽区：三角形列表 + 片元径向光（与上面共用 bind group / uniform / viewport）
+    mask_pipeline: wgpu::RenderPipeline,
     vertex_buf: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     instance_buf: wgpu::Buffer,
     capacity: u32,
+    mask_buf: wgpu::Buffer,
+    mask_capacity: u32,
+    /// 本帧要画的遮蔽区顶点数（`draw` 只拿得到 `&self` ⇒ 在 `upload_mask` 里记下；
+    /// 用原子而不是 `Cell`：`Playfield` 要能跨线程放进 `callback_resources`）
+    mask_drawn: std::sync::atomic::AtomicU32,
     /// 全屏物理尺寸，用于画完自己的 viewport 后恢复
     screen_px: [f32; 2],
 }
@@ -112,6 +146,8 @@ pub struct Playfield {
 /// 每帧传进回调的载荷
 pub struct PlayfieldFrame {
     pub instances: Vec<NoteInstance>,
+    /// 遮蔽区（躁域）的三角形顶点：**每 3 个一组**
+    pub mask_vertices: Vec<MaskVertex>,
     /// 演奏区矩形（物理像素）
     pub viewport_px: [f32; 2],
     /// 绘制耗时（GPU 提交前的 CPU 录制时间）
@@ -137,7 +173,10 @@ impl Playfield {
             label: Some("playfield-bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // **顶点 + 片元**：遮蔽区的柔光在片元着色器里按"到光标的距离"算，
+                // 那里也要读同一个 uniform（viewport/scale）—— 少了 FRAGMENT 会在建管线时直接报
+                // "binding 在该阶段不可用"
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -220,17 +259,68 @@ impl Playfield {
             mapped_at_creation: false,
         });
 
+        // ---- 遮蔽区：三角形列表 + **片元级径向光** ----
+        //
+        // 与上面那条管线共用 uniform / bind group / viewport（"显示代码和判定线共用"），
+        // 只有拓扑与顶点布局不同：遮罩区是任意三角形，实例化四边形那套表达不了。
+        let mask_layouts = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MaskVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4, 2 => Float32x4],
+        })];
+        let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("playfield-mask"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_mask"),
+                compilation_options: Default::default(),
+                buffers: &mask_layouts,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_mask"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("playfield-mask-vertices"),
+            size: (MASK_INITIAL as u64) * (std::mem::size_of::<MaskVertex>() as u64),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             pipeline,
+            mask_pipeline,
             vertex_buf,
             uniform_buf,
             bind_group,
             instance_buf,
             capacity: INITIAL,
+            mask_buf,
+            mask_capacity: MASK_INITIAL,
+            mask_drawn: std::sync::atomic::AtomicU32::new(0),
             screen_px: [1.0, 1.0],
         }
     }
 }
+
+/// 遮蔽区顶点缓冲的初值 / 上限（一份谱面上百块区也够；不够会按 2 的幂扩容）
+const MASK_INITIAL: u32 = 4096;
 
 impl Playfield {
     /// 上传 uniform 与实例数据（不足时扩容）。返回可绘制实例数。
@@ -266,16 +356,54 @@ impl Playfield {
         need.min(self.capacity)
     }
 
-    /// 在当前 render pass 里画。**不设置 viewport** —— 由调用方决定坐标空间。
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, count: u32, _viewport_px: [f32; 2]) {
-        if count == 0 {
-            return;
+    /// 上传遮蔽区顶点（不足时扩容）。返回可绘制顶点数。
+    pub fn upload_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[MaskVertex],
+    ) -> u32 {
+        let need = vertices.len() as u32;
+        if need > self.mask_capacity {
+            let new_cap = need.next_power_of_two();
+            self.mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("playfield-mask-vertices"),
+                size: (new_cap as u64) * (std::mem::size_of::<MaskVertex>() as u64),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.mask_capacity = new_cap;
         }
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-        pass.draw(0..4, 0..count);
+        if need > 0 {
+            queue.write_buffer(&self.mask_buf, 0, bytemuck::cast_slice(vertices));
+        }
+        let n = need.min(self.mask_capacity);
+        self.mask_drawn.store(n, std::sync::atomic::Ordering::Relaxed);
+        n
+    }
+
+    /// 在当前 render pass 里画。**不设置 viewport** —— 由调用方决定坐标空间。
+    ///
+    /// **顺序**：判定线/音符/窗口边界先画，遮蔽区最后 —— 它盖在它们之上（游戏里也是如此：
+    /// 这块红区盖住里面的音符），而它与它们共用同一个 viewport 与同一份映射。
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, count: u32, _viewport_px: [f32; 2]) {
+        if count > 0 {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+            pass.draw(0..4, 0..count);
+        }
+        let n = self
+            .mask_drawn
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(self.mask_capacity);
+        if n > 0 {
+            pass.set_pipeline(&self.mask_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.mask_buf.slice(..));
+            pass.draw(0..n, 0..1);
+        }
     }
 }
 
@@ -297,6 +425,7 @@ impl egui_wgpu::CallbackTrait for PlayfieldFrame {
         ];
 
         pf.upload(device, queue, self.viewport_px, &self.instances);
+        pf.upload_mask(device, queue, &self.mask_vertices);
         Vec::new()
     }
 
@@ -869,5 +998,54 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
+}
+
+// ---------------------------------------------------------------- 遮蔽区（躁域）
+
+struct MaskIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) glow: vec4<f32>,
+};
+struct MaskOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    /// 发光参数：`xy` = 光标（RPE），`z` = 半径（**像素**），`w` = 强度 + 软化
+    @location(1) glow: vec4<f32>,
+    /// 该片元在演奏区里的像素坐标（发光要按像素算距离）
+    @location(2) px: vec2<f32>,
+};
+
+@vertex
+fn vs_mask(in: MaskIn) -> MaskOut {
+    // **与判定线同一条映射**：RPE → 演奏区像素 → 该 viewport 内的 NDC
+    let px = in.pos * u.scale_px;
+    var out: MaskOut;
+    out.clip = vec4<f32>(px / (u.viewport_px * 0.5), 0.0, 1.0);
+    out.color = in.color;
+    out.glow = in.glow;
+    out.px = px;
+    return out;
+}
+
+@fragment
+fn fs_mask(in: MaskOut) -> @location(0) vec4<f32> {
+    // 发光：**围着光标亮一圈、边缘软化**（用户口径 2026-10-02）。
+    // 距离按像素算（半径也是像素）；`smoothstep` 的那一段就是软化带。
+    // **不超出遮蔽区边界**这件事不在这里管 —— 填充几何本身就是那块区域。
+    let center_px = in.glow.xy * u.scale_px;
+    let d = distance(in.px, center_px) / max(in.glow.z, 1.0);
+    let soft = clamp(in.glow.w * 0.0 + 0.45, 0.0, 0.95);
+    let k = 1.0 - smoothstep(1.0 - soft, 1.0, d);
+    var c = in.color;
+    let strength = max(in.glow.w, 0.0);
+    c.a = clamp(c.a + strength * k, 0.0, 1.0);
+    // 亮起来时**极轻**地往白里提一点：只提 0.08 —— 提多了会显得"被冲淡"（像变透明），
+    // 而用户要的是"照亮"。主体亮度来自上面那个 alpha 增量。
+    let lift = vec3<f32>(0.08, 0.06, 0.06) * k * strength;
+    c.r = clamp(c.r + lift.r, 0.0, 1.0);
+    c.g = clamp(c.g + lift.g, 0.0, 1.0);
+    c.b = clamp(c.b + lift.b, 0.0, 1.0);
+    return c;
 }
 "#;

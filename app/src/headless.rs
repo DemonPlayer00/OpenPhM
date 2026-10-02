@@ -66,10 +66,9 @@ pub fn lines_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
 
 /// **遮蔽区在某个时刻的数值快照** —— 给 agent 的核对口径（与 `lines_report` 同一套路）。
 ///
-/// 为什么必须有它：遮蔽区的画面是 **egui 层**画的（三角形 + 网格，见 `mask` 模块），
-/// 而无头出图（`render_png`）走的是 wgpu 实例管线 —— 那张 PNG 里**看不到遮蔽区**。
-/// 与其让 agent 对着一张看不见区域的图猜，不如把"此刻它是哪三个点、显不显示、active 是什么"
-/// 直接给成数字：这些数就是判据（`perf::mask_state_at`），图只是同一份求值的一种画法。
+/// 与图的分工：`render_png` 现在**也画遮蔽区**（与判定线共用同一条管线，见 `mask::push_mask_vertices`），
+/// 但这张数字快照仍然有用 —— 图答"看起来对不对"，它答"此刻是哪三个点、显不显示、active 是什么"
+/// （逐字段可断言，不必读图）。两者都走同一份求值（`perf::mask_state_at`），不会互相打脸。
 pub fn masks_report(doc: &Document, playhead_sec: f64) -> serde_json::Value {
     let tmap = crate::perf::TimeMap::from_doc(doc);
     let zones: Vec<serde_json::Value> = doc
@@ -148,6 +147,23 @@ pub fn render_png(
     crate::render::build_instances(&st, &mut instances);
     // 收尾：窗口边界压暗 + 边框（与 GUI 同一份几何）
     crate::render::push_window_overlay(&st, &mut instances);
+    // **遮蔽区**（躁域）：与 GUI 同一条管线、同一份装配实现 ⇒ 无头出图里也看得见它
+    // （用户口径 2026-10-02："将屏蔽区的显示代码和判定线共用"——共用之后这一条自然成立）。
+    // 无头出图没有指针 ⇒ 不发光（强度 0）。
+    let scale_px = crate::render::rpe_scale([width as f32, height as f32]);
+    let tris: Vec<crate::mask::ZoneTri> = st
+        .chart
+        .zones
+        .iter()
+        .filter_map(|z| crate::mask::zone_tri_of(z, &st.chart.tmap, playhead_sec))
+        .collect();
+    let mut mask_vertices = Vec::new();
+    crate::mask::push_mask_vertices(
+        &tris,
+        scale_px,
+        [0.0, 0.0, crate::mask::GLOW_RADIUS_PX, 0.0],
+        &mut mask_vertices,
+    );
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -200,6 +216,7 @@ pub fn render_png(
     let target_view = target.create_view(&Default::default());
 
     pf.upload(&device, &queue, viewport_px, &instances);
+    pf.upload_mask(&device, &queue, &mask_vertices);
     let count = instances.len() as u32;
 
     let mut encoder = device.create_command_encoder(&Default::default());

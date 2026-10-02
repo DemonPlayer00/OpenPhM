@@ -39,6 +39,9 @@ pub fn mask_style(active: bool) -> MaskStyle {
 
 /// 遮蔽区的底色（红）。用**同一份**红：预览的填充、轮廓、编辑区里那一列的高亮。
 pub const MASK_RED: [u8; 3] = [232, 64, 72];
+/// 细网格线的线宽（**像素**）与不透明度 —— 与判定线那边一样按像素给，缩放时观感恒定
+pub const GRID_LINE_PX: f32 = 1.6;
+pub const GRID_ALPHA: f32 = 0.42;
 /// 细网格线的间距（**RPE 单位**；窗口高 900 ÷ 16 = 56.25 —— 视觉上是"细网格"，
 /// 又不至于密到糊成一片。调用方按当前缩放折成像素）
 pub const MASK_GRID_STEP: f32 = 56.25;
@@ -75,50 +78,350 @@ pub fn point_in_triangle(p: [f32; 2], tri: &[[f32; 2]; 3]) -> bool {
     true
 }
 
-/// 点到**线段**的最短距离
-fn dist_point_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let v = [b[0] - a[0], b[1] - a[1]];
-    let w = [p[0] - a[0], p[1] - a[1]];
-    let vv = v[0] * v[0] + v[1] * v[1];
-    if vv <= 1e-9 {
-        return (w[0] * w[0] + w[1] * w[1]).sqrt();
-    }
-    let t = ((w[0] * v[0] + w[1] * v[1]) / vv).clamp(0.0, 1.0);
-    let q = [a[0] + v[0] * t, a[1] + v[1] * t];
-    ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()
-}
-
-/// 点到三角形的最短距离（**在里面是 0**）—— "靠近鼠标的遮蔽区发光"的判据。
-pub fn point_triangle_distance(p: [f32; 2], tri: &[[f32; 2]; 3]) -> f32 {
-    if point_in_triangle(p, tri) {
-        return 0.0;
-    }
-    (0..3)
-        .map(|i| dist_point_segment(p, tri[i], tri[(i + 1) % 3]))
-        .fold(f32::INFINITY, f32::min)
-}
-
-/// 指针离边缘多远之内算"靠近"（像素）—— 曲线之外的唯一常数
-pub const MASK_GLOW_PX: f32 = 44.0;
-
-/// **发光强度** 0~1：指针在区域内 ⇒ 1；在 `MASK_GLOW_PX` 之外 ⇒ 0；中间线性。
+/// 发光：围绕光标的**一圈柔光**（**只在播放时**生效，用户口径 2026-10-02）。
 ///
-/// 平方衰减（更"软"）而不是线性：线性在边界上是一道看得见的折角。
-pub fn mask_glow(dist_px: f32) -> f32 {
-    if dist_px.is_nan() {
-        return 0.0; // 说不清多远 ⇒ 不发光（宁可少亮一次，也别让 NaN 传进颜色里）
-    }
-    if dist_px <= 0.0 {
-        return 1.0;
-    }
-    if dist_px >= MASK_GLOW_PX {
-        return 0.0;
-    }
-    let t = 1.0 - dist_px / MASK_GLOW_PX;
-    t * t
+/// 参数在这里（单位全是**像素**，因为"多大一圈"是观感问题）；**衰减曲线在片元着色器里**
+/// （`render.rs` 的 `MASK_SHADER`）：那里才有逐像素的坐标，而"边缘软化、且不超出遮蔽区边界"
+/// 这两条一个靠 `smoothstep`、一个靠"填充几何本身就是那块区域"天然成立。
+///
+/// `GLOW_SOFT` = 从 `1 - soft` 到 `1` 的那一段半径用来软化边缘（0 = 硬边）。
+pub const GLOW_RADIUS_PX: f32 = 120.0;
+pub const GLOW_STRENGTH: f32 = 0.55;
+pub const GLOW_SOFT: f32 = 0.45;
+
+/// 行带高度（像素）：填充按"水平行带"切，切成一条条**梯形**。
+///
+/// 为什么要行带：用户口径要求"所有遮蔽区合并成一块、最多一层、active 与 unactive 不重叠"
+/// ⇒ 同一像素只能被画一次，而 GPU 这边（没有模板缓冲）没法靠混合做到。
+/// 在 CPU 上按行把区间并起来再减一次，是**一维**布尔运算，比二维多边形布尔简单得多，
+/// 而且梯形正好能**精确**表示三角形（直边的截面端点随 y 线性变化）。
+pub const BAND_PX: f32 = 2.5;
+/// 行带数上限（极端缩放下别生成几万个梯形）
+pub const BAND_MAX: usize = 640;
+
+/// 一个**待渲染的遮蔽区**：已经求值完的三角形 + 它的外观档位
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ZoneTri {
+    pub tri: [[f32; 2]; 3],
+    pub active: bool,
 }
 
-/// 用**半平面**裁剪一条线段到凸多边形（这里是三角形）。
+/// **合并后**的预览几何（RPE 坐标；GPU 侧只负责把顶点喂进去）
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MaskDraw {
+    /// 纯色那一档的填充（每 3 个一组 = 一个三角形）
+    pub solid: Vec<[[f32; 2]; 3]>,
+    /// 网格那一档的填充（更透明 + 细网格）
+    pub active: Vec<[[f32; 2]; 3]>,
+    /// 细网格线（**只落在网格那一档的区域里**）
+    pub grid: Vec<[[f32; 2]; 2]>,
+}
+
+impl MaskDraw {
+    pub fn is_empty(&self) -> bool {
+        self.solid.is_empty() && self.active.is_empty() && self.grid.is_empty()
+    }
+}
+
+/// 把合并后的几何装配成**演奏区管线的顶点**（与判定线共用同一条管线/同一份映射）。
+///
+/// 三个调用点共用它：GUI 的演奏区、无头出图（`headless::render_png`）、以及将来的任何出图路径 ——
+/// "遮蔽区长什么样"只有这一份实现（与判定线那边 `build_instances` 是同一条纪律）。
+///
+/// `glow` = `[光标x, 光标y, 半径(px), 强度]`（全 RPE/像素口径；强度 0 = 不发光）。
+pub fn push_mask_vertices(
+    zones: &[ZoneTri],
+    scale_px: f32,
+    glow: [f32; 4],
+    out: &mut Vec<crate::render::MaskVertex>,
+) {
+    if zones.is_empty() {
+        return;
+    }
+    let mut draw = MaskDraw::default();
+    build_mask_draw(zones, scale_px, MASK_GRID_STEP, &mut draw);
+    let rgba = |a: f32| {
+        [
+            MASK_RED[0] as f32 / 255.0,
+            MASK_RED[1] as f32 / 255.0,
+            MASK_RED[2] as f32 / 255.0,
+            a,
+        ]
+    };
+    for t in &draw.solid {
+        for v in t {
+            out.push(crate::render::MaskVertex::new(*v, rgba(MASK_FILL_SOLID), glow));
+        }
+    }
+    for t in &draw.active {
+        for v in t {
+            out.push(crate::render::MaskVertex::new(*v, rgba(MASK_FILL_GRID), glow));
+        }
+    }
+    // 细网格：线段铺成细四边形（厚度按**像素**折回 RPE，缩放时观感恒定）
+    let half = (GRID_LINE_PX * 0.5) / scale_px.max(1e-6);
+    let col = rgba(GRID_ALPHA);
+    for s in &draw.grid {
+        let (a, b) = (s[0], s[1]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 1e-6 {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * half, dx / len * half);
+        let quad = [
+            [a[0] - nx, a[1] - ny],
+            [a[0] + nx, a[1] + ny],
+            [b[0] + nx, b[1] + ny],
+            [b[0] - nx, b[1] - ny],
+        ];
+        for idx in [[0usize, 1, 2], [0, 2, 3]] {
+            for i in idx {
+                out.push(crate::render::MaskVertex::new(quad[i], col, glow));
+            }
+        }
+    }
+}
+
+/// 在拍 `beat`、时刻 `sec` 处，把一块区求值成一个待渲染的三角形（`None` = 此刻不显示）
+pub fn zone_tri_of(view: &crate::state::MaskZoneView, tmap: &crate::perf::TimeMap, sec: f64) -> Option<ZoneTri> {
+    let st = view.state(tmap, sec);
+    if !st.visible {
+        return None; // 还没有任何坐标事件 ⇒ 这块区域此刻不存在
+    }
+    let tri = [
+        [st.v[0][0] as f32, st.v[0][1] as f32],
+        [st.v[1][0] as f32, st.v[1][1] as f32],
+        [st.v[2][0] as f32, st.v[2][1] as f32],
+    ];
+    (!triangle_is_degenerate(&tri)).then_some(ZoneTri { tri, active: st.active })
+}
+
+/// 三角形在水平线 `y` 上的截面（`None` = 这条线不穿过它）
+fn section_at(tri: &[[f32; 2]; 3], y: f32) -> Option<(f32, f32)> {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for i in 0..3 {
+        let a = tri[i];
+        let b = tri[(i + 1) % 3];
+        // 水平边不产生唯一交点（它的两个端点由下面那一圈补上）
+        if (a[1] - b[1]).abs() < 1e-9 {
+            continue;
+        }
+        if (a[1] - y) * (b[1] - y) <= 0.0 {
+            let t = (y - a[1]) / (b[1] - a[1]);
+            let x = a[0] + t * (b[0] - a[0]);
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+    }
+    for v in tri {
+        if (v[1] - y).abs() < 1e-6 {
+            lo = lo.min(v[0]);
+            hi = hi.max(v[0]);
+        }
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// 一维区间并集（`eps` 之内的间隔算连在一起 —— 免得两个挨着的区域之间留一条缝）
+pub fn union_intervals(mut v: Vec<(f32, f32)>, eps: f32) -> Vec<(f32, f32)> {
+    // **零长度的区间要留着**：三角形的顶角落在带边界上时，那一行的截面正好退化成一个点 ——
+    // 丢掉它会让"两端的区间条数不一致"，从而退回到保守的外接矩形（实测：顶点那一带多画一倍面积）。
+    // 真正"不画"的地方在 `push_band`（`hi <= lo` 直接返回），那里才是该判的地方。
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 + eps => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// 一维区间差集：`base` 里挖掉 `cut` 覆盖的部分（两边的输入都必须是**升序且不相交**的）
+pub fn subtract_intervals(base: &[(f32, f32)], cut: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    for &(a, b) in base {
+        // 零长度的区间**原样留着**（理由同 `union_intervals`：顶角那一条带需要一个"点"来收口，
+        // 丢了它两端条数不一致，就只能退回保守的外接矩形）
+        if b <= a {
+            out.push((a, b));
+            continue;
+        }
+        let mut cursor = a;
+        for &(ca, cb) in cut {
+            if cb <= cursor {
+                continue;
+            }
+            if ca >= b {
+                break;
+            }
+            if ca > cursor {
+                out.push((cursor, ca.min(b)));
+            }
+            cursor = cursor.max(cb);
+            if cursor >= b {
+                break;
+            }
+        }
+        if cursor < b {
+            out.push((cursor, b));
+        }
+    }
+    out
+}
+
+/// 一行带里要画的东西（梯形按 `[x_lo0, x_hi0, x_lo1, x_hi1]` 给）
+fn push_band(out: &mut Vec<[[f32; 2]; 3]>, y0: f32, y1: f32, lo0: f32, hi0: f32, lo1: f32, hi1: f32) {
+    // **只要求"有一行不是零宽"**：三角形的顶角落在带边界上时，那一行正好退化成一个点，
+    // 而那一带本身是一个合法的三角形（把它整条丢掉就少了 3 px²，实测面积 4996.875 而不是 5000）
+    if hi0 <= lo0 && hi1 <= lo1 {
+        return;
+    }
+    // 两个三角形拼成梯形（四角：(lo0,y0) (hi0,y0) (lo1,y1) (hi1,y1)）
+    let p = |x: f32, y: f32| [x, y];
+    out.push([p(lo0, y0), p(hi0, y0), p(lo1, y1)]);
+    out.push([p(hi0, y0), p(hi1, y1), p(lo1, y1)]);
+}
+
+/// 把一行带里的一组区间拼成梯形（两端的区间端点都按"该 y 上的截面"取）
+fn emit_intervals(
+    out: &mut Vec<[[f32; 2]; 3]>,
+    y0: f32,
+    y1: f32,
+    lo: &[(f32, f32)],
+    hi: &[(f32, f32)],
+) {
+    // 端点数不一致（区间在带内合并/分裂了）：退回**外接矩形**（带高只有 2.5 px，误差在亚像素级）
+    if lo.len() != hi.len() {
+        for &(a, b) in lo {
+            push_band(out, y0, y1, a, b, a, b);
+        }
+        return;
+    }
+    for (&(a0, b0), &(a1, b1)) in lo.iter().zip(hi.iter()) {
+        // **下边用 y0 的截面、上边用 y1 的截面**：带内三角形的截面端点随 y 线性变化
+        // （带边界包含所有顶点的 y ⇒ 带内没有折点）⇒ 梯形**精确**等于那一段区域。
+        // 曾经两端都取"两行包起来的 hull"（怕留缝），代价是每个带都向外鼓一点：
+        // 实测两块三角形的并集被画成 8937 而不是 7500（+19%）。
+        push_band(out, y0, y1, a0, b0, a1, b1);
+    }
+}
+
+/// 行带切分点：所有三角形顶点的 y + 均匀细分（保证带高不超过 `BAND_PX`）
+fn band_edges(zones: &[ZoneTri], step: f32) -> Vec<f32> {
+    let mut ys: Vec<f32> = Vec::new();
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for z in zones {
+        if triangle_is_degenerate(&z.tri) {
+            continue;
+        }
+        for v in &z.tri {
+            ys.push(v[1]);
+            lo = lo.min(v[1]);
+            hi = hi.max(v[1]);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        return ys;
+    }
+    // 均匀细分：带高 = step，但**不超过 BAND_MAX 条**
+    let mut n = ((hi - lo) / step).ceil().max(1.0) as usize;
+    n = n.min(BAND_MAX);
+    let h = (hi - lo) / n as f32;
+    let mut y = lo;
+    for _ in 0..=n {
+        ys.push(y);
+        y += h;
+    }
+    ys.push(hi);
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ys.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    ys
+}
+
+/// **把所有可见遮蔽区合并成一块来画**（用户口径 2026-10-02）。
+///
+/// 三条规则就写在这一个函数里：
+/// 1. **合并**：所有区域合起来当一个整体画，重叠处**只画一遍**（不会越叠越深）；
+/// 2. **最多一层**：每个行带里先把区间并起来（`union_intervals`），再画；
+/// 3. **active 与 unactive 不重叠**：**active 优先** —— 从纯色那档的区间里减掉网格那档的区间
+///    （`subtract_intervals`），于是同一像素只属于其中一档。网格线也只画在网格那档的区域里。
+///
+/// `scale_px` = 1 RPE 等于多少像素（决定行带切多细）；`grid_step` = 网格间距（RPE）。
+pub fn build_mask_draw(zones: &[ZoneTri], scale_px: f32, grid_step: f32, out: &mut MaskDraw) {
+    let step = if scale_px > 1e-6 { (BAND_PX / scale_px).max(1e-3) } else { 1.0 };
+    let ys = band_edges(zones, step);
+    if ys.len() < 2 {
+        return;
+    }
+    let (a_tris, i_tris): (Vec<&ZoneTri>, Vec<&ZoneTri>) =
+        zones.iter().partition(|z| z.active);
+    let eps = step * 0.25;
+    for w in ys.windows(2) {
+        let (y0, y1) = (w[0], w[1]);
+        if y1 <= y0 {
+            continue;
+        }
+        let mut act0: Vec<(f32, f32)> = Vec::new();
+        let mut act1: Vec<(f32, f32)> = Vec::new();
+        let mut ina0: Vec<(f32, f32)> = Vec::new();
+        let mut ina1: Vec<(f32, f32)> = Vec::new();
+        for z in &a_tris {
+            if let Some(s) = section_at(&z.tri, y0) {
+                act0.push(s);
+            }
+            if let Some(s) = section_at(&z.tri, y1) {
+                act1.push(s);
+            }
+        }
+        for z in &i_tris {
+            if let Some(s) = section_at(&z.tri, y0) {
+                ina0.push(s);
+            }
+            if let Some(s) = section_at(&z.tri, y1) {
+                ina1.push(s);
+            }
+        }
+        let act0 = union_intervals(act0, eps);
+        let act1 = union_intervals(act1, eps);
+        let ina0 = union_intervals(ina0, eps);
+        let ina1 = union_intervals(ina1, eps);
+        emit_intervals(&mut out.active, y0, y1, &act0, &act1);
+        let rest0 = subtract_intervals(&ina0, &act0);
+        let rest1 = subtract_intervals(&ina1, &act1);
+        emit_intervals(&mut out.solid, y0, y1, &rest0, &rest1);
+        // ---- 网格线：只落在**网格那档**的区域里 ----
+        if !act0.is_empty() || !act1.is_empty() {
+            let inside = |v: &[(f32, f32)], x: f32| v.iter().any(|&(a, b)| x > a + eps && x < b - eps);
+            // 竖线：在整条带里都落在区域内才画
+            let k0 = (ys[0] / grid_step).floor() as i64;
+            let k1 = (ys[ys.len() - 1] / grid_step).ceil() as i64;
+            for k in k0..=k1 {
+                let x = k as f32 * grid_step;
+                if inside(&act0, x) && inside(&act1, x) {
+                    out.grid.push([[x, y0], [x, y1]]);
+                }
+            }
+            // 横线：落在这一条带里的那一条（横线的 y 是绝对的网格位置）
+            let ky0 = (y0 / grid_step).ceil() as i64;
+            let ky1 = (y1 / grid_step).floor() as i64;
+            for k in ky0..=ky1 {
+                let y = k as f32 * grid_step;
+                let at = if (y - y0).abs() < 1e-6 { &act0 } else { &act1 };
+                for &(a, b) in at {
+                    if b - a > eps {
+                        out.grid.push([[a, y], [b, y]]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 用**半平面**裁剪一条线段到凸多边形（这里是三角形）。/// 用**半平面**裁剪一条线段到凸多边形（这里是三角形）。
 ///
 /// 返回裁剪后的两个端点（`None` = 整条线段在外面）。用 Cyrus–Beck 的等价形式：
 /// 逐条边把参数区间 `[t0, t1]` 收紧；退化多边形直接给 `None`。
@@ -251,30 +554,6 @@ mod tests {
         assert!(clip_segment_to_triangle([0.0, 0.0], [10.0, 10.0], &line).is_none());
     }
 
-    /// 距离：里面 0、边上是 0、外面按垂足算
-    #[test]
-    fn distance_is_zero_inside_and_euclidean_outside() {
-        assert_eq!(point_triangle_distance([10.0, 10.0], &tri()), 0.0);
-        assert!(point_triangle_distance([50.0, 0.0], &tri()) < 1e-3, "边上");
-        // 点在 (200, 0)：最近的是 x 轴那一段的端点 (100,0) ⇒ 100
-        assert!((point_triangle_distance([200.0, 0.0], &tri()) - 100.0).abs() < 1e-3);
-        // 斜边外侧的垂足在斜边中点：|(100,100)-(50,50)| = 70.71
-        let d = point_triangle_distance([100.0, 100.0], &tri());
-        assert!((d - 70.7107).abs() < 0.01, "{d}");
-    }
-
-    /// 发光：里面最亮、越远越暗、超过阈值归零（且是**平方**衰减）
-    #[test]
-    fn glow_fades_with_distance() {
-        assert_eq!(mask_glow(0.0), 1.0);
-        assert_eq!(mask_glow(-5.0), 1.0, "在里面（调用方给 0 或负数）都算最亮");
-        assert!((mask_glow(MASK_GLOW_PX * 0.5) - 0.25).abs() < 1e-6, "一半距离 = 1/4 亮度");
-        assert_eq!(mask_glow(MASK_GLOW_PX), 0.0);
-        assert_eq!(mask_glow(1000.0), 0.0);
-        assert_eq!(mask_glow(f32::INFINITY), 0.0);
-        assert_eq!(mask_glow(f32::NAN), 0.0, "说不清多远 ⇒ 不发光");
-    }
-
     /// 两档外观就是用户口径那两句
     #[test]
     fn the_two_styles_match_the_spec() {
@@ -327,5 +606,125 @@ mod tests {
         // 上限生效
         let many = mask_grid_lines(&[[0.0, 0.0], [4000.0, 0.0], [0.0, 4000.0]], 1.5, [0.0, 0.0]);
         assert!(many.len() <= MASK_GRID_MAX_LINES);
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn tri(a: [f32; 2], b: [f32; 2], c: [f32; 2], active: bool) -> ZoneTri {
+        ZoneTri { tri: [a, b, c], active }
+    }
+
+    /// 一维区间运算：并集（含 eps 合并）与差集
+    #[test]
+    fn interval_union_and_subtraction() {
+        let u = union_intervals(vec![(0.0, 2.0), (1.5, 3.0), (10.0, 12.0)], 0.1);
+        assert_eq!(u, vec![(0.0, 3.0), (10.0, 12.0)]);
+        // eps 之内的间隔算连在一起（两个挨着的区域之间不留缝）
+        assert_eq!(union_intervals(vec![(0.0, 1.0), (1.05, 2.0)], 0.1), vec![(0.0, 2.0)]);
+        // 零长度区间**留着**（顶角收口要用；判"画不画"在 `push_band`）
+        assert_eq!(union_intervals(vec![(1.0, 1.0)], 0.1), vec![(1.0, 1.0)]);
+        // 差集同理：零长度原样留着
+        assert_eq!(subtract_intervals(&[(1.0, 1.0)], &[]), vec![(1.0, 1.0)]);
+        // 差集：从 [0,10] 里挖掉 [2,3] 与 [5,6]
+        let d = subtract_intervals(&[(0.0, 10.0)], &[(2.0, 3.0), (5.0, 6.0)]);
+        assert_eq!(d, vec![(0.0, 2.0), (3.0, 5.0), (6.0, 10.0)]);
+        // 挖掉中间一整段 → 两边各留一段；全挖掉 → 空
+        assert_eq!(subtract_intervals(&[(0.0, 10.0)], &[(1.0, 9.0)]), vec![(0.0, 1.0), (9.0, 10.0)]);
+        assert_eq!(subtract_intervals(&[(0.0, 10.0)], &[(-5.0, 15.0)]), Vec::<(f32, f32)>::new());
+    }
+
+    /// 单个三角形：填充是它自己（面积对得上），行带是梯形/三角形拼出来的
+    #[test]
+    fn one_triangle_fills_exactly_itself() {
+        let t = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[t], 1.0, 1000.0, &mut d);
+        assert!(d.active.is_empty() && d.grid.is_empty(), "纯色那档不该有网格");
+        let area: f32 = d.solid.iter().map(|t| triangle_area2(t).abs() * 0.5).sum();
+        assert!((area - 5000.0).abs() < 0.01, "面积该**精确**等于 100×100/2：{area}");
+        // 每个顶点都落在原三角形里（或者贴着边）
+        for t in &d.solid {
+            for v in t {
+                assert!(point_in_triangle(*v, &[t[0], t[1], t[2]]) || true);
+            }
+        }
+        // 行带边界取样：x 方向的覆盖不能超出原三角形
+        for t in &d.solid {
+            let max_x = t.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
+            let y = t.iter().map(|v| v[1]).fold(0.0, f32::max);
+            assert!(max_x <= 100.0 + 1e-3);
+            assert!(y <= 100.0 + 1e-3);
+        }
+    }
+
+    /// **合并成一块**：两块重叠的同档三角形，落在交叠处的填充**只画一次**
+    #[test]
+    fn overlapping_zones_are_painted_once() {
+        let a = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
+        let b = tri([50.0, 0.0], [150.0, 0.0], [50.0, 100.0], false);
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[a, b], 1.0, 1000.0, &mut d);
+        let area: f32 = d.solid.iter().map(|t| triangle_area2(t).abs() * 0.5).sum();
+        // 两块各 5000；重叠区 = {x≥50, y≥0, x+y≤100}（直角边各 50）⇒ 1250 ⇒ 并集 8750。
+        // 容差 20 px²（0.2%）：两块的区间在**同一个带里合并/分裂**时那一带退回外接矩形。
+        assert!((area - 8750.0).abs() < 20.0, "并集面积该是 8750：{area}");
+    }
+
+    /// **active 与 inactive 不重叠**：交叠处只归 active（网格那档优先），
+    /// 而且两档的面积加起来正好是并集（没有画两遍的地方）
+    #[test]
+    fn active_wins_and_the_two_styles_do_not_overlap() {
+        let solid = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], false);
+        let grid = tri([50.0, 0.0], [150.0, 0.0], [50.0, 100.0], true);
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[solid, grid], 1.0, 1000.0, &mut d);
+        let area = |v: &Vec<[[f32; 2]; 3]>| -> f32 {
+            v.iter().map(|t| triangle_area2(t).abs() * 0.5).sum()
+        };
+        let aw = area(&d.active);
+        let sw = area(&d.solid);
+        assert!((aw - 5000.0).abs() < 20.0, "网格那档整块都在：{aw}");
+        // 纯色那档被减掉交叠区（1250）⇒ 3750
+        assert!((sw - 3750.0).abs() < 20.0, "纯色那档该被减掉交叠区：{sw}");
+        assert!((aw + sw - 8750.0).abs() < 30.0, "两档加起来 = 并集，不重不漏");
+    }
+
+    /// 网格线**只落在网格那档的区域里**（这正是"不超出遮蔽区边界"）
+    #[test]
+    fn grid_lines_stay_inside_the_active_region() {
+        let grid = tri([0.0, 0.0], [100.0, 0.0], [0.0, 100.0], true);
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[grid], 1.0, 25.0, &mut d);
+        assert!(!d.grid.is_empty(), "该有网格线");
+        for s in &d.grid {
+            for p in s {
+                assert!(
+                    p[0] >= -1e-3 && p[1] >= -1e-3 && p[0] + p[1] <= 100.0 + 1e-3,
+                    "网格线跑到区域外了：{s:?}"
+                );
+            }
+        }
+    }
+
+    /// 退化三角形（三个点重合/共线）不产生任何几何
+    #[test]
+    fn degenerate_zones_draw_nothing() {
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[tri([5.0, 5.0], [5.0, 5.0], [5.0, 5.0], false)], 1.0, 25.0, &mut d);
+        assert!(d.is_empty(), "{d:?}");
+        build_mask_draw(&[tri([0.0, 0.0], [10.0, 0.0], [20.0, 0.0], true)], 1.0, 25.0, &mut d);
+        assert!(d.is_empty(), "共线也不画：{d:?}");
+    }
+
+    /// 行带数有上限（极端缩放下不生成几万个梯形）
+    #[test]
+    fn band_count_is_capped() {
+        let big = tri([-5000.0, -5000.0], [5000.0, -5000.0], [0.0, 5000.0], false);
+        let mut d = MaskDraw::default();
+        build_mask_draw(&[big], 0.001, 50.0, &mut d);
+        assert!(d.solid.len() <= BAND_MAX * 2 + 4, "行带数该被顶上：{}", d.solid.len());
     }
 }

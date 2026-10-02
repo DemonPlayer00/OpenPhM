@@ -1793,15 +1793,19 @@ impl EditorState {
         Some(std::borrow::Cow::Owned(mask_view_of_zone(&zone, 0, &self.chart.tmap)))
     }
 
-    /// 新建遮蔽区那颗三角形的**起止拍**：起点 = 吸附过的播放头，终点 = `default_span` 的规则。
+    /// 新建遮蔽区那颗三角形的**起止拍**：**起点固定拍 0**（用户口径 2026-10-02：
+    /// "0 个屏蔽区时初始事件固定在 0 处"），终点按 `default_span`（谱面末尾与"起点+4 拍"取大者）。
     ///
     /// 界面（草稿视图 + `add_zone` 命令）与核心那边用的是**同一个** `default_span`，
     /// 所以"屏幕上画的那个三角"与"真正建出来的那个"不会分家。
     pub fn mask_new_zone_span(&self) -> (crate::doc::Beat, crate::doc::Beat) {
-        let start = crate::codec::beat_from_f64(
-            self.snap_beat(self.chart.tmap.beat(self.playhead)).max(0.0),
-        );
-        crate::doc::MaskZone::default_span(start, crate::codec::beat_from_f64(self.content_end_beat))
+        // **起点固定在拍 0**（用户口径 2026-10-02："0 个屏蔽区时初始事件固定在 0 处"）——
+        // 草稿三角与"动第一下"时真正建出来的那块，事件都从谱面开头开始：
+        // 拖动播放头不该让待建的区前后挪动，而"这块躁域整首都在"也是最常见的用法。
+        crate::doc::MaskZone::default_span(
+            crate::doc::Beat::zero(),
+            crate::codec::beat_from_f64(self.content_end_beat),
+        )
     }
 
     /// 选中区的那条通道
@@ -2862,5 +2866,46 @@ mod tests {
         assert_eq!(timeline_height(f32::NAN, 0.3, true), 0.0, "坏输入不能 panic");
         let t = timeline_height(900.0, 0.3, true);
         assert!((t - 270.0).abs() < 1.0, "{t}");
+    }
+}
+
+#[cfg(test)]
+mod mask_draft_tests {
+    use super::*;
+    use crate::doc::{Document, MaskZone, MASK_DEFAULT_TRIANGLE};
+
+    /// **零区草稿**（用户口径 2026-10-02）：`add_zone` 会写出来的那块中央正三角形，
+    /// 而且**初始事件固定在拍 0** —— 拖动播放头不该让待建的区前后挪。
+    #[test]
+    fn the_draft_zone_is_fixed_at_beat_zero() {
+        let doc = Document::default();
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.mask_edit = true;
+        let (start, end) = st.mask_new_zone_span();
+        assert_eq!(start, crate::doc::Beat::zero(), "起点固定在拍 0");
+        assert!(end > start, "终点要有长度：{end:?}");
+        // 播放头挪到 20 拍，草稿的起点**不变**
+        st.seek(20.0);
+        assert_eq!(st.mask_new_zone_span().0, crate::doc::Beat::zero());
+        // 草稿视图就是"中央正三角形"：三条常量事件 + active 不写事件
+        let view = st.mask_edit_view().expect("编辑模式下零区 ⇒ 草稿");
+        assert_eq!(view.index, 0);
+        for c in MaskChannel::ALL {
+            let want = if c == MaskChannel::Active { 0 } else { 1 };
+            assert_eq!(view.track(c).events.len(), want, "{}", c.key());
+        }
+        let state = view.state(&st.chart.tmap, st.playhead);
+        assert_eq!(state.v[0], [MASK_DEFAULT_TRIANGLE[0][0], MASK_DEFAULT_TRIANGLE[0][1]]);
+        assert!(state.visible, "常量事件从拍 0 起 ⇒ 显示");
+        assert!(!state.active);
+        // 有真区时给的是真区（不再是草稿）
+        let mut doc2 = doc.clone();
+        doc2.mask_zones = vec![MaskZone::with_default_triangle(
+            crate::doc::Beat::zero(),
+            crate::doc::Beat::new(8, 1),
+        )];
+        let st2 = EditorState::new(chart_from_doc(&doc2));
+        assert_eq!(st2.chart.zones.len(), 1);
+        assert_eq!(st2.mask_edit_view().map(|v| v.index), Some(0));
     }
 }

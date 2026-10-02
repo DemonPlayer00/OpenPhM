@@ -791,7 +791,8 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
 缓存随目录一起删掉），快照是**没走到退出**那条路上的兜底。
 
 自动化钩子（截图/CI 用，与 `OPM_LAUNCH_AUTO` 同类，只在启动时读一次）：
-`OPM_RESUME_AUTO=continue|discard|later`。
+`OPM_RESUME_AUTO=continue|discard|later`、**`OPM_CURSOR=x,y`**（假装指针停在这个屏幕点上 ——
+Wayland 下没法注入鼠标，而"播放时遮蔽区那圈柔光"正好是个纯视觉的中间态）。
 
 **载入的四种形态**（都是 `EditCore::stage_file` 认的，按内容判、不看扩展名）：
 

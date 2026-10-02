@@ -288,7 +288,7 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"del_zone_event","zone":0,"track":"y3","index":1}` | |
 | `{"op":"resize_zone_event","zone":0,"track":"x1","index":0,"edge":"end","toBeat":[6,1]}` | 只动这一个端点（与 `resize_event` 同一语义） |
 | `{"op":"move_zone_event","zone":0,"track":"x1","index":1,"delta":[4,1]}` | 整块平移；与邻块重叠会被拒（返回 `ok:false`，文档不动） |
-| `opm-ctl --file F masks [--at SEC] [--json]` | **遮蔽区的数值快照**：此刻显不显示、`active`、三个顶点的坐标、七条通道各有几条事件。核对"区域此刻长什么样"用这个（**无头出图的 PNG 里看不到遮蔽区** —— 它画在 egui 层，见 §7） |
+| `opm-ctl --file F masks [--at SEC] [--json]` | **遮蔽区的数值快照**：此刻显不显示、`active`、三个顶点的坐标、七条通道各有几条事件。核对"区域此刻长什么样"用这个（图看形状、它看数值，两者同一份求值） |
 
 ⚠️ **遮蔽区通道的空隙是合法的**（与判定线轨道相反）：空档里保持前一条事件的终值，
 **首事件也可以晚于拍 0** —— "这块区域什么时候出现"就是靠它表达的。
@@ -403,8 +403,8 @@ opm-ctl --file chart.opm.json render --at 4.0 --no-boundary --out plain.png     
 
 ## 7. 限制与未实现（明确列出，避免 agent 误用）
 
-- **遮蔽区画在 egui 层，不进 wgpu 实例管线** ⇒ `render` 出的 PNG 里**没有**遮蔽区。
-  要核对它用 `masks`（数值）或让 GUI 自截屏（`opm-app --shot`）。
+- 遮蔽区**已经进 wgpu 管线**（与判定线共用）：`render` 出的 PNG 里有它，`masks` 给同一份数值。
+  唯一没有的是**播放期的那圈柔光**（它跟指针位置有关，而无头出图没有指针）。
 - **导出 RPE/pez 会丢掉遮蔽区**（那边没有这个字段），保真度报告里会逐个数报出来。
 - 遮蔽区编辑模式下的事件块当前只有**单选**（框选/Ctrl+多选还没做）。
 

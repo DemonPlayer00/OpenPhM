@@ -416,6 +416,9 @@ fn main() -> eframe::Result<()> {
     //
     // 崩溃检查也从这里搬走了（用户口径："不要启动时检查崩溃，而是在打开谱面文件时检查"）：
     // 启动时不再扫缓存根目录；谁在打开哪份谱面，就在那一刻查那一份（见 `App::open_doc`）。
+    if let Ok(v) = std::env::var("OPM_CURSOR") {
+        println!("  OPM_CURSOR       : {v}（假装指针停在这里，用于验证遮蔽区的播放期柔光）");
+    }
     println!(
         "  解压缓存根目录    : {}（每份谱面一把锁：lock.pid）",
         opm_app::codec::container::cache_root().display()
@@ -888,6 +891,9 @@ struct App {
 
     /// 每帧构建的实例（复用同一 Vec，避免每帧分配）
     instances: Vec<NoteInstance>,
+    /// 遮蔽区（躁域）的三角形顶点：与 `instances` 同一个回调、同一个 viewport 一起送进 GPU
+    /// （用户口径："将屏蔽区的显示代码和判定线共用"）
+    mask_vertices: Vec<render::MaskVertex>,
     paint_us: Arc<AtomicU64>,
 
     // 诊断
@@ -1000,6 +1006,9 @@ struct App {
     /// `OPM_RESUME_AUTO=continue|discard|later`：遗留缓存对话框替人做选择（截图/CI 用）。
     /// 与 `launch_auto` 同类 —— **只在启动时读一次**。
     resume_auto: Option<String>,
+    /// `OPM_CURSOR=x,y`：假装指针停在这个屏幕点上（只为验证"播放时的那圈柔光"；
+    /// Wayland 下没法注入鼠标，而它是个纯视觉的中间态）。`None` = 用真实指针。
+    cursor_auto: Option<egui::Pos2>,
     /// 这一帧**问过用户**"那份缓存要不要继续"吗（`launch_page` 靠它避免同一帧做第二个决定）
     resume_asked: bool,
     /// 「上次没有正常退出」这份待问的遗留缓存（`None` = 没有 / 已经问过）
@@ -1170,6 +1179,7 @@ impl App {
             inited: false,
             adapter: String::new(),
             instances: Vec::new(),
+            mask_vertices: Vec::new(),
             paint_us: Arc::new(AtomicU64::new(0)),
             frames: 0,
             last_frame: None,
@@ -1235,6 +1245,12 @@ impl App {
             launch_auto: std::env::var("OPM_LAUNCH_AUTO").ok(),
             snapshot_at: Instant::now(),
             snapshot_err: None,
+            // 启动期钩子：**假装指针在这个位置**（屏幕点）。Wayland 下没法注入鼠标事件，
+            // 而"播放时光标附近那一圈柔光"正好是拍不出来的中间态 —— 与 `OPM_KEY_AUTO` 同类。
+            cursor_auto: std::env::var("OPM_CURSOR").ok().and_then(|v| {
+                let (x, y) = v.split_once(',')?;
+                Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+            }),
             // 启动期钩子：遗留缓存对话框怎么选（`continue|discard|later`）—— 与 `OPM_LAUNCH_AUTO`
             // 同类，只在启动时读一次，给 agent 一条"把这一步走完"的路（没人能替它点鼠标）
             resume_auto: std::env::var("OPM_RESUME_AUTO").ok(),
@@ -1852,19 +1868,23 @@ impl App {
     /// 两件事不在这一层做：
     /// · **命令怎么拼**（尤其是"同一张表里按下标降序发"这条正确性规则）在 `edit.rs`；
     /// · **哪些下标还算数**由 `EditCore` 判（越界会明确报错，这里不预筛）。
-    /// 画所有**可见**的遮蔽区（用户口径：三条坐标轨道都没有"已开始"的事件就不显示）。
+    /// 把**可见**的遮蔽区装进演奏区管线（与判定线共用同一个回调、视口与坐标映射）。
     ///
-    /// 三条硬约束（都是用户口径）：
-    /// · **和 note 等一样显示**：画在编辑区叠加层**之上**（与音符选择框、事件块同层）——
-    ///   编辑器里它是"看得见的数据"，不是被 chrome 压暗的预览；
-    /// · **不对事件响应**（2026-10-02）：没有悬停发光、没有点击选中、顶点也没有手柄 ——
-    ///   它纯粹是画出来的东西；选哪一块、改哪个坐标，走左栏列表 / 属性编辑器 / 通道列；
-    /// · **一个区都没有时**（遮蔽区编辑模式下）画**草稿三角** = `add_zone` 会写出来的那一块，
-    ///   用户动一下编辑才真正建区（见 `mask_commands`）。
-    ///
-    /// 它同时压住 wgpu 播放区里的判定线与音符（egui 这一层永远在上面），与游戏里的观感一致。
-    fn draw_mask_zones(&self, ui: &mut egui::Ui, play_rect: egui::Rect, scale_pts: f32) {
-        // 草稿区（还没进文档的那一块）只在"遮蔽区编辑模式 + 一个区都没有"时存在
+    /// 用户口径（2026-10-02）四条：
+    /// · **显示代码和判定线共用** ⇒ 走 `render::MaskVertex` + `PlayfieldFrame`，不再是 egui 画笔
+    ///   （于是它天然落在演奏区那一层：编辑区叠加层盖在它上面）；
+    /// · **合并成一块、最多一层** ⇒ 几何在 `mask::build_mask_draw` 里按行带并区间；
+    /// · **active 与 unactive 不重叠** ⇒ 同一函数里 active 优先，纯色那档减掉 active；
+    /// · **光标靠近发亮只在播放时生效**，样式是"围着光标一圈、边缘软化、不超出区域边界"
+    ///   ⇒ 参数交给片元着色器（那里才有逐像素坐标），编辑时强度传 0。
+    fn build_mask_vertices(
+        &mut self,
+        play_rect: egui::Rect,
+        scale_pts: f32,
+        pointer: Option<egui::Pos2>,
+    ) {
+        self.mask_vertices.clear();
+        // 零区草稿：遮蔽区编辑模式下还没有真区时，画的就是那块"默认三角"
         let draft = (self.state.mask_edit && self.state.chart.zones.is_empty())
             .then(|| self.state.mask_edit_view())
             .flatten();
@@ -1875,58 +1895,28 @@ impl App {
         if zones.is_empty() {
             return;
         }
-        let center = play_rect.center();
-        let rpe_of = |x: f32, y: f32| center + egui::vec2(x * scale_pts, -y * scale_pts);
         let tmap = &self.state.chart.tmap;
         let playhead = self.state.playhead;
-        let red = opm_app::mask::MASK_RED;
-        let p = ui.painter();
-        for zone in zones {
-            let st = zone.state(tmap, playhead);
-            if !st.visible {
-                continue; // 还没有任何坐标事件 ⇒ 这块区域此刻不存在
-            }
-            let tri: [[f32; 2]; 3] = [
-                [st.v[0][0] as f32, st.v[0][1] as f32],
-                [st.v[1][0] as f32, st.v[1][1] as f32],
-                [st.v[2][0] as f32, st.v[2][1] as f32],
-            ];
-            let pts: Vec<egui::Pos2> = tri.iter().map(|v| rpe_of(v[0], v[1])).collect();
-            let tri_px: [[f32; 2]; 3] = std::array::from_fn(|k| [pts[k].x, pts[k].y]);
-            if opm_app::mask::triangle_is_degenerate(&tri_px) {
-                continue; // 三个顶点重合/共线：没有可画的东西
-            }
-            let style = opm_app::mask::mask_style(st.active);
-            let fill = egui::Color32::from_rgba_unmultiplied(
-                red[0],
-                red[1],
-                red[2],
-                (style.fill_alpha * 255.0) as u8,
-            );
-            p.add(egui::Shape::convex_polygon(
-                pts.clone(),
-                fill,
-                egui::Stroke::new(1.4, egui::Color32::from_rgba_unmultiplied(red[0], red[1], red[2], 150)),
-            ));
-            // **细网格**（active 那一档）：间距按当前缩放折算，锚在屏幕原点
-            // （三角形移动时网格跟着走 —— 网格属于"屏幕"，不属于这块区）
-            if style.grid {
-                let step_px = opm_app::mask::MASK_GRID_STEP * scale_pts;
-                let origin_px = rpe_of(0.0, 0.0);
-                let grid_col =
-                    egui::Color32::from_rgba_unmultiplied(red[0].saturating_add(40), red[1].saturating_add(40), red[2].saturating_add(40), 120);
-                for seg in opm_app::mask::mask_grid_lines(
-                    &tri_px,
-                    step_px.max(2.0),
-                    [origin_px.x, origin_px.y],
-                ) {
-                    p.line_segment(
-                        [egui::pos2(seg[0][0], seg[0][1]), egui::pos2(seg[1][0], seg[1][1])],
-                        egui::Stroke::new(1.0, grid_col),
-                    );
-                }
-            }
+        let tris: Vec<opm_app::mask::ZoneTri> = zones
+            .iter()
+            .filter_map(|z| opm_app::mask::zone_tri_of(z, tmap, playhead))
+            .collect();
+        if tris.is_empty() {
+            return;
         }
+        // 发光参数：**只在播放时**（用户口径），且指针在演奏区里 —— 否则强度 0（等于不发光）
+        let cursor_rpe = pointer.filter(|p| play_rect.contains(*p)).map(|p| {
+            let c = play_rect.center();
+            [(p.x - c.x) / scale_pts, -(p.y - c.y) / scale_pts]
+        });
+        let glow = match (self.state.playing, cursor_rpe) {
+            (true, Some(c)) => {
+                [c[0], c[1], opm_app::mask::GLOW_RADIUS_PX, opm_app::mask::GLOW_STRENGTH]
+            }
+            _ => [0.0, 0.0, opm_app::mask::GLOW_RADIUS_PX, 0.0],
+        };
+        // 顶点装配只有一份实现（GUI 与无头出图共用）
+        opm_app::mask::push_mask_vertices(&tris, scale_pts, glow, &mut self.mask_vertices);
     }
 
     /// 遮蔽区编辑模式下**动第一下**时的命令序列。
@@ -4854,10 +4844,17 @@ impl eframe::App for App {
                 rpe_of(-state::RPE_WINDOW_HALF_W, state::RPE_WINDOW_HALF_H),
                 rpe_of(state::RPE_WINDOW_HALF_W, -state::RPE_WINDOW_HALF_H),
             );
+            // ---- 遮蔽区（躁域）：**装进演奏区管线**（与判定线同一个回调、同一份映射与视口）----
+            // 指针位置只用来算"播放时的那圈柔光"（用户口径）：编辑时不发光、不响应鼠标。
+            let hover = self
+                .cursor_auto
+                .or_else(|| ui.input(|i| i.pointer.hover_pos()));
+            self.build_mask_vertices(play_rect, scale_pts, hover);
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 play_rect,
                 PlayfieldFrame {
                     instances: std::mem::take(&mut self.instances),
+                    mask_vertices: std::mem::take(&mut self.mask_vertices),
                     viewport_px,
                     paint_ms: self.paint_us.clone(),
                 },
@@ -4946,9 +4943,6 @@ impl eframe::App for App {
                 // 重叠组随之清空：宁可列表消失，也别留一份与画面不符的旧数据。
                 self.state.set_note_stack(Vec::new());
             }
-
-            // ---- 遮蔽区：**和 note 等一样显示**（画在编辑区之上，两种模式都画、不对事件响应）----
-            self.draw_mask_zones(ui, play_rect, scale_pts);
 
             // 对齐自检：用与着色器相同的映射公式，把同一批 RPE 坐标画成十字。
             // 若自研管线的方块与这些十字重合，说明 viewport 映射在任意缩放/布局下都正确。
