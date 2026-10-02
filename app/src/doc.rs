@@ -229,6 +229,23 @@ pub const MASK_TRACKS: [&str; 7] = ["x1", "y1", "x2", "y2", "x3", "y3", "active"
 /// 换个入口就得到不一样长的块。现在只有这一个数字，改它就全变。
 pub const MASK_EVENT_BEATS: i64 = 1;
 
+/// `active` 的某个值 → **它认领的状态**（`None` = 不是布尔也不是数字，校验器会另报一条）。
+///
+/// 阈值与求值侧**同一条线**：`perf::mask_state_at` 也是 `≥ 0.5` 二值化
+/// （写 `true`/`false` 与写 `1`/`0` 是同一个意思）。
+///
+/// 用户口径（2026-10-02）："一个事件块一种状态，不能在头和尾有不同状态" ——
+/// 所以**一个 active 事件块**要求 `active_state(startValue) == active_state(endValue)`；
+/// 想要中途换外观就放**两块**（各是一种状态、各自是常量），别用渐变。
+/// 判据由 `cmd::validate`（两个校验器）与核心的 `add_zone_event` / `set_zone_event` 共用这一份。
+pub fn doc_active_state(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n.as_f64().map(|x| x >= 0.5),
+        _ => None,
+    }
+}
+
 /// 新建遮蔽区的默认形状：以屏幕中心为外心的**正三角形**（外接圆半径 200 RPE 单位）。
 ///
 /// 顶点坐标按"Y 向上"给（与 RPE 坐标系一致）：第一个顶点在上，另两个在下。
@@ -316,6 +333,35 @@ impl MaskZone {
             .filter_map(|t| self.track(t))
             .map(|l| l.len())
             .sum()
+    }
+
+    /// **这块区坐标事件的包络** `[最早起点, 最晚终点)`（六条坐标通道合起来看）；一条都没有 ⇒ `None`。
+    ///
+    /// 用途只有一个：这块区本来没有 active 事件（= 纯色那档），要把它切成 true 时，
+    /// 新写的那一块占哪一段 —— 用户口径（2026-10-02）："该区坐标事件的包络"
+    /// （"这块区存在多久，它就是这个状态"）。
+    pub fn coord_span(&self) -> Option<(Beat, Beat)> {
+        let mut span: Option<(Beat, Beat)> = None;
+        for t in &MASK_TRACKS[..6] {
+            for e in self.track(t).map(Vec::as_slice).unwrap_or_default() {
+                span = Some(match span {
+                    None => (e.start, e.end),
+                    Some((s, en)) => (s.min(e.start), en.max(e.end)),
+                });
+            }
+        }
+        span
+    }
+
+    /// 这条 `active` 通道**认领的状态**：`None` = 一条事件都没有（求值口径下是 `false`）。
+    ///
+    /// 只在一处成立时给 `Some`：所有事件的两端都落在同一档（见 [`active_state`]）。
+    /// 混着两档时给 `Some(...)` 也毫无意义（那时谱面本身就该被校验器报出来），
+    /// 所以这里返回**第一条事件**的状态、并由 `cmd::validate` 负责报错。
+    pub fn active_state(&self) -> Option<bool> {
+        self.active
+            .first()
+            .and_then(|e| doc_active_state(&e.start_value))
     }
 
     /// 新建遮蔽区的**默认跨度**：`[起点, 起点 + 1 拍]`（**就 1 拍**）。

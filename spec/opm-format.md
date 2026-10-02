@@ -197,7 +197,12 @@
 - 三条通道**都没有块覆盖当前拍** ⇒ 整块不显示（**不是**"只要曾经有过块就一直显示"）；
 - `active` 与其它通道走**同一套插值**，只在对外的最后一步按 `≥ 0.5` 二值化；
   **没有 `active` 事件时为 `false`**；
-- `active=false` ⇒ 纯色、不透明度更高；`active=true` ⇒ 更透明 + **细网格线条**。
+- `active=false` ⇒ 纯色、不透明度更高；`active=true` ⇒ 更透明 + **细网格线条**；
+- **一个 `active` 事件块只能是一种状态**（用户口径 2026-10-02）：它的
+  `startValue` 与 `endValue` 必须落在同一档（`false`→`true` 这种渐变**不合法**）。
+  想中途换外观就放**两块**（各是一种状态、各自是常量）—— 于是外观是**分段切换**的，
+  永远不会有"一格网格渐渐淡出"的中间态。
+  写侧（`add_zone_event` / `set_zone_event`）与两个校验器共用 `doc_active_state` 这一份判据。
 
 **新建遮蔽区**（`{"op":"add_zone"}`）会写 6 条常量事件 = 屏幕中央的正三角形，跨度是
 **`[起点, 起点 + 1 拍]`**（种子块；"初始屏蔽区事件区间为 0~1 拍"）—— 想要更长就拖事件块的尾巴，
@@ -213,8 +218,8 @@
 |---|---|
 | `add_zone` | `{startBeat?, endBeat?, name?, empty?, set?}`；默认写中央正三角形；`empty:true` 建一个没有任何事件、**不显示**的区 |
 | `del_zone` | `{index}`（`zone` 也认） |
-| `set_zone` | `{zone, set:{name}}` |
-| `add_zone_event` | `{zone, track, startBeat, endBeat?, startValue?, endValue?, easing?}`；缺省值 = 该通道**此刻的值**；缺省终点 = 起点 + 1 拍（`MASK_EVENT_BEATS`）**且不越过下一块**；**起点与已有块的起点重合、或显式终点越过下一块 ⇒ 报错**；插入时会把被压住的前一块**裁到新块起点**（切点值不变） |
+| `set_zone` | `{zone, set:{name, active?}}`；`set.active` = **整区切档**：已有 `active` 块的时间跨度不动、值全部改写成这一档（于是"一块区一种状态"这件事有一个一键入口）；一条 `active` 块都没有时按**坐标事件的包络** `[最早起点, 最晚终点)` 写一块；一条坐标事件都没有的区拒绝（`active` 在那时没有意义） |
+| `add_zone_event` | `{zone, track, startBeat, endBeat?, startValue?, endValue?, easing?}`；缺省值 = 该通道**此刻的值**；`active` 通道还要求头尾同档（否则报错）；缺省终点 = 起点 + 1 拍（`MASK_EVENT_BEATS`）**且不越过下一块**；**起点与已有块的起点重合、或显式终点越过下一块 ⇒ 报错**；插入时会把被压住的前一块**裁到新块起点**（切点值不变） |
 | `set_zone_event` | `{zone, track, index, set:{startBeat?, endBeat?, startValue?, endValue?, easing?}}`；改完**与邻块重叠 ⇒ 报错**（通道不变量） |
 | `del_zone_event` | `{zone, track, index}` |
 | `resize_zone_event` | `{zone, track, index, edge:"start"\|"end", toBeat}` —— 只动这一个端点；与邻块重叠会被拒 |
@@ -289,6 +294,8 @@
 10. `extensions` 非空但 `minClientCapability < 3`；扩展名不以 `x-opm:` 开头。
 11. 遮蔽区：通道未按 `startBeat` 升序 / 同通道内重叠 / `endBeat <= startBeat` / 缓动名不在表里。
 12. `maskZones` 非空但 `minClientCapability < 4`。
+13. 遮蔽区的 `active` 事件块**头尾不同档**（`false`→`true` 这类渐变）：一个块只能是一种状态，
+    要换外观请分两块（§4.6）。
 
 **警告（可载入，但需报告）**
 

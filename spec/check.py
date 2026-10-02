@@ -355,6 +355,18 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int) -> Fraction:
     return chart_end
 
 
+def active_state(v):
+    """`active` 的值 → 它认领的状态（`None` = 类型不对，由别处报）。
+
+    阈值与求值器同一条线：`≥ 0.5` 即 true（写 `true`/`false` 与写 `1`/`0` 等价）。
+    """
+    if isinstance(v, bool):
+        return v
+    if is_num(v):
+        return v >= 0.5
+    return None
+
+
 def check_mask_track(track: list, name: str, ptr: str, rep: Report) -> None:
     """遮蔽区的一条通道。
 
@@ -398,6 +410,18 @@ def check_mask_track(track: list, name: str, ptr: str, rep: Report) -> None:
                     rep.err(f"{p}.{key}", "active 的值必须是布尔（true/false）或数字")
             elif not is_num(v):
                 rep.err(f"{p}.{key}", "遮蔽区坐标通道的值必须是数字")
+        if name == "active":
+            # **一个 active 事件块只能是一种状态**（用户口径 2026-10-02）：
+            # 头尾值必须落在同一档（≥0.5 = true），否则这块区会在中途换外观。
+            # 想中途换外观就放**两块**，别用渐变。
+            a = active_state(ev.get("startValue"))
+            b = active_state(ev.get("endValue"))
+            if a is not None and b is not None and a != b:
+                rep.err(
+                    p,
+                    f"active 事件块只能是一种状态：起值 {ev.get('startValue')!r} 与"
+                    f"终值 {ev.get('endValue')!r} 分别是 {a} 与 {b} —— 想中途换外观就放两块",
+                )
 
 
 def check_mask_zone(zone, index: int, rep: Report) -> None:

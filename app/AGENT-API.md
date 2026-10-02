@@ -282,9 +282,10 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 |---|---|
 | `{"op":"add_zone","startBeat":[0,1]}` | 新建一块：写 6 条常量事件 = **屏幕中央的正三角形**（`active` 不写事件），跨度 `[startBeat, startBeat + 1 拍]`（**种子块**，要更长就拖尾巴）。`empty:true` 建一个**没有任何事件、因此不显示**的区 |
 | `{"op":"del_zone","index":0}` | `zone` 与 `index` 都认 |
-| `{"op":"set_zone","zone":0,"set":{"name":"右侧躁域"}}` | 目前只有 `name` |
+| `{"op":"set_zone","zone":0,"set":{"name":"右侧躁域"}}` | `name`（区内名字） |
+| `{"op":"set_zone","zone":0,"set":{"active":true}}` | **整区切 active 档**：已有 `active` 块跨度不动、值全改成这一档；一块都没有时按**坐标事件的包络**写一块（"这块区存在多久，它就是这个状态"）。坐标事件一条都没有的区会被拒 |
 | `{"op":"add_zone_event","zone":0,"track":"x1","startBeat":[8,1],"endBeat":[16,1],"startValue":0,"endValue":-400,"easing":"inOutCubic"}` | **缺省值 = 该通道此刻的值**（不传 `startValue` 时，放下一刻不跳变）；`endBeat` 缺省 = 起点 + **1 拍**，且**自动缩到下一块的起点**；显式给的终点**越过下一块 ⇒ `ok:false`**（通道内不许重叠） |
-| `{"op":"set_zone_event","zone":0,"track":"active","index":0,"set":{"startValue":true,"endValue":true}}` | `active` 的值可以是布尔或数字 |
+| `{"op":"set_zone_event","zone":0,"track":"active","index":0,"set":{"startValue":true,"endValue":true}}` | `active` 的值可以是布尔或数字，但**头尾必须同档**：只改一头会报错（下一行那条口径） |
 | `{"op":"del_zone_event","zone":0,"track":"y3","index":1}` | |
 | `{"op":"resize_zone_event","zone":0,"track":"x1","index":0,"edge":"end","toBeat":[6,1]}` | 只动这一个端点（与 `resize_event` 同一语义） |
 | `{"op":"move_zone_event","zone":0,"track":"x1","index":1,"delta":[4,1]}` | 整块平移；与邻块重叠会被拒（返回 `ok:false`，文档不动） |
@@ -298,6 +299,11 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 `set_zone_event` / `resize_zone_event` / `move_zone_event` 一发现重叠就返回 `ok:false`
 （文档一个字节都不改）—— 判定线那边的重叠留给冲突浏览器，遮蔽区没有那个东西，
 编辑器自己造出来的重叠会让 `validate` 当场报错。
+
+**一个 `active` 事件块只能是一种状态**（用户口径 2026-10-02："一个事件块一种状态，不能在头和尾
+有不同状态"）：`startValue` 与 `endValue` 必须落在同一档（`≥ 0.5` = true，与求值侧同一条线）。
+`false`→`true` 这种渐变**不合法**（写侧直接拒、校验器也报）；想中途换外观就放**两块**，
+于是外观是**分段切换**的。`add_zone` 的 `set.active` 与 `set_zone` 的 `active` 都写常量，天然合法。
 
 放一块的**跨度规则只有一份**（`edit::mask_can_start` / `mask_end_limit` / `mask_default_end`）：
 界面手势、属性编辑器那颗按钮、核心命令共用它，所以"同一个动作换个入口"得到的块是一样的。

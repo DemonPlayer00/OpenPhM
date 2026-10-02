@@ -2086,13 +2086,48 @@ impl EditCore {
                 let index = zone_arg(c)?;
                 let before = ZoneProps::of(self.zone(index)?);
                 let mut after = before.clone();
+                // 整区切 `active` 要改**一条通道**（不是属性），于是记的是 `ZoneTrack` ——
+                // 与 `set_zone` 的属性改动合成**一个撤销步**（见下面 `wrap`）。
+                let mut active_change: Option<(Vec<Event>, Vec<Event>)> = None;
                 if let Some(set) = c.get("set").and_then(|v| v.as_object()) {
                     for (k, v) in set {
                         match k.as_str() {
                             "name" => after.name = v.as_str().unwrap_or("遮蔽区").to_owned(),
+                            // **整区切 active**（用户口径 2026-10-02："每个遮蔽区的 active 只能是
+                            // 一种状态"）：已有块的时间跨度不动、值**全部改写**成这一档；
+                            // 一块都没有（= false 那档）时，按**坐标事件的包络**写一块
+                            // （"这块区存在多久，它就是这个状态"）。
+                            "active" => {
+                                let on = v
+                                    .as_bool()
+                                    .or_else(|| v.as_f64().map(|x| x >= 0.5))
+                                    .ok_or("set_zone 的 active 需要布尔（true/false）")?;
+                                let mut list = self.zone_track(index, "active")?;
+                                if list.is_empty() {
+                                    let (s, e) = self.zone(index)?.coord_span().ok_or(
+                                        "这块区还没有任何坐标事件 —— active 现在没有意义\
+                                         （先把三角形写出来）",
+                                    )?;
+                                    list = vec![Event::new(s, e, json!(on), json!(on), "linear")];
+                                } else {
+                                    for e in list.iter_mut() {
+                                        e.start_value = json!(on);
+                                        e.end_value = json!(on);
+                                    }
+                                }
+                                active_change = Some((self.zone_track(index, "active")?, list));
+                            }
                             other => return Err(format!("set_zone 不支持的字段 {other}")),
                         }
                     }
+                }
+                // 一个命令 = 一个撤销步：同时改了属性与通道时才需要显式开事务
+                //（调用方自己开着事务时不动它 —— `commit` 会把**它**的事务提前结掉）
+                let wrap = active_change.is_some()
+                    && after != before
+                    && !self.journal.in_transaction();
+                if wrap {
+                    self.journal.begin("设置遮蔽区");
                 }
                 after.apply_to(self.zone_mut(index)?);
                 self.journal.record(Change::SetZone {
@@ -2100,6 +2135,18 @@ impl EditCore {
                     before: Box::new(before),
                     after: Box::new(after),
                 });
+                if let Some((track_before, track_after)) = active_change {
+                    *self.zone_track_mut(index, "active")? = track_after.clone();
+                    self.journal.record(Change::ZoneTrack {
+                        zone: index,
+                        track: "active".to_owned(),
+                        before: track_before,
+                        after: track_after,
+                    });
+                }
+                if wrap {
+                    self.journal.commit();
+                }
                 Ok(json!({"zone": index}))
             }
             "add_zone_event" => {
@@ -2155,6 +2202,7 @@ impl EditCore {
                 let from = c.get("startValue").cloned().unwrap_or_else(neutral);
                 let to = c.get("endValue").cloned().unwrap_or_else(|| from.clone());
                 let ev = Event::new(start, end, from, to, &easing);
+                check_active_block(&track, &ev)?;
                 let mut after = before.clone();
                 // **先裁后插**：把被这一块压在下面的那些裁到它的起点（保持切点上的值）。
                 // 用户最常见的动作是"给一条铺满全谱的常量事件里插一个关键帧" ——
@@ -2216,6 +2264,7 @@ impl EditCore {
                 if ev.start < Beat::zero() {
                     return Err("拍不能为负".into());
                 }
+                check_active_block(&track, &ev)?;
                 // **不许压到邻块**：拖端点/属性编辑器改头尾都走这条命令，而通道的不变量是
                 // "不许重叠"（判定线那边由冲突浏览器兜着，遮蔽区没有那个东西）。
                 // 判据与 `move_zone_event` 同一句（半个区间相交），只是这里只重排一个事件的跨度。
@@ -3040,6 +3089,34 @@ fn zone_track_arg(c: &Value) -> Result<String, String> {
     Ok(track)
 }
 
+/// `active` 通道的一个事件块**只能是一种状态**（用户口径 2026-10-02：
+/// "一个事件块一种状态，不能在头和尾有不同状态"）。
+///
+/// 头尾落在两档 ⇒ 这块区会在中途换外观（`false` 渐变到 `true` 就是这种）；要换就放**两块**。
+/// 判据与两个校验器共用 [`crate::doc::doc_active_state`] 那一份（阈值同求值侧 `≥ 0.5`）。
+/// 放在写侧拦一道，是为了让"编辑器造出来的东西"永远过得了自己的校验器。
+fn check_active_block(track: &str, ev: &Event) -> Result<(), String> {
+    if track != "active" {
+        return Ok(());
+    }
+    let (a, b) = (
+        crate::doc::doc_active_state(&ev.start_value),
+        crate::doc::doc_active_state(&ev.end_value),
+    );
+    match (a, b) {
+        (None, _) | (_, None) => Err(format!(
+            "active 的值必须是布尔（true/false）或数字，收到 {:?} / {:?}",
+            ev.start_value, ev.end_value
+        )),
+        (Some(a), Some(b)) if a != b => Err(format!(
+            "active 事件块只能是一种状态：起值 {:?} 与终值 {:?} 分别是 {a} 与 {b} —— \
+             想中途换外观就放两块（各是一种状态），别用渐变",
+            ev.start_value, ev.end_value
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// 事件必须按 `startBeat` 升序 —— `perf::active_event` 的二分依赖它。
 ///
 /// 判定线那边靠"插入时排序"维持；遮蔽区的拖动/改端点会破坏它，所以在这里显式挡一道
@@ -3784,6 +3861,84 @@ mod mask_zone_tests {
         exec_ok(&mut c, json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1]}));
         let a = c.doc().mask_zones[0].active.clone();
         assert_eq!(a[0].start_value, json!(false));
+    }
+
+    /// **一块区的 active 只能是一种状态**（用户口径 2026-10-02："一个事件块一种状态，
+    /// 不能在头和尾有不同状态"）：写侧（`add_zone_event` / `set_zone_event`）直接拒渐变；
+    /// `set_zone` 的 `active` 是"整区切档"——已有块全部改写、没有块时按坐标包络写一块。
+    #[test]
+    fn one_active_block_claims_exactly_one_state() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "set": {"x1": 0.0}}));
+        // 渐变（false → true）在建的时候就拒
+        let e = exec_err(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1],
+                   "startValue": false, "endValue": true}),
+        );
+        assert!(e.contains("只能是一种状态"), "{e}");
+        // 数字也按 ≥0.5 二值化：0.2 → 0.8 同样拒（换的是同一档的意思）
+        let e = exec_err(
+            &mut c,
+            json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1],
+                   "startValue": 0.2, "endValue": 0.8}),
+        );
+        assert!(e.contains("只能是一种状态"), "{e}");
+        // 一种状态就放行（写 1 与写 true 等价）
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "active", "startBeat": [0, 1], "endBeat": [4, 1], "startValue": 1, "endValue": 1}));
+        // 改端点也不能把它变成渐变：只改一头会被拒
+        let e = exec_err(&mut c, json!({"op": "set_zone_event", "track": "active", "index": 0, "set": {"startValue": false}}));
+        assert!(e.contains("只能是一种状态"), "{e}");
+        // 两头一起改可以（这就是界面那颗复选框发出的形状）
+        exec_ok(&mut c, json!({"op": "set_zone_event", "track": "active", "index": 0, "set": {"startValue": false, "endValue": false}}));
+
+        // ---- 整区切档：已有块全部改写，跨度不动；一个撤销步 ----
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "active", "startBeat": [8, 1], "endBeat": [12, 1], "startValue": false, "endValue": false}));
+        exec_ok(&mut c, json!({"op": "set_zone", "set": {"active": true}}));
+        let a = c.doc().mask_zones[0].active.clone();
+        assert_eq!(a.len(), 2, "块数不变（改的是档，不是块）");
+        assert_eq!(a[0].start_value, json!(true));
+        assert_eq!(a[1].end_value, json!(true));
+        assert_eq!(a[1].start.to_f64(), 8.0, "跨度不动");
+        exec_ok(&mut c, json!({"op": "undo"}));
+        let a = c.doc().mask_zones[0].active.clone();
+        assert_eq!(a[0].start_value, json!(false), "一次 Ctrl+Z 全回去");
+        assert_eq!(a[1].end_value, json!(false));
+        // 自己的校验器必须放行
+        let bad: Vec<String> = crate::cmd::validate(c.doc())
+            .iter()
+            .filter(|i| i.pointer.starts_with("/maskZones"))
+            .map(|i| format!("{} {}", i.pointer, i.message))
+            .collect();
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// 本来没有 active 块（= false 那档）的区：`set_zone {active:true}` 按**坐标事件的包络**写一块；
+    /// 一条坐标事件都没有的区（`empty:true`）则明确拒绝 —— active 在那时没有意义。
+    #[test]
+    fn turning_a_zone_active_writes_one_block_across_its_coord_span() {
+        let mut c = EditCore::new();
+        // 坐标事件横跨 [2, 10)：active 那一段就应当是 [2, 10)
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [2, 1], "endBeat": [4, 1], "startValue": 0.0}));
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "y3", "startBeat": [6, 1], "endBeat": [10, 1], "startValue": -100.0}));
+        exec_ok(&mut c, json!({"op": "set_zone", "set": {"active": true}}));
+        let a = c.doc().mask_zones[0].active.clone();
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].start.to_f64(), a[0].end.to_f64()), (2.0, 10.0), "包络");
+        assert_eq!(a[0].start_value, json!(true));
+        // 再切回 false：还是那一块，值改了
+        exec_ok(&mut c, json!({"op": "set_zone", "set": {"active": false}}));
+        let a = c.doc().mask_zones[0].active.clone();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].end_value, json!(false));
+        // 一条坐标事件都没有 ⇒ 拒（不猜一个跨度出来）
+        exec_ok(&mut c, json!({"op": "add_zone", "empty": true}));
+        let e = exec_err(&mut c, json!({"op": "set_zone", "zone": 1, "set": {"active": true}}));
+        assert!(e.contains("还没有任何坐标事件"), "{e}");
+        // 非布尔/数字 ⇒ 拒（别把字符串塞进去）
+        let e = exec_err(&mut c, json!({"op": "set_zone", "set": {"active": "yes"}}));
+        assert!(e.contains("需要布尔"), "{e}");
     }
 
     /// **放一块的跨度规则**（用户口径 2026-10-02："创建流程应与普通编辑模式下的事件块放置一样"）：

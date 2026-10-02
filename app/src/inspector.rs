@@ -644,6 +644,51 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
         if st_now.active { "true（细网格 + 更透明）" } else { "false（纯色）" }
     ));
 
+    // ---- 整区 active：**一块区一种状态**（用户口径 2026-10-02）----
+    //
+    // "一个事件块一种状态，不能在头和尾有不同状态" —— 于是这里只给一个开关：
+    // 一按把这块区**所有** active 块改写成那一档（各块的时间跨度不动）；一块都没有时
+    // 按坐标事件的包络写一块（`core::set_zone` 的 `active` 字段）。想中途换外观就放两块，
+    // 那是编辑区里的事；这里是"整块区的档位"。
+    let zone_active = mi.channels.iter().find_map(|r| {
+        (r.channel == opm_app::state::MaskChannel::Active).then_some(r)
+    });
+    let active_blocks = zone_active.map(|r| r.events).unwrap_or(0);
+    // 判据取自视图模型（**逐块**看头尾，见 `MaskInspect::active_mixed`）——
+    // 不是"整条通道的 min/max"：几块之间取不同的档是合法的（外观分段切换）
+    let active_mixed = mi.active_mixed;
+    let has_coords = mi
+        .channels
+        .iter()
+        .any(|r| r.channel != opm_app::state::MaskChannel::Active && r.events > 0);
+    ui.horizontal(|ui| {
+        let mut on = st_now.active;
+        let resp = ui.add_enabled(
+            has_coords,
+            egui::Checkbox::new(&mut on, "整区 active（true = 细网格）"),
+        );
+        let hint = if has_coords {
+            format!(
+                "这块区**只有一种状态**：一按就把它的 {active_blocks} 个 active 块全改成这一档。\n\
+                 想中途换外观：在编辑区的 active 列里放**两块**（各是一种状态）。"
+            )
+        } else {
+            "这块区还没有任何坐标事件 —— active 现在没有意义（先把三角形写出来）".to_owned()
+        };
+        if resp.on_hover_text(hint).changed() {
+            ec.push(opm_app::edit::set_zone_command(
+                mi.index,
+                serde_json::json!({ "active": on }),
+            ));
+        }
+    });
+    if active_mixed {
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 190, 110),
+            "⚠ 某一块 active 的头尾不同档（校验会报错）—— 选中它、用下面那个复选框改一下即可",
+        );
+    }
+
     // ---- 在播放头放一块 ----
     //
     // 跨度规则与编辑区里的手势草稿**同一条**（`EditorState::mask_span_at`）：长度一个格点、
@@ -740,20 +785,26 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
     };
     match (as_bool(&ev.start_value), as_bool(&ev.end_value)) {
         (Some(sb), Some(eb)) if ch == opm_app::state::MaskChannel::Active => {
-            let (mut a, mut b) = (sb, eb);
-            let mut set = serde_json::Map::new();
-            if ui.checkbox(&mut a, "起 true").changed() {
-                set.insert("startValue".into(), serde_json::json!(a));
-            }
-            if ui.checkbox(&mut b, "止 true").changed() {
-                set.insert("endValue".into(), serde_json::json!(b));
-            }
-            if !set.is_empty() {
+            // **一个 active 块一种状态**（用户口径）：所以只有一个复选框，
+            // 一改就同时写 `startValue` 与 `endValue` —— 两个独立复选框正是"头 true、尾 false"
+            // 这种块的来源（核心现在也会拒，但界面不该给出这条歧路）。
+            let mut state = sb;
+            let resp = ui
+                .checkbox(&mut state, "true（细网格 + 更透明）")
+                .on_hover_text(if sb != eb {
+                    format!(
+                        "这块现在的头尾不一致（起 {sb} / 止 {eb}）—— 一改就都写成同一档；\
+                         不改它的话，校验会一直报这一块"
+                    )
+                } else {
+                    "这一块的状态（头尾一起改）—— 想中途换外观就再放一块".to_owned()
+                });
+            if resp.changed() {
                 ec.push(opm_app::edit::set_mask_event_command(
                     mi.index,
                     ch,
                     ev.index,
-                    serde_json::Value::Object(set),
+                    serde_json::json!({"startValue": state, "endValue": state}),
                 ));
             }
         }

@@ -624,8 +624,12 @@ fn doc_with_zone() -> Document {
         json!({"op": "add_zone", "startBeat": [0, 1]}),
         json!({"op": "add_zone_event", "zone": 0, "track": "x1", "startBeat": [8, 1],
                "endBeat": [16, 1], "startValue": 0.0, "endValue": -400.0, "easing": "inOutCubic"}),
+        // active：**一块一种状态**（用户口径 2026-10-02）——要换外观就放两块，别用渐变。
+        // 这里刻意摆成"先 false 后 true"的两段，顺带钉住"外观可以分段切换"这条。
         json!({"op": "add_zone_event", "zone": 0, "track": "active", "startBeat": [4, 1],
-               "endBeat": [12, 1], "startValue": false, "endValue": true}),
+               "endBeat": [8, 1], "startValue": false, "endValue": false}),
+        json!({"op": "add_zone_event", "zone": 0, "track": "active", "startBeat": [8, 1],
+               "endBeat": [12, 1], "startValue": true, "endValue": true}),
     ] {
         let r = c.exec(&cmd);
         assert_eq!(r["ok"], json!(true), "{cmd} → {r}");
@@ -642,6 +646,7 @@ fn mask_zones_roundtrip_through_opm() {
     assert_eq!(doc.to_json(), back.to_json(), "opm 原生往返必须一模一样");
     assert_eq!(back.mask_zones.len(), 1);
     assert_eq!(back.mask_zones[0].active[0].start_value, json!(false));
+    assert_eq!(back.mask_zones[0].active[1].end_value, json!(true), "第二段是 true（分段切换）");
     assert_eq!(back.mask_zones[0].x1[1].easing, "inOutCubic");
     assert_eq!(back.min_client_capability, opm_app::doc::CAP_MASK, "能力等级必须是 4");
 }
@@ -732,6 +737,46 @@ fn mask_channel_invariants_differ_from_judge_line_tracks() {
         !issues.iter().any(|i| i.pointer.contains("maskZones")),
         "遮蔽区的稀疏轨道是合法的：{}",
         issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>().join("; ")
+    );
+}
+
+/// **一个 active 事件块只能是一种状态**（用户口径 2026-10-02）：手写的 JSON 里出现渐变时，
+/// 校验器必须报出来 —— 写侧（`add_zone_event` / `set_zone_event`）拦得住编辑器，
+/// 拦不住别人手改文件，所以这条不变量在两侧各有一道。
+#[test]
+fn a_ramped_active_block_is_a_validation_error() {
+    use opm_app::doc::{Beat, Event};
+    let mut doc = doc_with_zone();
+    assert!(validate(&doc).iter().all(|i| !i.pointer.contains("maskZones")));
+    // 把第一段改成 false → true（头尾两档）
+    doc.mask_zones[0].active[0].end_value = json!(true);
+    let issues = validate(&doc);
+    let hit = issues
+        .iter()
+        .find(|i| i.pointer.contains("maskZones") && i.pointer.ends_with("active[0]"))
+        .unwrap_or_else(|| {
+            panic!(
+                "渐变 active 块必须报错：{:?}",
+                issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>()
+            )
+        });
+    assert!(matches!(hit.severity, Severity::Error), "{:?}", hit.severity as u8);
+    assert!(hit.message.contains("只能是一种状态"), "{}", hit.message);
+    // 数字写法同理（0.2 / 0.8 也是两档）
+    doc.mask_zones[0].active[0].start_value = json!(0.2);
+    doc.mask_zones[0].active[0].end_value = json!(0.8);
+    assert!(
+        validate(&doc).iter().any(|i| i.pointer.ends_with("active[0]") && i.severity == Severity::Error),
+        "0.2 → 0.8 同样跨档"
+    );
+    // 两档但**分成两块** = 合法的"外观分段切换"
+    doc.mask_zones[0].active = vec![
+        Event::new(Beat::new(4, 1), Beat::new(8, 1), json!(false), json!(false), "linear"),
+        Event::new(Beat::new(8, 1), Beat::new(12, 1), json!(true), json!(true), "linear"),
+    ];
+    assert!(
+        !validate(&doc).iter().any(|i| i.pointer.contains("maskZones")),
+        "分段切换是合法的"
     );
 }
 

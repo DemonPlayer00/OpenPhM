@@ -391,6 +391,24 @@ pub fn validate(doc: &Document) -> Vec<Issue> {
                 if !is_easing(&e.easing) {
                     err!(&format!("{ep}.easing"), format!("未知缓动 {:?}", e.easing));
                 }
+                // **一个 active 事件块只能是一种状态**（用户口径 2026-10-02）：头尾值必须落在同一档，
+                // 否则这块区会在中途换外观（"false 渐变到 true" 就是这种）。要换外观就放**两块**。
+                if track == "active" {
+                    match (
+                        crate::doc::doc_active_state(&e.start_value),
+                        crate::doc::doc_active_state(&e.end_value),
+                    ) {
+                        (Some(a), Some(b)) if a != b => err!(
+                            &ep,
+                            format!(
+                                "active 事件块只能是一种状态：起值 {:?} 与终值 {:?} 分别是 {a} 与 {b}\n                 —— 想中途换外观就放两块（各是一种状态），别用渐变",
+                                e.start_value, e.end_value
+                            )
+                        ),
+                        (None, _) | (_, None) => {}  // 类型不对由别处报（这里不重复）
+                        _ => {}
+                    }
+                }
                 if let Some((ps, pe)) = prev {
                     if e.start < *ps {
                         err!(

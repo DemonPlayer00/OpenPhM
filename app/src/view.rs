@@ -335,6 +335,12 @@ pub struct MaskInspect {
     pub event: Option<MaskEventEdit>,
     /// 播放头那一拍（"在播放头放一块"的缺省起点）
     pub playhead_beat: f64,
+    /// 这块区的 `active` 通道里**有没有哪一块头尾不同档**（用户口径 2026-10-02：
+    /// "一个事件块一种状态"）。手改过 JSON 的谱面会有 —— 校验器也报这一条。
+    ///
+    /// 判据是**逐块**的，不是"整条通道的 min/max"：几块之间取不同的档是**合法**的
+    /// （外观分段切换），只有同一块的头尾不同档才是错的。
+    pub active_mixed: bool,
 }
 
 /// 遮蔽区检查器快照。没选中任何区（或一个区都没有）时给 `None`。
@@ -357,6 +363,15 @@ pub fn mask_inspect(st: &EditorState) -> Option<MaskInspect> {
             }
         })
         .collect();
+    let active_mixed = zone.track(MaskChannel::Active).events.iter().any(|e| {
+        matches!(
+            (
+                crate::doc::doc_active_state(&e.start_value),
+                crate::doc::doc_active_state(&e.end_value),
+            ),
+            (Some(a), Some(b)) if a != b
+        )
+    });
     let event = st.mask_sel.and_then(|i| {
         let t = zone.track(st.selected_channel);
         t.events.get(i).map(|e| MaskEventEdit {
@@ -379,6 +394,7 @@ pub fn mask_inspect(st: &EditorState) -> Option<MaskInspect> {
         channels,
         event,
         playhead_beat: beat,
+        active_mixed,
     })
 }
 

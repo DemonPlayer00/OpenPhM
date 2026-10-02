@@ -5501,3 +5501,45 @@ pub fn resize_pending(&mut self, edge: EventEdge, beat: f64) { … }
 - 实机：`OPM_EDIT_AUTO=mask:x1,2,2.25` + 12 帧指针脚本（y 从 380 挪到 180）+ `OPM_KEY_AUTO=14:R`
   ⇒ 状态栏回执"放下遮蔽区事件（x1）：2.000 → **4.500** 拍"（起稿时那一格是 2.25 ⇒ 长度由指针决定）。
 - **448 测试全绿**（+2）；四配置 0 警告。
+
+---
+
+## 7.93 「每个遮蔽区的 active 事件块只能认领一种状态」（用户口径）（2026-10-02）
+
+用户原话："每个遮蔽区的active事件块只能认领一种状态（true或false）"；追问"那编辑时该是什么形状"，
+回答把粒度钉死了：**"一个事件块一种状态，不能在头和尾有不同状态"**。
+
+于是这不是"整条通道只能一个值"，而是**逐块**的：`startValue` 与 `endValue` 必须落在同一档
+（`≥ 0.5` = true，与求值侧 `perf::mask_state_at` 同一条线）。**渐变块**（`false`→`true`）
+从此不合法 —— 它会渲染出"一格网格渐渐淡出/淡入"的中间态，那正是用户要去掉的东西。
+想中途换外观就放**两块**（各是一种常量）⇒ 外观变成**分段切换**。
+
+### 改了什么
+
+- **判据一份**：`doc::doc_active_state`（值 → 状态）。写侧 `core::check_active_block`
+  在 `add_zone_event` / `set_zone_event` 各拦一道；两个校验器（`cmd::validate`、`spec/check.py`）
+  各报一条 —— 写侧拦的是编辑器，校验器拦的是手改过的文件，两侧都要有。
+  规范 §8 错误表加了第 13 条。
+- **整区切档**：`set_zone {set:{"active":bool}}` —— 已有 `active` 块**跨度不动、值全部改写**成这一档；
+  一块都没有（= false 那档）时按**坐标事件的包络** `[最早起点, 最晚终点)` 写一块
+  （用户口径："这块区存在多久，它就是这个状态"）；一条坐标事件都没有的区**拒绝**
+  （`active` 那时没有意义，不猜一个跨度出来）。
+  记录成 `Change::ZoneTrack`；万一同一命令里还改了名字，用一个显式事务兜住"一个命令 = 一个撤销步"
+  （且**不动调用方自己的事务** —— `journal.in_transaction()` 时不开不关）。
+- **界面**：右栏加 `整区 active` 复选框（一键切档）；选中块那栏的 `active` 从**两个**
+  复选框（"起 true"/"止 true"）改成**一个** —— 那两个复选框正是"头 true 尾 false"这种块的来源。
+  另外当视图模型发现**某一块**头尾不同档时给一句告警（判据是逐块的，不是整条通道的 min/max：
+  几块之间取不同档是合法的，用 min/max 判断会对合法的分段切换误报 —— 这个误报我自己先写出来过）。
+- **例子**：`spec/examples/mask.opm.json` 原来就带着一条 `false→true` 的渐变（新口径下非法），
+  改成两块常量 = 分段切换；`tests/codec.rs` 的遮蔽区夹具同理。
+
+### 证据
+
+- 测试（+3 ⇒ **451 全绿**）：`core::mask_zone_tests::one_active_block_claims_exactly_one_state`
+  （渐变在建/改两头都被拒；数字按 ≥0.5 同样判；整区切档改值不改跨度、一次 Ctrl+Z 回去）、
+  `turning_a_zone_active_writes_one_block_across_its_coord_span`（包络、切回、空区拒绝、非布尔拒绝）、
+  `codec::a_ramped_active_block_is_a_validation_error`（手改 JSON 也报；分段切换放行）。
+- CLI：`set_zone {active:true}` 把两块都改成 true（跨度仍是 `[4,8)`/`[8,12)`）；
+  空区被拒（"这块区还没有任何坐标事件"）；渐变被拒（"active 事件块只能是一种状态…"）；
+  两个校验器对同一份非法文件给出同一条错。
+- 界面截图：`~/.dsh/workspace/OpenPhM-artifacts/mask/active-one-state.png`。

@@ -16,7 +16,13 @@
     "background": null
   },
   "bpmList": [
-    { "startBeat": { "n": 0, "d": 1 }, "bpm": 180.0 }
+    {
+      "startBeat": {
+        "n": 0,
+        "d": 1
+      },
+      "bpm": 180.0
+    }
   ],
   "judgeLines": [
     {
@@ -27,17 +33,59 @@
       "layers": [
         {
           "moveX": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 16,
+                "d": 1
+              },
+              "startValue": 0.0,
+              "endValue": 0.0,
+              "easing": "linear"
+            }
           ]
         }
       ],
       "notes": [
-        { "kind": "tap", "startBeat": { "n": 0, "d": 1 }, "laneX": 0.0 },
-        { "kind": "hold", "startBeat": { "n": 4, "d": 1 }, "endBeat": { "n": 8, "d": 1 },
-          "laneX": -112.5 },
-        { "kind": "tap", "startBeat": { "n": 12, "d": 1 }, "laneX": 112.5 },
-        { "kind": "flick", "startBeat": { "n": 16, "d": 1 }, "laneX": 0.0 }
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "laneX": 0.0
+        },
+        {
+          "kind": "hold",
+          "startBeat": {
+            "n": 4,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "laneX": -112.5
+        },
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 12,
+            "d": 1
+          },
+          "laneX": 112.5
+        },
+        {
+          "kind": "flick",
+          "startBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "laneX": 0.0
+        }
       ]
     }
   ],
@@ -45,34 +93,135 @@
     {
       "name": "躁域",
       "x1": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 8, "d": 1 },
-          "startValue": 0.0, "endValue": 0.0, "easing": "linear" },
-        { "startBeat": { "n": 8, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": 0.0, "endValue": -300.0, "easing": "inOutCubic" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "startValue": 0.0,
+          "endValue": 0.0,
+          "easing": "linear"
+        },
+        {
+          "startBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": 0.0,
+          "endValue": -300.0,
+          "easing": "inOutCubic"
+        }
       ],
       "y1": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": 200.0, "endValue": 200.0, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": 200.0,
+          "endValue": 200.0,
+          "easing": "linear"
+        }
       ],
       "x2": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": -173.205, "endValue": -173.205, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": -173.205,
+          "endValue": -173.205,
+          "easing": "linear"
+        }
       ],
       "y2": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": -100.0, "endValue": -100.0, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": -100.0,
+          "endValue": -100.0,
+          "easing": "linear"
+        }
       ],
       "x3": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": 173.205, "endValue": 173.205, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": 173.205,
+          "endValue": 173.205,
+          "easing": "linear"
+        }
       ],
       "y3": [
-        { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 16, "d": 1 },
-          "startValue": -100.0, "endValue": -100.0, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 16,
+            "d": 1
+          },
+          "startValue": -100.0,
+          "endValue": -100.0,
+          "easing": "linear"
+        }
       ],
       "active": [
-        { "startBeat": { "n": 4, "d": 1 }, "endBeat": { "n": 12, "d": 1 },
-          "startValue": false, "endValue": true, "easing": "linear" }
+        {
+          "startBeat": {
+            "n": 4,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "startValue": false,
+          "endValue": false,
+          "easing": "linear"
+        },
+        {
+          "startBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 12,
+            "d": 1
+          },
+          "startValue": true,
+          "endValue": true,
+          "easing": "linear"
+        }
       ]
     }
   ]
