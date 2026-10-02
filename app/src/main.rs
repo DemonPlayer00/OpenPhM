@@ -5048,6 +5048,28 @@ impl eframe::App for App {
                 self.state.set_note_stack(Vec::new());
             }
 
+            // ---- 正在编辑的那块遮蔽区：预览区里的**白框**（用户口径 2026-10-02）----
+            //
+            // 画在**叠加层之后**：编辑区叠加层盖住整个演奏区（半透明压暗），白框若画在它之前
+            // 就会被一起压暗 —— 而它存在的理由正是"一眼看出我在编哪一块"。
+            // 只在编辑 chrome 在场时画（`overlay_visible`）：播放/按住 H 时那是看画面的时刻。
+            // 取的那块与七列通道、属性编辑器**同源**（`mask_edit_view`：零区时就是那块草稿三角），
+            // 而且只在它**此刻真的存在**时才画（没事件块的区本来就不在画面上，框也就无从画起）。
+            if self.overlay_visible && self.state.mask_edit {
+                let drafted = self.state.mask_edit_view();
+                let tri = drafted.as_deref().and_then(|v| {
+                    opm_app::mask::zone_tri_of(v, &self.state.chart.tmap, self.state.playhead)
+                });
+                if let Some(t) = tri {
+                    let pts: Vec<egui::Pos2> =
+                        t.tri.iter().map(|v| rpe_of(v[0], v[1])).collect();
+                    ui.painter().add(egui::Shape::closed_line(
+                        pts,
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    ));
+                }
+            }
+
             // 对齐自检：用与着色器相同的映射公式，把同一批 RPE 坐标画成十字。
             // 若自研管线的方块与这些十字重合，说明 viewport 映射在任意缩放/布局下都正确。
             if self.args.verify_align {
