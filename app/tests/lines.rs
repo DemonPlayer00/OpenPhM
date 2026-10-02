@@ -164,21 +164,99 @@ fn one_line_change_does_not_move_another_lines_notes() {
     );
     assert_ne!(inst_a[3].center(), inst_b[3].center(), "L1 子音符的位置应随旋转改变");
 }
+
+/// 一条线 + 一颗**一定落在窗口里**的音符（0.5 拍 ⇒ 离判定线 200 单位），线 alpha 由参数给。
+///
+/// 为什么不用 `two_line_doc`：那条线被 `moveY` 推高 300 之后，它的音符在屏幕上是 500 ——
+/// **本来就被窗口裁掉了**。旧用例 `alpha_zero_line_is_not_emitted` 正是栽在这里：
+/// 它断言"α=0 的线连子音符都不上报"，可那颗音符压根不是因为 α 才没的
+/// （无论 α 是多少它都被裁）—— 断言与要守的行为**没关系**，所以它没能发现这个 bug。
+fn line_with_one_note(alpha: f64) -> Document {
+    let mut doc = Document::default();
+    doc.bpm_list = vec![BpmEntry {
+        start: Beat::zero(),
+        bpm: 180.0,
+        foreign: Default::default(),
+    }];
+    doc.judge_lines.clear();
+    let mut l = JudgeLine::default();
+    let end = Beat::new(64, 1);
+    for (track, v) in [
+        ("moveX", 0.0),
+        ("moveY", 0.0),
+        ("rotate", 0.0),
+        ("alpha", alpha),
+        ("speed", 10.0),
+    ] {
+        l.layers[0].track_mut(track).unwrap().clear();
+        l.layers[0]
+            .track_mut(track)
+            .unwrap()
+            .push(Event::new(Beat::zero(), end, json!(v), json!(v), "linear"));
+    }
+    let mut n = DocNote::new(DocKind::Tap, Beat::new(1, 2), 0.0);
+    n.end = None;
+    l.notes.push(n);
+    doc.judge_lines.push(l);
+    doc
+}
+
+/// **判定线透明，音符不跟着透明**（用户报："在判定线透明时 note 也跟着透明了。保持 note 不透明"）。
+///
+/// 口径有出处，不是口味问题：RPE 的 `Alpha` 事件**正常范围 0~255** 控制的是判定线自身的不透明度，
+/// 只有**负数**那条废弃的非法分支才"在隐藏判定线的同时隐藏这条线上的所有 Note"
+/// （Phira Documents「普通事件」；作者 cmdysj 自述该功能废弃）。而 opm 把负 alpha 夹成 0
+/// 并记进保真度报告（`spec/opm-format.md` §3）⇒ opm 表达不了那个分支，
+/// 音符的可见性**只由它自己的 `alpha` 决定**。
+///
+/// 旧写法在 `perf.alpha <= 0.004` 时 `continue` **整条线**（注释还写着"完全透明的线（含子音符）
+/// 不必上报实例"——把耦合当成了前提），音符于是跟着淡、跟着消失。
 #[test]
-fn alpha_zero_line_is_not_emitted() {
-    let mut doc = two_line_doc(0.0);
-    // 把 L1 的 alpha 事件改成 0
-    let l1 = &mut doc.judge_lines[1];
-    let a = l1.layers[0].track_mut("alpha").unwrap();
-    a[0].start_value = json!(0.0);
-    a[0].end_value = json!(0.0);
-    let mut st = EditorState::new(chart_from_doc(&doc));
-    st.lookahead = 2.0;
-    st.selected_line = usize::MAX;
-    let mut inst = Vec::new();
-    build_instances(&st, &mut inst);
-    // 只剩 L0 的 2 个实例（本体 + 1 个可见子音符）
-    assert_eq!(inst.len(), 2, "alpha=0 的线与它的子音符都不该上报实例");
+fn line_alpha_never_reaches_the_notes() {
+    let shots = |alpha: f64| {
+        let mut st = EditorState::new(chart_from_doc(&line_with_one_note(alpha)));
+        st.lookahead = 2.0;
+        st.selected_line = usize::MAX;
+        let mut inst = Vec::new();
+        build_instances(&st, &mut inst);
+        inst
+    };
+    // 本体半宽是 `line_half_w`（整屏宽），音符半宽 46 ⇒ 用半宽一眼分得开
+    let note_of = |v: &[NoteInstance]| {
+        *v.iter()
+            .find(|i| i.half()[0].abs() < 100.0)
+            .expect("这颗音符该在窗口里")
+    };
+    let body_of = |v: &[NoteInstance]| v.iter().find(|i| i.half()[0].abs() >= 100.0).copied();
+
+    let full = shots(1.0);
+    assert_eq!(full.len(), 2, "α=1 ⇒ 本体 + 音符，实际 {} 个实例", full.len());
+    assert!((note_of(&full).color()[3] - 1.0).abs() < 1e-6);
+
+    // 半透明的线：**只有本体淡**
+    let dim = shots(0.3);
+    let body = body_of(&dim).expect("本体还在");
+    assert!(
+        (body.color()[3] - 0.55 * 0.3).abs() < 1e-6,
+        "本体该按 α 淡，实际 {:?}",
+        body.color()
+    );
+    assert_eq!(
+        note_of(&dim).color(),
+        note_of(&full).color(),
+        "音符不该跟着判定线变透明"
+    );
+
+    // 完全透明的线：**本体没了，音符照旧**
+    let gone = shots(0.0);
+    assert!(body_of(&gone).is_none(), "α=0 的判定线不该上报本体");
+    assert_eq!(gone.len(), 1, "只该剩那颗音符，实际 {} 个实例", gone.len());
+    assert_eq!(
+        note_of(&gone).color(),
+        note_of(&full).color(),
+        "α=0 也不许碰音符"
+    );
+    assert_eq!(note_of(&gone).center(), note_of(&full).center(), "位置也不受影响");
 }
 /// **下落速度必须与 RPE 一致**（用户要求"保持和RPE一致流速"）。
 ///

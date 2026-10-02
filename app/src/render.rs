@@ -643,13 +643,16 @@ pub fn hit_fx_progress(note: &Note, tmap: &perf::TimeMap, playhead: f64) -> Opti
 /// 判定线上那一点（音符的 `laneX`、线本地 y = 0）闪一下 —— 白闪 + 一圈向外扩散的方框。
 /// 渲染层只有实例化的方块可用，所以"环"是**四条细边拼的空心方框**（跟着判定线一起转）。
 /// 颜色取音符类型的颜色（环）与白色（闪），与游戏里"打击点亮一下"的观感一致。
+///
+/// **不乘判定线的 alpha**（这里曾经收一个 `alpha` 参数，就是线 alpha）：击中效果是**音符的**
+/// 反馈，跟着音符走 —— 线透明时音符照常下落照常被打，那一下闪光也该照常出现。
+/// 这是一处**判断**（RPE 文档只写了线 alpha 管线的本体、没写击中效果归属谁），记在这里备查。
 fn push_hit_fx(
     out: &mut Vec<NoteInstance>,
     perf: &perf::LinePerf,
     lane_x: f32,
     angle: f32,
     rgb: [f32; 3],
-    alpha: f32,
     t: f32,
 ) {
     let t = t.clamp(0.0, 1.0);
@@ -659,7 +662,7 @@ fn push_hit_fx(
     out.push(NoteInstance::new(
         perf.apply([lane_x, 0.0]),
         [fw, fw * (NOTE_H / NOTE_W)],
-        [1.0, 1.0, 1.0, 0.85 * flash * alpha],
+        [1.0, 1.0, 1.0, 0.85 * flash],
         angle,
     ));
     // ② 扩散的方框：向外扩到约 3 倍，同时淡出
@@ -669,7 +672,7 @@ fn push_hit_fx(
         rgb[0] * 0.35 + 0.65,
         rgb[1] * 0.35 + 0.65,
         rgb[2] * 0.35 + 0.65,
-        0.9 * (1.0 - t) * alpha,
+        0.9 * (1.0 - t),
     ];
     for (dx, dy, hx, hy) in [
         (0.0, half, half, w),
@@ -727,25 +730,35 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
 
     for (li, line) in chart.lines.iter().enumerate() {
         let perf = line.perf(tmap, state.playhead);
-        if perf.alpha <= 0.004 {
-            continue; // 完全透明的线（含子音符）不必上报实例
-        }
         let angle = perf.rotate_rad();
 
         // ---- 判定线本体：一条贯穿全宽的细条（±675），跟着旋转 ----
+        //
+        // **`alpha` 只管这一条本体**。这条口径有出处：RPE 的 `Alpha` 事件**正常范围 0~255**
+        // 控制的是判定线自身的不透明度，只有**负数**那条废弃的非法分支才"在隐藏判定线的同时
+        // 隐藏这条线上的所有 Note"（Phira Documents「普通事件」；作者 cmdysj 自述该功能废弃）。
+        // 而 opm 把负 alpha 夹成 0 并记进保真度报告（`spec/opm-format.md` §3）⇒ opm **表达不了**
+        // "连音符一起隐藏"，音符的可见性只由它自己的 `alpha` 决定。
+        //
+        // 所以这里**不能**再按 `perf.alpha` 早退整条线 —— 那会把该线的音符一起吞掉
+        // （用户报："在判定线透明时 note 也跟着透明了"。旧写法是 `if perf.alpha <= 0.004
+        // { continue; }`，注释还写着"含子音符"，是把这个耦合当成了前提）。
+        // 完全透明的线省掉本体这一个实例就够，音符照走。
         let selected = li == state.selected_line;
-        let mut lc = if selected {
-            [0.95, 0.85, 0.35, 0.95]
-        } else {
-            [0.55, 0.60, 0.75, 0.55]
-        };
-        lc[3] *= perf.alpha;
-        out.push(NoteInstance::new(
-            perf.apply([0.0, 0.0]),
-            [state.line_half_w, 3.0],
-            lc,
-            angle,
-        ));
+        if perf.alpha > 0.004 {
+            let mut lc = if selected {
+                [0.95, 0.85, 0.35, 0.95]
+            } else {
+                [0.55, 0.60, 0.75, 0.55]
+            };
+            lc[3] *= perf.alpha;
+            out.push(NoteInstance::new(
+                perf.apply([0.0, 0.0]),
+                [state.line_half_w, 3.0],
+                lc,
+                angle,
+            ));
+        }
 
         // ---- 子音符 ----
         //
@@ -889,14 +902,15 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
             // "播一次"落实成"在某个时刻之后的一小段窗口里画它" —— 见 `hit_fx_progress`。
             if let Some(t) = hit_fx_progress(note, &state.chart.tmap, state.playhead) {
                 let c = note.kind.color();
-                push_hit_fx(out, &perf, note.lane_x, angle, [c[0], c[1], c[2]], perf.alpha, t);
+                push_hit_fx(out, &perf, note.lane_x, angle, [c[0], c[1], c[2]], t);
             }
 
+            // 音符**不乘判定线的 alpha**：线透明是线的事（见上面"alpha 只管线本体"）。
+            // 音符自己的 `alpha` 字段是另一回事，目前渲染没用它 —— 别把两件事混起来。
             let mut color = note.kind.color();
-            color[3] *= perf.alpha;
             let hold_selected = selected && state.is_note_selected(idx);
             if hold_selected {
-                color = [1.0, 1.0, 1.0, perf.alpha];
+                color = [1.0, 1.0, 1.0, 1.0];
             }
 
             // ---- hold 的身子：被"按住"吃掉的那一段不再画（从判定线起算到尾巴）----
@@ -914,7 +928,7 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
                 // 身子**整段都在判定线之下**（含贴线的那一端）⇒ 不画，与上面同一条口径
                 if dy.abs() > 1.0 && body_a.max(tail_y) > 0.0 {
                     let mid_local = [note.lane_x, body_a + dy * 0.5];
-                    let mut hc = [color[0], color[1], color[2], 0.55 * perf.alpha];
+                    let mut hc = [color[0], color[1], color[2], 0.55];
                     if hold_selected {
                         hc = [1.0, 1.0, 1.0, 0.7];
                     }
