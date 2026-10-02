@@ -1041,7 +1041,7 @@ pub fn draw(
         // 简短：右半的列名就在同一行，长标题会跟列名叠字（其余信息在工具栏/检查器里）
         if mask_mode {
             format!(
-                "遮蔽区编辑 [{} 拍] · 七条通道 · R/双击放块 · Del 删除 · Ctrl+滚轮 缩放 · H 隐藏",
+                "遮蔽区编辑 [{} 拍] · 七条通道 · R 起稿放块 · Del 删除 · Ctrl+滚轮 缩放 · H 隐藏",
                 beats as i64
             )
         } else {
@@ -1913,7 +1913,8 @@ fn draft_gesture(
 /// 单文件里两套列布局并存是刻意的 —— 判定线那边还挂着多选、组拖动、框选、跨图层合并地址，
 /// 把这些一起泛化会让 3000 行的叠加层多出一层抽象，而收益只是"少写 120 行"。
 ///
-/// 它**没有自己的键位**（放块靠双击、删除靠全局 Del），滚轮换算与普通模式**逐字相同** ——
+/// 它**放块的手势与普通模式共用一份实现**（`R` 起稿 → 跟随 → `R`/回车/左键放下，见
+/// `draft_gesture`），删除靠全局 `Del`；滚轮换算与普通模式**逐字相同** ——
 /// 用户口径："统一两个模式下的滚轮滑动速度"。
 #[allow(clippy::too_many_arguments)]
 fn draw_mask_pane(
@@ -3901,6 +3902,61 @@ mod tests {
         assert_eq!(note_box_hits(&boxes, sel), vec![0], "框在 hold 身体上也要选中它");
         let sel2 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 50.0));
         assert!(note_box_hits(&boxes, sel2).is_empty());
+    }
+
+    /// **遮蔽区草稿要跟着指针走**（用户报："按下 r 能出现临时事件块，但鼠标移动无法控制长度"）。
+    ///
+    /// 机制级回归：面板必须**发出** `DraftFollow`（这一段），状态层必须把它送给遮蔽区那一支
+    /// （`state::follow_pending`，见 `state::mask_draft_tests` 那条）—— 缺任何一段都会表现为
+    /// "起稿成功、鼠标却不动长度"，而且不报错。当初缺的正是第二段：`main.rs` 的
+    /// `DraftFollow` 只认"事件草稿 / hold"，遮蔽区草稿静默落到 hold 上。
+    #[test]
+    fn a_mask_draft_follows_the_pointer() {
+        let mut st = state_with_events();
+        st.mask_edit = true;
+        st.overlay_beats = 32.0;
+        // 起稿：x1 通道、10 拍处（长度先给一个格点）
+        assert!(st.begin_pending_mask(MaskChannel::X1, 0, 10.0));
+        let end0 = st.pending_mask.expect("草稿").end.to_f64();
+
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        // 指针依次停在 y=380（更早的拍）→ y=200（更晚）→ y=380：**帧间位移**就是跟随的信号
+        let mut follows: Vec<f64> = Vec::new();
+        for y in [380.0f32, 200.0, 380.0] {
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![egui::Event::PointerMoved(egui::pos2(600.0, y))],
+                ..Default::default()
+            };
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            follows.extend(acts.iter().filter_map(|a| match a {
+                OverlayAction::DraftFollow { beat } => Some(*beat),
+                _ => None,
+            }));
+        }
+        assert_eq!(follows.len(), 2, "两次位移 ⇒ 两条 DraftFollow：{follows:?}");
+        let (up, down) = (follows[0], follows[1]);
+        assert!(up > down, "指针往上 = 更晚的拍：{up} 应晚于 {down}");
+
+        // 动作接上状态层：草稿的终点真的跟着走（往上变长）
+        st.follow_pending(up);
+        let grown = st.pending_mask.expect("草稿还在").end.to_f64();
+        assert!(grown > end0, "跟随之后终点要变大：{end0} → {grown}");
+        // 往回拖：**保底一个格点**（与判定线那边同一条规则），不会把草稿拖没
+        st.follow_pending(down);
+        let back = st.pending_mask.expect("草稿还在");
+        let floor = back.start.to_f64() + st.beat_step();
+        assert!(
+            (back.end.to_f64() - floor).abs() < 1e-9,
+            "反拖到起点之前 ⇒ 停在保底长度 {floor}，实际 {}",
+            back.end.to_f64()
+        );
     }
 
     /// **遮蔽区编辑模式下按 R 起的是草稿，不是就地放一块** —— 与判定线事件区同一套手势

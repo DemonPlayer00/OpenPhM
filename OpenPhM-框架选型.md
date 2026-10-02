@@ -5438,3 +5438,66 @@ windows 那两条一直是红的（这次才发现）。
   状态栏"放下遮蔽区事件（x1）：2.000 → 6.000 拍（值取此刻的值）"。
   夹取版：在 `spec/examples/mask.opm.json` 上 `mask:x1,2,20` ⇒ 草稿停在 8 拍（下一块起点）。
 - 446 测试全绿；Linux / Windows-gnu × debug / release 四配置 **0 警告**。
+
+---
+
+## 7.92 「按 `R` 能起稿，但鼠标不动长度」：**第二张分派表**漏了一支（用户报）（2026-10-02）
+
+用户原话："在屏蔽区编辑器按下r能够出现临时事件块，但鼠标移动无法控制长度"。
+
+### 成因
+
+`draft_gesture`（两个模式共用的草稿手势）会把指针位移发成 `OverlayAction::DraftFollow`，
+但 `main.rs` 里那张**分派表**还停在加遮蔽区草稿之前的形态：
+
+```rust
+OverlayAction::DraftFollow { beat } => {
+    if self.state.pending_event.is_some() { self.state.follow_pending_event(beat); }
+    else { self.state.follow_pending_hold(beat); }        // ← 遮蔽区草稿静默落到这里
+}
+```
+
+遮蔽区草稿既不是 `pending_event` 也不是 `pending_hold` ⇒ 落到 hold 那一支 ⇒
+`follow_pending_hold` 见到 `pending_hold == None` 就什么都不做。**没有任何报错**，
+因为"什么都没做"是合法状态。`DraftResize`（拖控制杆）同病。
+
+这是"同一件事写两遍"的又一例，而且是这一批（§7.91）刚刚清理过的那类：
+上一步把"跨度规则"收敛成一份，却把**"现在是哪个草稿"**留在了调用方。
+
+### 做法
+
+把这张表也收进状态层，调用方不再判：
+
+```rust
+pub fn follow_pending(&mut self, beat: f64) {      // 三种草稿各一支
+    if self.pending_mask.is_some() { self.follow_pending_mask(beat) }
+    else if self.pending_event.is_some() { self.follow_pending_event(beat) }
+    else { self.follow_pending_hold(beat) }
+}
+pub fn resize_pending(&mut self, edge: EventEdge, beat: f64) { … }
+```
+
+`main.rs` 那两行于是变成一句转发；`set_mask_edit` 里"切模式时丢掉草稿"的那个
+`if pending_event.is_some() || pending_hold.is_some()` 也一并改成无条件的 `cancel_pending()`
+（同样是不该存在的"哪种草稿"判断）。**再加草稿种类时，只需要在这两个函数里各加一支。**
+
+### 顺带：让 `OPM_CURSOR` 真的能驱动指针
+
+这条 bug 之所以只能靠用户的眼睛发现，是因为当时的 `OPM_CURSOR` 只假装了**柔光算的那份位置**
+（`self.cursor_auto`），并没有进 egui 的输入：pane 拿到的 `ptr` 恒为 `None`，
+"移动鼠标改长度"这条路径**拍不出来**。
+
+现在 `OPM_CURSOR` 改由 `eframe::App::raw_input_hook` 注入（egui `begin_pass` **之前**），
+并且支持 `x,y; x,y; …` 的**逐帧脚本** —— 指针真的有位移，悬停/`delta`/拖动判定与真指针一致。
+克制点写进 README：**不要**改成在 `ctx.input_mut` 里塞 `PointerMoved`，那是晚的
+（`hover_pos`、`delta` 都由 `begin_pass` 从 `RawInput` 算出来）。
+
+### 证据
+
+- 无头 egui：`overlay::tests::a_mask_draft_follows_the_pointer`（指针两帧位移 ⇒ 必须产出
+  `DraftFollow`，且状态层接上之后终点真的变长、反拖停在保底长度）。
+- 状态层：`state::mask_draft_tests::every_draft_kind_is_driven_by_the_shared_follow_and_resize_entry_points`
+  （hold / 事件块 / 遮蔽区三种草稿各走一遍 `follow_pending` / `resize_pending` —— 少一支就红）。
+- 实机：`OPM_EDIT_AUTO=mask:x1,2,2.25` + 12 帧指针脚本（y 从 380 挪到 180）+ `OPM_KEY_AUTO=14:R`
+  ⇒ 状态栏回执"放下遮蔽区事件（x1）：2.000 → **4.500** 拍"（起稿时那一格是 2.25 ⇒ 长度由指针决定）。
+- **448 测试全绿**（+2）；四配置 0 警告。

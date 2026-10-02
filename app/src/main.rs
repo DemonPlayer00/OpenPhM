@@ -308,6 +308,24 @@ impl Trace {
     }
 }
 
+/// `OPM_CURSOR="x,y[; x,y]…"` → 假指针的**多帧脚本**（每帧挪一格，走完停在最后一格）。
+///
+/// 解析放在函数里是因为它有两个使用点：`main` 的启动横幅，和 `App::new` 的字段初值。
+/// 单点写法（`OPM_CURSOR=700,300`）仍然只有一个位置 ⇒ 指针停着不动（老用法不变）。
+fn cursor_script_from_env() -> Vec<egui::Pos2> {
+    std::env::var("OPM_CURSOR")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .filter_map(|one| {
+                    let (x, y) = one.split_once(',')?;
+                    Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `OPM_KEY_AUTO` 的一小片语法：`[ctrl+][shift+]键名` → `(修饰键, egui::Key)`。
 ///
 /// 只认够用的那几个（这是自动化钩子，不是键盘映射表）：`ctrl` / `shift` / `alt` 前缀，
@@ -416,8 +434,13 @@ fn main() -> eframe::Result<()> {
     //
     // 崩溃检查也从这里搬走了（用户口径："不要启动时检查崩溃，而是在打开谱面文件时检查"）：
     // 启动时不再扫缓存根目录；谁在打开哪份谱面，就在那一刻查那一份（见 `App::open_doc`）。
-    if let Ok(v) = std::env::var("OPM_CURSOR") {
-        println!("  OPM_CURSOR       : {v}（假装指针停在这里，用于验证遮蔽区的播放期柔光）");
+    let cursor_script = cursor_script_from_env();
+    if !cursor_script.is_empty() {
+        println!(
+            "  OPM_CURSOR       : {} 个位置（{}），每帧挪一格（假装指针，用于验证柔光/草稿跟随/拖动夹取）",
+            cursor_script.len(),
+            std::env::var("OPM_CURSOR").unwrap_or_default().trim()
+        );
     }
     println!(
         "  解压缓存根目录    : {}（每份谱面一把锁：lock.pid）",
@@ -1039,9 +1062,16 @@ struct App {
     /// `OPM_RESUME_AUTO=continue|discard|later`：遗留缓存对话框替人做选择（截图/CI 用）。
     /// 与 `launch_auto` 同类 —— **只在启动时读一次**。
     resume_auto: Option<String>,
-    /// `OPM_CURSOR=x,y`：假装指针停在这个屏幕点上（只为验证"播放时的那圈柔光"；
-    /// Wayland 下没法注入鼠标，而它是个纯视觉的中间态）。`None` = 用真实指针。
+    /// **这一帧的假指针**（`OPM_CURSOR`；`None` = 用真实指针）。
+    ///
+    /// 它由 [`eframe::App::raw_input_hook`] 每帧填 —— 注入点在 `begin_pass` **之前**，
+    /// 所以悬停、`pointer.delta`、拖动全都跟真指针一样（只在 `OPM_CURSOR` 非空时生效）。
     cursor_auto: Option<egui::Pos2>,
+    /// `OPM_CURSOR` 的**多帧脚本**（`x,y; x,y; …`，每帧挪一格，走完停在最后一格）——
+    /// 有位移才有的东西才拍得出来：草稿跟随、拖动夹取、悬停命中。
+    cursor_script: Vec<egui::Pos2>,
+    /// 脚本走到第几格
+    cursor_step: usize,
     /// 这一帧**问过用户**"那份缓存要不要继续"吗（`launch_page` 靠它避免同一帧做第二个决定）
     resume_asked: bool,
     /// 「上次没有正常退出」这份待问的遗留缓存（`None` = 没有 / 已经问过）
@@ -1278,12 +1308,12 @@ impl App {
             launch_auto: std::env::var("OPM_LAUNCH_AUTO").ok(),
             snapshot_at: Instant::now(),
             snapshot_err: None,
-            // 启动期钩子：**假装指针在这个位置**（屏幕点）。Wayland 下没法注入鼠标事件，
-            // 而"播放时光标附近那一圈柔光"正好是拍不出来的中间态 —— 与 `OPM_KEY_AUTO` 同类。
-            cursor_auto: std::env::var("OPM_CURSOR").ok().and_then(|v| {
-                let (x, y) = v.split_once(',')?;
-                Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
-            }),
+            // 启动期钩子：**假装指针**（屏幕点；`;` 分隔 = 每帧挪一格）。Wayland 下没法注入
+            // 鼠标事件，而"播放时那圈柔光""草稿跟着鼠标走""拖到邻块就停"全是拍不出来的中间态
+            // —— 与 `OPM_KEY_AUTO` 同类，只在启动时读一次。
+            cursor_auto: None,
+            cursor_script: cursor_script_from_env(),
+            cursor_step: 0,
             // 启动期钩子：遗留缓存对话框怎么选（`continue|discard|later`）—— 与 `OPM_LAUNCH_AUTO`
             // 同类，只在启动时读一次，给 agent 一条"把这一步走完"的路（没人能替它点鼠标）
             resume_auto: std::env::var("OPM_RESUME_AUTO").ok(),
@@ -1560,19 +1590,12 @@ impl App {
                     ));
                 }
                 // ---- 草稿（hold 或事件块）：跟随 / 拖控制杆 / 放下 / 取消 ----
-                OverlayAction::DraftFollow { beat } => {
-                    if self.state.pending_event.is_some() {
-                        self.state.follow_pending_event(beat);
-                    } else {
-                        self.state.follow_pending_hold(beat);
-                    }
-                }
+                // 跟随/拖控制杆：**"现在是哪个草稿"由状态层回答**（`follow_pending` /
+                // `resize_pending` 里三种草稿各一支）—— 这里再判一次就会漏掉一支，
+                // 而漏掉的表现是静默的："起稿成功、鼠标却不动长度"。
+                OverlayAction::DraftFollow { beat } => self.state.follow_pending(beat),
                 OverlayAction::DraftResize { edge, beat } => {
-                    if self.state.pending_event.is_some() {
-                        self.state.resize_pending_event(edge, beat);
-                    } else {
-                        self.state.resize_pending_hold(edge, beat);
-                    }
+                    self.state.resize_pending(edge, beat)
                 }
                 OverlayAction::DraftCommit => {
                     if let Some(e) = self.state.take_pending_event() {
@@ -2022,11 +2045,10 @@ impl App {
         }
         self.state.mask_edit = on;
         self.state.clear_mask_selection();
-        if self.state.pending_event.is_some() || self.state.pending_hold.is_some() {
-            // 草稿（按住 R 之后的跟随状态）属于普通模式：切模式时丢掉它，
-            // 免得"切回去之后一个 hold 还在跟着鼠标"
-            self.state.cancel_pending();
-        }
+        // 草稿（按住 R 之后的跟随状态）属于**某一个**模式：切模式时统统丢掉，
+        // 免得"切过去之后一个 hold / 事件块还在跟着鼠标"。不留"哪种草稿"的判断 ——
+        // 那种判断每加一种草稿就要改一处（这个 bug 就是这么来的）。
+        self.state.cancel_pending();
         if on {
             self.state.clamp_mask();
             let n = self.state.chart.zones.len();
@@ -2034,7 +2056,7 @@ impl App {
                 true,
                 if n == 0 {
                     "遮蔽区编辑模式：还没有遮蔽区 —— 编辑区里画的是**默认的中央正三角形**，\
-                     动一下编辑（双击放块 / 属性编辑器）就会先建区再应用，一次 Ctrl+Z 全回去"
+                     动一下编辑（R 起稿并放下 / 右栏按钮）就会先建区再应用，一次 Ctrl+Z 全回去"
                         .to_owned()
                 } else {
                     format!("遮蔽区编辑模式：当前 #{}（共 {n} 块）", self.state.selected_zone)
@@ -3820,6 +3842,22 @@ impl eframe::App for App {
             // 启动页用同一族的深色，但slightly偏冷，与编辑页一眼可分
             _ => egui::Color32::from_rgb(20, 22, 30).to_normalized_gamma_f32(),
         }
+    }
+
+    /// `OPM_CURSOR` 的注入点：**必须在 `begin_pass` 之前**。
+    ///
+    /// `OPM_KEY_AUTO` 能在 `ctx.input_mut` 里塞事件，是因为键另有 `events` 列表可查；
+    /// 指针不行 —— `hover_pos` / `pointer.delta` 都是 `begin_pass` 从 `RawInput` 算出来的，
+    /// 晚了就只剩"看起来像"，`ui.interact` 一律拿不到（实测：这样注入的指针连悬停都不算）。
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.cursor_script.is_empty() {
+            return;
+        }
+        let step = self.cursor_step.min(self.cursor_script.len() - 1);
+        let pos = self.cursor_script[step];
+        self.cursor_step = self.cursor_step.saturating_add(1);
+        self.cursor_auto = Some(pos);
+        raw_input.events.push(egui::Event::PointerMoved(pos));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

@@ -1926,6 +1926,32 @@ impl EditorState {
         self.pending_mask = None;
     }
 
+    /// 鼠标移动 ⇒ 改**当前那个**草稿的长度。
+    ///
+    /// 三种草稿（hold / 判定线事件块 / 遮蔽区事件块）在这里各占一支，**调用方只发"跟随"**。
+    /// 让调用方自己判"现在是哪个草稿"正是这个 bug 的来源：加遮蔽区草稿时漏了一支，
+    /// 表现是"按 R 能起稿、鼠标却不动长度"—— 而且不报错，因为那一支静默落到了 hold 上。
+    pub fn follow_pending(&mut self, beat: f64) {
+        if self.pending_mask.is_some() {
+            self.follow_pending_mask(beat);
+        } else if self.pending_event.is_some() {
+            self.follow_pending_event(beat);
+        } else {
+            self.follow_pending_hold(beat);
+        }
+    }
+
+    /// 拖草稿的控制杆 ⇒ 改当前那个草稿的起点/终点（同 [`Self::follow_pending`]）
+    pub fn resize_pending(&mut self, edge: EventEdge, beat: f64) {
+        if self.pending_mask.is_some() {
+            self.resize_pending_mask(edge, beat);
+        } else if self.pending_event.is_some() {
+            self.resize_pending_event(edge, beat);
+        } else {
+            self.resize_pending_hold(edge, beat);
+        }
+    }
+
     /// 鼠标移动：hold 的长度跟着走（保底一个格点）
     pub fn follow_pending_hold(&mut self, beat: f64) {
         let step = self.beat_step();
@@ -3258,6 +3284,55 @@ mod mask_draft_tests {
         let d = st.pending_mask.unwrap();
         assert_eq!(d.start, crate::doc::Beat::new(1, 3));
         assert_eq!(d.end, crate::doc::Beat::new(1, 2), "上限重算了");
+    }
+
+    /// **三种草稿都要能被同一条"跟随 / 拖控制杆"入口驱动**。
+    ///
+    /// 这条是血换来的：遮蔽区草稿刚加进来时，`main.rs` 的 `DraftFollow` / `DraftResize` 还写着
+    /// "有事件草稿就给它、否则给 hold"，于是遮蔽区草稿**静默地**落到 hold 那一支 ——
+    /// 现象是"按 R 能起稿、鼠标却不动长度"，一点报错都没有。
+    /// 现在"现在是哪个草稿"只有 [`EditorState::follow_pending`] / [`EditorState::resize_pending`]
+    /// 一处回答，这条测试盯着三种草稿在那两个入口下的行为。
+    #[test]
+    fn every_draft_kind_is_driven_by_the_shared_follow_and_resize_entry_points() {
+        // ---- hold（音符区）----
+        let mut st = EditorState::new(chart_from_doc(&Document::default()));
+        st.begin_pending_hold(0.0, 1.0);
+        let end0 = st.pending_hold.unwrap().end_beat;
+        st.follow_pending(6.0);
+        assert!(st.pending_hold.unwrap().end_beat > end0, "hold：跟随要改长度");
+        st.resize_pending(EventEdge::End, 9.0);
+        assert_eq!(st.pending_hold.unwrap().end_beat, 9.0, "hold：控制杆要能动终点");
+        st.cancel_pending();
+
+        // ---- 判定线事件块 ----
+        let mut st = EditorState::new(chart_from_doc(&Document::default()));
+        st.begin_pending_event(TrackId::Alpha, 1.0);
+        let end0 = st.pending_event.unwrap().end_beat;
+        st.follow_pending(6.0);
+        assert!(st.pending_event.unwrap().end_beat > end0, "事件块：跟随要改长度");
+        st.resize_pending(EventEdge::End, 9.0);
+        assert_eq!(st.pending_event.unwrap().end_beat, 9.0, "事件块：控制杆要能动终点");
+        st.cancel_pending();
+
+        // ---- 遮蔽区事件块（本条的来由）----
+        let mut st = off_grid_neighbour();
+        assert!(st.begin_pending_mask(MaskChannel::X1, 0, 10.0));
+        let end0 = st.pending_mask.unwrap().end;
+        st.follow_pending(12.0);
+        let d = st.pending_mask.expect("草稿还在");
+        assert!(
+            d.end > end0,
+            "遮蔽区：跟随要改长度（曾经落到 hold 那一支 ⇒ 鼠标不动：{end0:?} → {:?}）",
+            d.end
+        );
+        st.resize_pending(EventEdge::End, 14.0);
+        assert_eq!(st.pending_mask.unwrap().end.to_f64(), 14.0, "遮蔽区：控制杆要能动终点");
+        // 起点那一头同样要能拖（并且上限随起点重算）
+        st.resize_pending(EventEdge::Start, 13.0);
+        let d = st.pending_mask.unwrap();
+        assert_eq!(d.start.to_f64(), 13.0);
+        assert!(d.end > d.start, "起点拖到终点之前 ⇒ 跨度仍然合法");
     }
 
     /// 新建区的起点口径：**一块都没有 ⇒ 拍 0**（草稿三角就是它），已有区 ⇒ 播放头

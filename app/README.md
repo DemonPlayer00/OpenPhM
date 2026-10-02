@@ -809,8 +809,15 @@ STORE/DEFLATE 包都能读 + CRC 校验 + 截断/坏 CRC 明确报错。
 缓存随目录一起删掉），快照是**没走到退出**那条路上的兜底。
 
 自动化钩子（截图/CI 用，与 `OPM_LAUNCH_AUTO` 同类，只在启动时读一次）：
-`OPM_RESUME_AUTO=continue|discard|later`、**`OPM_CURSOR=x,y`**（假装指针停在这个屏幕点上 ——
-Wayland 下没法注入鼠标，而"播放时遮蔽区那圈柔光"正好是个纯视觉的中间态）。
+`OPM_RESUME_AUTO=continue|discard|later`、`OPM_KEY_AUTO=<帧号>:<键>[,…][;…]`、
+**`OPM_CURSOR=x,y[; x,y]…`**（假装指针：多段用 `;` 分隔 = **每帧挪一格**，走完停在最后一格）。
+
+`OPM_CURSOR` 的注入点在 `eframe::App::raw_input_hook` —— 也就是 egui `begin_pass` **之前**，
+所以悬停、`pointer.delta`、拖动判定全都和真指针一模一样（Wayland 下没法注入鼠标）。
+注意别改成在 `ctx.input_mut` 里塞 `PointerMoved`：那是**晚**的，`hover_pos` 与 `delta` 都是
+`begin_pass` 从 `RawInput` 算出来的，晚塞只会让 hover 永远为假（`OPM_KEY_AUTO` 能那么写，
+是因为键另有 `events` 列表可查）。有位移才存在的中间态（播放期柔光、草稿跟随、拖到邻块停住）
+都得靠它才拍得出来。
 
 **载入的四种形态**（都是 `EditCore::stage_file` 认的，按内容判、不看扩展名）：
 
