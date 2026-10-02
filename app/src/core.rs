@@ -2013,10 +2013,10 @@ impl EditCore {
             // · 事件块的值可以是非数值（`active` 写 `true`/`false`），求值器按 0/1 处理。
             "add_zone" => {
                 let start = c.get("startBeat").map(parse_beat).transpose()?.unwrap_or_else(Beat::zero);
-                // 终点：`MaskZone::default_span`（谱面末尾与"起点后 4 拍"取大者）——
-                // **不学 `set_track_constant` 的 `chart_end + 1024`**：那会把 `chart_end` 自己
-                // 顶高 1024 拍（时间轴跟着变长）。这条规则与界面的草稿三角共用一份（见 `default_span`）。
-                let (_, default_end) = MaskZone::default_span(start, self.doc.chart_end());
+                // 终点：`MaskZone::default_span`（**起点 + 1 拍**，用户口径 2026-10-02）——
+                // 不铺到谱面末尾：块的跨度就是这块区域存在的时段（见 `perf::mask_state_at`），
+                // "整首都在"不该是默认。这条规则与界面的草稿三角共用一份（见 `default_span`）。
+                let (_, default_end) = MaskZone::default_span(start);
                 let end = c
                     .get("endBeat")
                     .map(parse_beat)
@@ -3644,8 +3644,8 @@ mod mask_zone_tests {
         let x1 = &z.x1[0];
         assert_eq!(x1.start_value, json!(MASK_DEFAULT_TRIANGLE[0][0]));
         assert_eq!(x1.start_value, x1.end_value, "常量事件（新建时不该有斜坡）");
-        // 终点：谱面还没有内容 ⇒ 起点 + 4 拍
-        assert_eq!(z.x1[0].end.to_f64(), 4.0);
+        // 终点：**起点 + 1 拍**（用户口径："调整初始屏蔽区事件区间为 0~1 拍"）
+        assert_eq!(z.x1[0].end.to_f64(), 1.0);
     }
 
     /// `empty: true` 建一个**没有任何事件**的区：预览里它不存在（三条坐标轨道都没事件）

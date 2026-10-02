@@ -708,9 +708,9 @@ fn mask_channel_invariants_differ_from_judge_line_tracks() {
     assert!(mask.is_empty(), "{mask:?}");
 
     let mut broken = doc.clone();
-    // x1 是 [0,4]（默认三角那条常量段）+ [8,16]（后插的那块）⇒ 把后者起点提到 2，造一处重叠
+    // x1 是 [0,1]（默认三角那条种子块）+ [8,16]（后插的那块）⇒ 把后者起点压到 0，与前者重叠
     assert_eq!(broken.mask_zones[0].x1.len(), 2);
-    broken.mask_zones[0].x1[1].start = opm_app::doc::Beat::new(2, 1);
+    broken.mask_zones[0].x1[1].start = opm_app::doc::Beat::new(0, 1);
     let issues = validate(&broken);
     assert!(
         issues.iter().any(|i| i.pointer.contains("maskZones") && i.severity == Severity::Error),

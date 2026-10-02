@@ -1799,13 +1799,10 @@ impl EditorState {
     /// 界面（草稿视图 + `add_zone` 命令）与核心那边用的是**同一个** `default_span`，
     /// 所以"屏幕上画的那个三角"与"真正建出来的那个"不会分家。
     pub fn mask_new_zone_span(&self) -> (crate::doc::Beat, crate::doc::Beat) {
-        // **起点固定在拍 0**（用户口径 2026-10-02："0 个屏蔽区时初始事件固定在 0 处"）——
-        // 草稿三角与"动第一下"时真正建出来的那块，事件都从谱面开头开始：
-        // 拖动播放头不该让待建的区前后挪动，而"这块躁域整首都在"也是最常见的用法。
-        crate::doc::MaskZone::default_span(
-            crate::doc::Beat::zero(),
-            crate::codec::beat_from_f64(self.content_end_beat),
-        )
+        // **起点固定在拍 0**（用户口径 2026-10-02："0 个屏蔽区时初始事件固定在 0 处"），
+        // 长度 1 拍（同一批："调整初始屏蔽区事件区间为 0~1 拍"）⇒ 草稿就是 `[0, 1]`：
+        // 拖动播放头不该让待建的区前后挪动，而"整首都在"也不该是默认。
+        crate::doc::MaskZone::default_span(crate::doc::Beat::zero())
     }
 
     /// 选中区的那条通道
@@ -2894,10 +2891,15 @@ mod mask_draft_tests {
             let want = if c == MaskChannel::Active { 0 } else { 1 };
             assert_eq!(view.track(c).events.len(), want, "{}", c.key());
         }
-        let state = view.state(&st.chart.tmap, st.playhead);
+        // 形状：草稿就是那块中央正三角形（值不随播放头变）
+        assert_eq!(st.mask_new_zone_span().1, crate::doc::Beat::new(1, 1), "区间 0~1 拍");
+        let state = view.state(&st.chart.tmap, 0.0);
         assert_eq!(state.v[0], [MASK_DEFAULT_TRIANGLE[0][0], MASK_DEFAULT_TRIANGLE[0][1]]);
-        assert!(state.visible, "常量事件从拍 0 起 ⇒ 显示");
+        assert!(state.visible, "种子块 [0,1] 覆盖拍 0 ⇒ 此刻存在");
         assert!(!state.active);
+        // **块的跨度就是存在时段**（用户口径）：播到头之后那块区就不存在了
+        //（180 BPM ⇒ 1 拍 = 1/3 秒，这里取 10 秒 = 30 拍，早就出了 [0,1)）
+        assert!(!st.mask_edit_view().unwrap().state(&st.chart.tmap, 10.0).visible);
         // 有真区时给的是真区（不再是草稿）
         let mut doc2 = doc.clone();
         doc2.mask_zones = vec![MaskZone::with_default_triangle(

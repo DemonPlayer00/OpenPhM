@@ -280,7 +280,7 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 
 | 命令 | 说明 |
 |---|---|
-| `{"op":"add_zone","startBeat":[0,1]}` | 新建一块：在拍 0 写 6 条常量事件 = **屏幕中央的正三角形**（`active` 不写事件）。`endBeat` 缺省 = `max(谱面末尾, startBeat+4拍)`；`empty:true` 建一个**没有任何事件、因此不显示**的区 |
+| `{"op":"add_zone","startBeat":[0,1]}` | 新建一块：写 6 条常量事件 = **屏幕中央的正三角形**（`active` 不写事件），跨度 `[startBeat, startBeat + 1 拍]`（**种子块**，要更长就拖尾巴）。`empty:true` 建一个**没有任何事件、因此不显示**的区 |
 | `{"op":"del_zone","index":0}` | `zone` 与 `index` 都认 |
 | `{"op":"set_zone","zone":0,"set":{"name":"右侧躁域"}}` | 目前只有 `name` |
 | `{"op":"add_zone_event","zone":0,"track":"x1","startBeat":[8,1],"endBeat":[16,1],"startValue":0,"endValue":-400,"easing":"inOutCubic"}` | **缺省值 = 该通道此刻的值**（不传 `startValue` 时，放下一刻不跳变）；`endBeat` 缺省 = 起点 + 4 拍 |
@@ -291,7 +291,8 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `opm-ctl --file F masks [--at SEC] [--json]` | **遮蔽区的数值快照**：此刻显不显示、`active`、三个顶点的坐标、七条通道各有几条事件。核对"区域此刻长什么样"用这个（图看形状、它看数值，两者同一份求值） |
 
 ⚠️ **遮蔽区通道的空隙是合法的**（与判定线轨道相反）：空档里保持前一条事件的终值，
-**首事件也可以晚于拍 0** —— "这块区域什么时候出现"就是靠它表达的。
+**首事件也可以晚于拍 0**。**块的跨度就是这块区域存在的时段**：三条坐标通道都没有
+"覆盖当前拍"的块时，整块不显示（值会延续，但**存在不会**）—— "第 8~12 拍出现"就写成 `[8,12)`。
 `add_zone_event` 插入时会把被它压住的前一块**裁到它的起点**（切点上的值保持不变），
 所以"给一条铺满全谱的常量事件里插关键帧"不会留下重叠。
 

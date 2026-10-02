@@ -109,7 +109,8 @@ pub enum OverlayAction {
     MaskDragStart,
     /// 遮蔽区编辑：拖动结束（调用方提交事务）
     MaskDragEnd,
-    /// 遮蔽区编辑：双击空处放一个新块（起止已吸附；值由核心取"此刻的值"）
+    /// 遮蔽区编辑：**R 或双击**放一个新块（起止已吸附；值由核心取"此刻的值"）。
+    /// 两条入口共用 `mask_block_span` 那一条跨度规则（长度 1 拍、不越过下一块）。
     MaskPlace {
         zone: usize,
         channel: MaskChannel,
@@ -561,6 +562,35 @@ fn mask_drag_set(ui: &egui::Ui, v: Option<MaskDrag>) {
 
 fn mask_drag_get(ui: &egui::Ui) -> Option<MaskDrag> {
     ui.data(|d| d.get_temp::<MaskDrag>(egui::Id::new("opm_mask_drag")))
+}
+
+/// **要在某条通道上放的那一块占哪一段**（R 键与双击**共用这一条规则**）。
+///
+/// 三条（都是用户口径的延续）：
+/// · 起点 = 指针所在拍（调用方已按网格吸附过，且 ≥ 0）；
+/// · 长度 = `len` 拍（R/双击默认 **1 拍** —— 与"初始屏蔽区事件区间 0~1 拍"同一个口径）；
+/// · **不越过下一块**（越过了就贴到它起点；起点本身已经压在块里时给 `None`）。
+///
+/// 返回 `None` = 这里放不下（紧挨着下一块），调用方去提示而不是硬塞。
+pub fn mask_block_span(
+    events: &[opm_app::doc::Event],
+    start: f64,
+    len: f64,
+) -> Option<(f64, f64)> {
+    let start = start.max(0.0);
+    // 已经有一块**正好从这一点开始** ⇒ 这里放不下（放下去就是两条起点相同的事件 = 重叠，
+    // 而遮蔽区通道的不变量是"不许重叠"）。指针落在块的**里面**是另一回事：那是有意插一块，
+    // 核心的 `trim_before_insert` 会把前一块裁到新块起点。
+    if events.iter().any(|e| (e.start.to_f64() - start).abs() < 1e-9) {
+        return None;
+    }
+    let next = events
+        .iter()
+        .filter(|e| e.start.to_f64() > start)
+        .map(|e| e.start.to_f64())
+        .fold(f64::INFINITY, f64::min);
+    let end = (start + len.max(1e-3)).min(next);
+    (end > start + 1e-3).then_some((start, end))
 }
 
 /// 按 `pad` 把闭区间夹进合法范围（`[0, ∞)` 里的一个"有长度的"区间）
@@ -1039,7 +1069,7 @@ pub fn draw(
         // 简短：右半的列名就在同一行，长标题会跟列名叠字（其余信息在工具栏/检查器里）
         if mask_mode {
             format!(
-                "遮蔽区编辑 [{} 拍] · 七条通道 · 双击空处放块 · Del 删除 · Ctrl+滚轮 缩放 · H 隐藏",
+                "遮蔽区编辑 [{} 拍] · 七条通道 · R/双击放块 · Del 删除 · Ctrl+滚轮 缩放 · H 隐藏",
                 beats as i64
             )
         } else {
@@ -1093,7 +1123,7 @@ pub fn draw(
     //
     // 放在"取选中判定线"**之前**：这个模式下不需要判定线，没有判定线也能编遮蔽区。
     if mask_mode {
-        draw_mask_pane(ui, st, rect, lanes, cfg, &y_of, &beat_of, actions);
+        draw_mask_pane(ui, st, rect, lanes, keys_enabled, cfg, &y_of, &beat_of, actions);
         return OverlayOut::default();
     }
 
@@ -1879,6 +1909,8 @@ fn draw_mask_pane(
     st: &EditorState,
     rect: egui::Rect,
     lanes: egui::Rect,
+    // 现在能不能用快捷键（打字/模态期间为 false，调用方算好 —— 门控只有一处）
+    keys_enabled: bool,
     cfg: &OverlayCfg,
     y_of: &impl Fn(f64) -> f32,
     beat_of: &impl Fn(f32) -> f64,
@@ -2159,26 +2191,16 @@ fn draw_mask_pane(
         if let (Some(Hit::Channel(ch)), Some(q)) = (&hit, ptr) {
             let ch = *ch;
             let start = st.snap_beat(beat_of(q.y)).max(0.0);
-            // 新块铺 4 拍，但**不越过下一块**（越过了就贴到它起点；起点本身在块里时不该走到这里）
-            let next = zone
-                .track(ch)
-                .events
-                .iter()
-                .filter(|e| e.start.to_f64() > start + 1e-9)
-                .map(|e| e.start.to_f64())
-                .fold(f64::INFINITY, f64::min);
-            let end = (start + 4.0).min(next);
-            if end > start + 1e-3 {
-                actions.push(OverlayAction::MaskPlace {
+            match mask_block_span(&zone.track(ch).events, start, MASK_BLOCK_BEATS) {
+                Some((start, end)) => actions.push(OverlayAction::MaskPlace {
                     zone: zone_idx,
                     channel: ch,
                     start,
                     end,
-                });
-            } else {
-                actions.push(OverlayAction::Notice(
+                }),
+                None => actions.push(OverlayAction::Notice(
                     "这里放不下新块（紧挨着下一块）—— 双击稍微早一点的位置".to_owned(),
-                ));
+                )),
             }
         }
     } else if resp.clicked() && mask_drag_get(ui).is_none() {
@@ -2191,6 +2213,40 @@ fn draw_mask_pane(
             }),
             Some(Hit::Channel(ch)) => actions.push(OverlayAction::MaskSelectChannel(ch)),
             None => {}
+        }
+    }
+
+    // ---- R：在**指针所在的那一列**放一块（用户口径 2026-10-02："在屏蔽区按 r 添加事件块"）----
+    //
+    // 与双击**同一条规则**（同一个 `mask_block_span`）：长度 1 拍、不越过下一块、
+    // 值由核心取"该通道此刻的值"。这里不做草稿跟随（那套跟随状态属于判定线事件区，
+    // 见 `draw_mask_pane` 的头注）；`keys_enabled` 的门控与普通模式一致（打字/模态期间不响应）。
+    if keys_enabled && !resp.dragged() {
+        if key_pressed_once(ui, egui::Key::R) {
+            let target = match (&hit, ptr) {
+                (Some(Hit::Channel(ch)), Some(q)) => Some((*ch, q)),
+                (Some(Hit::Block(ch, _, _)), Some(q)) => Some((*ch, q)),
+                _ => None,
+            };
+            match target {
+                Some((ch, q)) => {
+                    let start = st.snap_beat(beat_of(q.y)).max(0.0);
+                    match mask_block_span(&zone.track(ch).events, start, MASK_BLOCK_BEATS) {
+                        Some((start, end)) => actions.push(OverlayAction::MaskPlace {
+                            zone: zone_idx,
+                            channel: ch,
+                            start,
+                            end,
+                        }),
+                        None => actions.push(OverlayAction::Notice(
+                            "这里放不下新块（紧挨着下一块）—— 把指针挪到空档里再按 R".to_owned(),
+                        )),
+                    }
+                }
+                None => actions.push(OverlayAction::Notice(
+                    "按 R 放块：指针要放在某一条通道列上".to_owned(),
+                )),
+            }
         }
     }
 
@@ -2212,6 +2268,9 @@ fn draw_mask_pane(
     }
 }
 
+/// R / 双击放出来的那一块有多长（拍）—— 与"初始屏蔽区事件区间 0~1 拍"同一个口径
+pub const MASK_BLOCK_BEATS: f64 = 1.0;
+
 /// 七条通道的配色（与判定线那五条一样：颜色只用来分辨列，不承载语义）
 const MASK_COLORS: [[u8; 3]; 7] = [
     [240, 120, 120], // x1
@@ -2222,6 +2281,44 @@ const MASK_COLORS: [[u8; 3]; 7] = [
     [185, 160, 255], // y3
     [255, 220, 120], // active
 ];
+
+#[cfg(test)]
+mod mask_block_tests {
+    use super::*;
+    use opm_app::doc::{Beat, Event};
+
+    fn ev(a: f64, b: f64) -> Event {
+        Event::new(
+            Beat::new((a * 4.0) as i64, 4),
+            Beat::new((b * 4.0) as i64, 4),
+            serde_json::json!(0.0),
+            serde_json::json!(0.0),
+            "linear",
+        )
+    }
+
+    /// R / 双击放出来的那一块：长度 1 拍、**不越过下一块**、紧贴时给 `None`
+    #[test]
+    fn the_placed_block_is_one_beat_and_never_crosses_the_next_one() {
+        let none: Vec<Event> = Vec::new();
+        assert_eq!(mask_block_span(&none, 8.0, 1.0), Some((8.0, 9.0)));
+        // 负拍夹到 0
+        assert_eq!(mask_block_span(&none, -3.0, 1.0), Some((0.0, 1.0)));
+        // 下一块在 8.5：贴到它起点
+        let list = vec![ev(8.5, 12.0)];
+        assert_eq!(mask_block_span(&list, 8.0, 1.0), Some((8.0, 8.5)));
+        // 空档只剩 0.1 拍：给一条 0.1 拍的细块（能拖，不硬塞一个重叠）
+        assert_eq!(mask_block_span(&list, 8.4, 1.0), Some((8.4, 8.5)));
+        // 正好落在下一块的**起点**上 ⇒ 放不下（否则就是两条起点相同的事件 = 重叠）
+        assert_eq!(mask_block_span(&list, 8.5, 1.0), None);
+        // 落在块的**里面** ⇒ 可以（核心会把前一块裁到新块起点）
+        let list = vec![ev(8.0, 12.0)];
+        assert_eq!(mask_block_span(&list, 9.0, 1.0), Some((9.0, 10.0)));
+        // 起点在**已结束**的块之后：不受它影响
+        let list = vec![ev(0.0, 4.0), ev(20.0, 24.0)];
+        assert_eq!(mask_block_span(&list, 8.0, 1.0), Some((8.0, 9.0)));
+    }
+}
 
 #[cfg(test)]
 mod tests {
