@@ -1,6 +1,6 @@
 {
   "format": "opm",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "minClientCapability": 4,
   "extensions": [],
   "meta": {

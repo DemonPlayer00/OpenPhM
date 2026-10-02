@@ -1,6 +1,6 @@
 {
   "format": "opm",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "minClientCapability": 1,
   "extensions": [],
   "meta": {
@@ -15,7 +15,13 @@
     "background": null
   },
   "bpmList": [
-    { "startBeat": { "n": 0, "d": 1 }, "bpm": 120.0 }
+    {
+      "startBeat": {
+        "n": 0,
+        "d": 1
+      },
+      "bpm": 120.0
+    }
   ],
   "judgeLines": [
     {
@@ -24,13 +30,31 @@
       "layers": [
         {
           "moveX": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 32, "d": 1 },
-              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 32,
+                "d": 1
+              },
+              "startValue": 0.0,
+              "endValue": 0.0,
+              "easing": "linear"
+            }
           ]
         }
       ],
       "notes": [
-        { "kind": "tap", "startBeat": { "n": 32, "d": 1 }, "laneX": 0.0 }
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 32,
+            "d": 1
+          },
+          "laneX": 0.0
+        }
       ]
     },
     {
@@ -39,13 +63,31 @@
       "layers": [
         {
           "moveX": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 8, "d": 1 },
-              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 8,
+                "d": 1
+              },
+              "startValue": 0.0,
+              "endValue": 0.0,
+              "easing": "linear"
+            }
           ]
         }
       ],
       "notes": [
-        { "kind": "tap", "startBeat": { "n": 8, "d": 1 }, "laneX": 0.0 }
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 8,
+            "d": 1
+          },
+          "laneX": 0.0
+        }
       ]
     }
   ]

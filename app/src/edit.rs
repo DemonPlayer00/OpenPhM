@@ -822,7 +822,8 @@ pub fn place_event_command(
 /// **只在轨道上一条事件都没有时**才用得到；有事件时取"此刻的值"（见 [`new_event_value`]）。
 pub fn track_neutral_value(track: TrackId) -> f64 {
     match track {
-        TrackId::Alpha => 1.0,
+        // **0~255**（v2 口径，与 RPE / 音符 alpha 同量纲）：中性值 = 完全不透明
+        TrackId::Alpha => crate::doc::ALPHA_MAX as f64,
         TrackId::Speed => 10.0,
         TrackId::MoveX | TrackId::MoveY | TrackId::Rotate => 0.0,
     }
@@ -1053,13 +1054,13 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs.last().unwrap().start.to_f64(), 8.0);
 
-        // 空轨道 ⇒ 中性值（透明度 1、流速 10、移动 0）
-        assert_eq!(new_event_value(&st, TrackId::Alpha, 0.0), 1.0);
+        // 空轨道 ⇒ 中性值（透明度 **255**、流速 10、移动 0）
+        assert_eq!(new_event_value(&st, TrackId::Alpha, 0.0), 255.0);
         assert_eq!(new_event_value(&st, TrackId::Speed, 0.0), 10.0);
         assert_eq!(new_event_value(&st, TrackId::Rotate, 0.0), 0.0);
         assert_eq!(track_neutral_value(TrackId::MoveY), 0.0);
         // 空轨道上真的能放出一条事件（不会因为"没有值"而失败）
-        let cmd = place_event_command(&st, TrackId::Alpha, 0, 0.0, 2.0, 1.0);
+        let cmd = place_event_command(&st, TrackId::Alpha, 0, 0.0, 2.0, 255.0);
         exec_ok(&mut c, cmd);
         assert_eq!(c.doc().judge_lines[0].layers[0].track("alpha").unwrap().len(), 1);
     }

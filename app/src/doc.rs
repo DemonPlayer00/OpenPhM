@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// 精确有理拍。构造时自动约分，`d` 恒为正。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -614,6 +614,19 @@ pub struct Document {
 /// 忽略遮蔽区会渲染出一份**玩法不同**的谱面（该挡的地方没挡）。
 pub const CAP_MASK: u8 = 4;
 
+/// **当前格式版本**。
+///
+/// v2 相对 v1 只有一处语义变更：**判定线 `alpha` 轨道从 0~1 改成 0~255**（用户口径 2026-10-03：
+/// "透明度数值和RPE保持一致，使用 0~255 计算法"）。理由不只是整齐 —— RPE 的 alpha 本来就是
+/// 0~255 的整数，存成 0~1 的浮点等于**每次往返都做一次有损除法**（`200/255` 不是二进制精确值），
+/// 而 0~255 是恒等映射。音符的 `alpha` **v1 起就已经是 0~255**，所以 v2 只是把线那一半追平。
+///
+/// 迁移见 [`Document::migrate_to_current`]：v1 文件载入时 ×255，**无损**（v1 的值都是 `k/255`）。
+pub const FORMAT_VERSION: u32 = 2;
+
+/// `alpha` 的量纲上界（§3）。**线的事件与音符的字段共用它** —— 这是 v2 的要点。
+pub const ALPHA_MAX: f32 = 255.0;
+
 /// 按内容推导 `minClientCapability`（`spec/opm-format.md` §7）——**全工程唯一一份**。
 ///
 /// RPE 导入侧与遮蔽区命令都走它：两份实现迟早会在"加第 5 档"那天分家，
@@ -662,7 +675,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             format: "opm".to_owned(),
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             min_client_capability: 1,
             extensions: Vec::new(),
             meta: Meta {
@@ -722,7 +735,47 @@ impl Document {
             "maskZones",
         ];
         doc.foreign = foreign_from(obj, &known);
+        doc.migrate_to_current();
         Ok(doc)
+    }
+
+    /// **把载入的旧版本文档就地升到当前版本**；返回改了什么的说明（无需迁移时返回 `None`）。
+    ///
+    /// 目前只有一条迁移：**v1 → v2 的判定线 `alpha` 轨道 ×255**（0~1 → 0~255）。
+    ///
+    /// 为什么 ×255 是**无损**的：v1 的 alpha 只可能来自两个地方 —— 手写谱面（人写的就是
+    /// `k/255`，如 `0.4`）或 RPE 导入（`RPE整数 / 255`）。两边都是 `k/255` 的形状，
+    /// 乘回去正好是那个整数（浮点误差在 `round` 之内）。反过来把 0~255 存成 0~1 才是有损的。
+    ///
+    /// 幂等：靠 `format_version` 判断，升过一次就是 2，再读不会重复乘。
+    /// 迁移是**静默写回**的一部分（保存即 v2），但调用方应当把返回的说明报给用户
+    /// （`codec::to_document` 会把它写进保真度报告）——"文件被改过了"这件事不该只说给日志听。
+    pub fn migrate_to_current(&mut self) -> Option<String> {
+        if self.format_version >= FORMAT_VERSION {
+            return None;
+        }
+        let from = self.format_version;
+
+        // ---- v1 → v2：判定线 alpha 轨道 ×255 ----
+        let mut events = 0usize;
+        for line in &mut self.judge_lines {
+            for layer in &mut line.layers {
+                for ev in &mut layer.alpha {
+                    for v in [&mut ev.start_value, &mut ev.end_value] {
+                        if let Some(n) = v.as_f64() {
+                            // 负数（RPE 那条废弃的"连音符一起隐藏"）与 v1 的既有口径一致：夹到 0
+                            *v = json!((n * ALPHA_MAX as f64).clamp(0.0, ALPHA_MAX as f64));
+                        }
+                    }
+                    events += 1;
+                }
+            }
+        }
+
+        self.format_version = FORMAT_VERSION;
+        Some(format!(
+            "格式迁移 v{from} → v{FORMAT_VERSION}：判定线 `alpha` 轨道 {events} 条事件 ×255（0~1 → 0~255，无损）"
+        ))
     }
 
     /// 谱面末尾：**音符、五条基础轨事件、七条遮蔽区通道事件取最大**，全文档取最大。

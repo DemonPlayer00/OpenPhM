@@ -136,7 +136,7 @@ def check_color(v, ptr: str, rep: Report) -> None:
 
 
 def check_event_track(track: list, name: str, ptr: str, rep: Report,
-                      chart_end: Fraction) -> None:
+                      chart_end: Fraction, version: int = 2) -> None:
     prev_end = None
     for i, ev in enumerate(track):
         p = f"{ptr}[{i}]"
@@ -182,6 +182,17 @@ def check_event_track(track: list, name: str, ptr: str, rep: Report,
                     rep.err(f"{p}.{key}", "文字事件的数值必须是字符串")
             elif not is_num(v):
                 rep.err(f"{p}.{key}", "事件的数值必须是数字")
+
+        # alpha 的量纲随 formatVersion 变（v2 起 0~255，与 RPE 和音符的 alpha 同量纲）。
+        # 只是**警告**：规范第 8 节的错误清单里没有"数值越界"，量纲错通常表现为"线看不见了"，
+        # 而不是读不动文件。
+        if name == "alpha" and version >= 2:
+            for key in ("startValue", "endValue"):
+                v = ev.get(key)
+                if is_num(v) and not 0 <= v <= 255:
+                    rep.warn(f"{p}.{key}",
+                             f"v{version} 的线 alpha 应按 0~255 写（当前 {v}）"
+                             "—— 旧版本这里是 0~1，写 1.0 会让线变得几乎全透明")
 
     if track and prev_end is not None and prev_end < chart_end:
         rep.err(ptr, f"轨道末事件止于 {prev_end}，早于谱面末尾 {chart_end}"
@@ -317,7 +328,7 @@ def check_note(note: dict, ptr: str, rep: Report) -> None:
 
 
 def check_judge_line(line: dict, idx: int, rep: Report, count: int,
-                     chart_end: Fraction) -> None:
+                     chart_end: Fraction, version: int = 2) -> None:
     """一条判定线。`chart_end` 是**全文档**的谱面末尾（`chart_end_of` 算一次，所有线共用）。
 
     它以前在这里现算，而且只按**本线自己的**音符算 —— 见 `chart_end_of` 的说明。
@@ -386,7 +397,7 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int,
             if not isinstance(track, list):
                 rep.err(f"{lp}.{name}", "轨道必须是数组")
                 continue
-            check_event_track(track, name, f"{lp}.{name}", rep, chart_end)
+            check_event_track(track, name, f"{lp}.{name}", rep, chart_end, version)
 
     ext = line.get("extended") or {}
     if not isinstance(ext, dict):
@@ -396,7 +407,7 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int,
         for name in EXT_TRACKS:
             track = ext.get(name)
             if isinstance(track, list):
-                check_event_track(track, name, f"{ptr}.extended.{name}", rep, chart_end)
+                check_event_track(track, name, f"{ptr}.extended.{name}", rep, chart_end, version)
             elif track is not None:
                 rep.err(f"{ptr}.extended.{name}", "轨道必须是数组")
 
@@ -535,8 +546,12 @@ def check_document(doc, rep: Report) -> None:
     fv = doc.get("formatVersion")
     if not isinstance(fv, int) or isinstance(fv, bool) or fv < 1:
         rep.err("/formatVersion", "formatVersion 必须是正整数")
-    elif fv != 1:
-        rep.warn("/formatVersion", f"formatVersion={fv}：本校验器只实现 v1")
+    elif fv == 1:
+        rep.warn("/formatVersion",
+                 "formatVersion=1：**判定线 alpha 轨道是 0~1 量纲**（v2 起改成 0~255，与 RPE "
+                 "和音符的 alpha 同量纲）。载入时会自动 ×255 迁移，无损；重新保存即为 v2")
+    elif fv != 2:
+        rep.warn("/formatVersion", f"formatVersion={fv}：本校验器实现 v1（alpha 0~1）与 v2（alpha 0~255）")
 
     cap = doc.get("minClientCapability")
     if not isinstance(cap, int) or isinstance(cap, bool) or not 0 <= cap <= CAP_MASK:
@@ -621,8 +636,11 @@ def check_document(doc, rep: Report) -> None:
     # 谱面末尾**先算一次**（全文档一份），再逐线校验 —— 顺序不能反：
     # 每条线都要拿它去判"本线的轨道铺到末尾了吗"，而它取的是**所有线**的最大值。
     chart_end = chart_end_of(lines, zones)
+    # 版本影响 alpha 的量纲：1 ⇒ 0~1，2 ⇒ 0~255。取不到就按当前版本（2）判 —— 缺
+    # formatVersion 本身已经被上面记了一条错，不必在这里再放大。
+    version = fv if isinstance(fv, int) and not isinstance(fv, bool) else 2
     for i, line in enumerate(lines):
-        check_judge_line(line, i, rep, len(lines), chart_end)
+        check_judge_line(line, i, rep, len(lines), chart_end, version)
 
     # 父线成环检测
     n = len(lines)

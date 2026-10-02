@@ -2506,13 +2506,13 @@ mod tests {
         // 块之后（20 秒）：保持终值
         let p = line.perf(&tmap, 20.0);
         assert!((p.speed - 3.0).abs() < 1e-6, "块后流速该保持 3，实际 {}", p.speed);
-        // 空轨道仍然是**全局默认**（那是默认值唯一该出现的地方：流速 10 / 透明度 1）
+        // 空轨道仍然是**全局默认**（那是默认值唯一该出现的地方：流速 10 / 透明度 255）
         let doc = speed_doc(vec![], &[("tap", 20.0, None)]);
         let chart = chart_from_doc(&doc);
         let tmap = chart.tmap.clone();
         let p = chart.lines[0].perf(&tmap, 1.0);
         assert!((p.speed - 10.0).abs() < 1e-6, "空流速轨道按 RPE 默认 10 走");
-        assert!((p.alpha - 1.0).abs() < 1e-6, "空透明度轨道按 1（不透明）走");
+        assert!((p.alpha - 255.0).abs() < 1e-6, "空透明度轨道按 255（不透明）走");
     }
 
     /// **流速事件一改：只有它之后的音符被标脏**（前缀积分的直接推论），其余仍是"已算准"。

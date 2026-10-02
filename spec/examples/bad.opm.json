@@ -1,8 +1,10 @@
 {
   "format": "opm",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "minClientCapability": 2,
-  "extensions": ["holdSpeed"],
+  "extensions": [
+    "holdSpeed"
+  ],
   "meta": {
     "name": "Bad Example",
     "composer": "n/a",
@@ -16,52 +18,164 @@
     "background": "bg.png"
   },
   "bpmList": [
-    { "startBeat": { "n": 1, "d": 1 }, "bpm": 180.0 },
-    { "startBeat": { "n": 1, "d": 1 }, "bpm": 0 }
+    {
+      "startBeat": {
+        "n": 1,
+        "d": 1
+      },
+      "bpm": 180.0
+    },
+    {
+      "startBeat": {
+        "n": 1,
+        "d": 1
+      },
+      "bpm": 0
+    }
   ],
   "judgeLines": [
     {
       "name": "L0",
       "bpmFactor": 0,
       "zOrder": 200,
-      "anchor": [0.5, 1.5],
+      "anchor": [
+        0.5,
+        1.5
+      ],
       "father": 1,
       "layers": [
         {
           "moveX": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 0, "d": 1 },
-              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "startValue": 0.0,
+              "endValue": 0.0,
+              "easing": "linear"
+            }
           ],
           "alpha": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 1, "d": 1 },
-              "startValue": 1.0, "endValue": 1.0, "easing": "linear" },
-            { "startBeat": { "n": 2, "d": 1 }, "endBeat": { "n": 5, "d": 1 },
-              "startValue": 1.0, "endValue": 0.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 1,
+                "d": 1
+              },
+              "startValue": 255.0,
+              "endValue": 255.0,
+              "easing": "linear"
+            },
+            {
+              "startBeat": {
+                "n": 2,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 5,
+                "d": 1
+              },
+              "startValue": 255.0,
+              "endValue": 0.0,
+              "easing": "linear"
+            }
           ],
           "speed": [
-            { "startBeat": { "n": 1, "d": 1 }, "endBeat": { "n": 5, "d": 1 },
-              "startValue": 10.0, "endValue": 10.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 1,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 5,
+                "d": 1
+              },
+              "startValue": 10.0,
+              "endValue": 10.0,
+              "easing": "linear"
+            }
           ],
           "rotate": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 4, "d": 1 },
-              "startValue": 0.0, "endValue": 90.0, "easing": "easeInOut" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 4,
+                "d": 1
+              },
+              "startValue": 0.0,
+              "endValue": 90.0,
+              "easing": "easeInOut"
+            }
           ]
         }
       ],
       "controls": {
         "alpha": [
-          { "atDistance": 0.0, "value": 1.0, "easing": "linear" },
-          { "value": 0.5, "easing": "outSine" }
+          {
+            "atDistance": 0.0,
+            "value": 1.0,
+            "easing": "linear"
+          },
+          {
+            "value": 0.5,
+            "easing": "outSine"
+          }
         ]
       },
       "notes": [
-        { "kind": "laser", "startBeat": { "n": 0, "d": 1 }, "laneX": 900.0, "alpha": 300 },
-        { "kind": "hold", "startBeat": { "n": 5, "d": 1 }, "endBeat": { "n": 5, "d": 1 },
-          "laneX": 0.0 },
-        { "kind": "tap", "startBeat": { "n": 7, "d": 1 }, "endBeat": { "n": 10, "d": 1 },
-          "laneX": 0.0 },
-        { "kind": "flick", "startBeat": { "n": 10, "d": 1 }, "laneX": 0.0,
-          "hitsound": "hit.wav" }
+        {
+          "kind": "laser",
+          "startBeat": {
+            "n": 0,
+            "d": 1
+          },
+          "laneX": 900.0,
+          "alpha": 300
+        },
+        {
+          "kind": "hold",
+          "startBeat": {
+            "n": 5,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 5,
+            "d": 1
+          },
+          "laneX": 0.0
+        },
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 7,
+            "d": 1
+          },
+          "endBeat": {
+            "n": 10,
+            "d": 1
+          },
+          "laneX": 0.0
+        },
+        {
+          "kind": "flick",
+          "startBeat": {
+            "n": 10,
+            "d": 1
+          },
+          "laneX": 0.0,
+          "hitsound": "hit.wav"
+        }
       ]
     },
     {
@@ -71,17 +185,46 @@
       "layers": [
         {
           "speed": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 10, "d": 1 },
-              "startValue": 10.0, "endValue": 10.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 10,
+                "d": 1
+              },
+              "startValue": 10.0,
+              "endValue": 10.0,
+              "easing": "linear"
+            }
           ],
           "alpha": [
-            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 10, "d": 1 },
-              "startValue": 1.0, "endValue": 1.0, "easing": "linear" }
+            {
+              "startBeat": {
+                "n": 0,
+                "d": 1
+              },
+              "endBeat": {
+                "n": 10,
+                "d": 1
+              },
+              "startValue": 255.0,
+              "endValue": 255.0,
+              "easing": "linear"
+            }
           ]
         }
       ],
       "notes": [
-        { "kind": "tap", "startBeat": { "n": 10, "d": 1 }, "laneX": -112.5 }
+        {
+          "kind": "tap",
+          "startBeat": {
+            "n": 10,
+            "d": 1
+          },
+          "laneX": -112.5
+        }
       ]
     }
   ]

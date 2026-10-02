@@ -359,7 +359,8 @@ pub fn inspector_ui(
                 value_field(ui, &mut tx, "目标 x ", 1.0, None);
                 value_field(ui, &mut ty, "目标 y ", 1.0, None);
                 value_field(ui, &mut ta, "目标角度 ", 1.0, None);
-                value_field(ui, &mut tp, "目标透明度 ", 0.02, Some(0.0..=1.0));
+                // 透明度与 RPE/音符同量纲：**0~255**（v2 口径）
+                value_field(ui, &mut tp, "目标透明度 ", 1.0, Some(0.0..=255.0));
                 // "变了没有"按**位**比：同一个数重敲一遍不该发命令（与 set_target 的跳过判据同源）
                 let diff = |now: f64, was: f64| now.to_bits() != was.to_bits();
                 let mut target: Vec<(&'static str, f64)> = Vec::new();
@@ -512,7 +513,7 @@ pub fn inspector_ui(
             ui.monospace(format!("moveX  {:>8.2}", v.perf.x));
             ui.monospace(format!("moveY  {:>8.2}", v.perf.y));
             ui.monospace(format!("rotate {:>8.2}°", v.perf.rotate_deg));
-            ui.monospace(format!("alpha  {:>8.3}", v.perf.alpha));
+            ui.monospace(format!("alpha  {:>8.1}", v.perf.alpha));
             ui.monospace(format!("speed  {:>8.2}", v.perf.speed));
             ui.separator();
             ui.label(format!(

@@ -1066,6 +1066,8 @@ pub struct LinePerf {
     pub x: f32,
     pub y: f32,
     pub rotate_deg: f32,
+    /// **0~255**（v2 起与 RPE、与音符的 `alpha` 同量纲，见 `doc::ALPHA_MAX`）。
+    /// 只有落到 GPU 顶点色那一刻才 ÷255 —— 内部一律按 0~255 算，别再引入第二套量纲。
     pub alpha: f32,
     pub speed: f32,
 }
@@ -1076,7 +1078,7 @@ impl Default for LinePerf {
             x: 0.0,
             y: 0.0,
             rotate_deg: 0.0,
-            alpha: 1.0,
+            alpha: crate::doc::ALPHA_MAX,
             speed: 10.0,
         }
     }
@@ -1164,7 +1166,7 @@ pub fn perf_of(tracks: &[&[Event]; 5], beat: f64, tmap: &TimeMap) -> LinePerf {
         p.rotate_deg = v[2] as f32;
     }
     if has[3] {
-        p.alpha = (v[3] as f32).clamp(0.0, 1.0);
+        p.alpha = (v[3] as f32).clamp(0.0, crate::doc::ALPHA_MAX);
     }
     if has[4] {
         p.speed = v[4] as f32;

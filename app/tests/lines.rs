@@ -33,7 +33,7 @@ fn two_line_doc(rotate_to: f64) -> Document {
             ("moveX", 0.0, 0.0),
             ("moveY", my, my),
             ("rotate", rot, rot),
-            ("alpha", 1.0, 1.0),
+            ("alpha", 255.0, 255.0),
             ("speed", 10.0, 10.0),
         ] {
             l.layers[0].track_mut(track).unwrap().clear();
@@ -229,16 +229,16 @@ fn line_alpha_never_reaches_the_notes() {
     };
     let body_of = |v: &[NoteInstance]| v.iter().find(|i| i.half()[0].abs() >= 100.0).copied();
 
-    let full = shots(1.0);
+    let full = shots(255.0);
     assert_eq!(full.len(), 2, "α=1 ⇒ 本体 + 音符，实际 {} 个实例", full.len());
     assert!((note_of(&full).color()[3] - 1.0).abs() < 1e-6);
 
-    // 半透明的线：**只有本体淡**
-    let dim = shots(0.3);
+    // 半透明的线：**只有本体淡**（0~255 量纲：0.3×255 ≈ 76.5）
+    let dim = shots(76.5);
     let body = body_of(&dim).expect("本体还在");
     assert!(
-        (body.color()[3] - 0.55 * 0.3).abs() < 1e-6,
-        "本体该按 α 淡，实际 {:?}",
+        (body.color()[3] - 0.55 * (76.5 / 255.0)).abs() < 1e-6,
+        "本体该按 α 淡（76.5/255），实际 {:?}",
         body.color()
     );
     assert_eq!(

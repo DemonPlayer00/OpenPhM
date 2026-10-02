@@ -195,7 +195,8 @@ pub fn load_value(v: Value) -> Result<RpeImport, String> {
 
     let doc = Document {
         format: "opm".to_owned(),
-        format_version: 1,
+        // 导入出来的就是**当前版本**：上面 alpha 轨道已按 0~255 原样落进文档（v2 语义）
+        format_version: crate::doc::FORMAT_VERSION,
         min_client_capability: 1,
         extensions: Vec::new(),
         meta,
@@ -454,7 +455,9 @@ fn import_event(
         norm0(f64_of(get(eo, "start"), 0.0)),
         norm0(f64_of(get(eo, "end"), 0.0)),
     );
-    // alpha 轨道：RPE 0~255（负数是"隐藏判定线与其上所有音符"的废弃功能）→ opm 0~1
+    // alpha 轨道：RPE 0~255 → opm **0~255**。v2 起两边同量纲，**恒等映射** ——
+    // v1 时代这里要 ÷255，代价是每次往返都做一次有损除法（`200/255` 不是二进制精确值），
+    // 且线 alpha(0~1) 与音符 alpha(0~255) 在同一个文档里是两套量纲。用户口径 2026-10-03 追平。
     if track == "alpha" {
         if a < 0.0 || b < 0.0 {
             fid.warn(format!(
@@ -462,8 +465,8 @@ fn import_event(
                  RPE 用负 alpha 连音符一起隐藏，opm 无此表达；已降级为 0"
             ));
         }
-        a = (a / 255.0).clamp(0.0, 1.0);
-        b = (b / 255.0).clamp(0.0, 1.0);
+        a = a.clamp(0.0, 255.0);
+        b = b.clamp(0.0, 255.0);
     }
     let easing_id = i64_of(get(eo, "easingType"), 1);
     let easing = match easing_name_of_rpe(easing_id) {
@@ -528,7 +531,7 @@ fn import_event(
             if (d - default).abs() > 1e-9 {
                 fid.warn(format!(
                     "judgeLineList[{li}].eventLayers[{gi}].{key}[{ei}].{k} = {d}（缓动区间裁剪）—— \
-                     opm v1 未建模，已原样保留；本机预览按完整缓动曲线走"
+                     本格式未建模，已原样保留；本机预览按完整缓动曲线走"
                 ));
             }
         }
@@ -760,7 +763,7 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
     }
     if doc.judge_lines.iter().any(|l| l.foreign.contains_key("father")) {
         fid.warn(
-            "判定线嵌套 `father` 只是原样写回：opm v1 未建模父子关系，导出后播放器可能重新按嵌套渲染"
+            "判定线嵌套 `father` 只是原样写回：本格式未建模父子关系，导出后播放器可能重新按嵌套渲染"
                 .to_owned(),
         );
     }
@@ -799,7 +802,7 @@ pub fn to_value(doc: &Document, target: RpeTarget) -> (Value, Fidelity) {
         unmodeled.push(format!("根字段 `{k}`"));
     }
     if !unmodeled.is_empty() {
-        fid.warn(format!("以下来源字段按原名写回（opm v1 未建模）：{}", unmodeled.join("、")));
+        fid.warn(format!("以下来源字段按原名写回（本格式未建模）：{}", unmodeled.join("、")));
     }
     if doc.extensions.iter().any(|e| !e.starts_with("x-opm:")) {
         fid.warn("`extensions` 里存在非 `x-opm:` 前缀项 —— RPE 不认识，已忽略".to_owned());
@@ -840,8 +843,8 @@ fn export_event(
     };
     o.insert("startTime".to_owned(), st);
     o.insert("endTime".to_owned(), et);
-    // alpha 轨道：opm 0~1 → RPE 0~255（四舍五入；离线值与 RPE 一致）
-    let scale = if track == "alpha" { 255.0 } else { 1.0 };
+    // alpha 轨道：opm 0~255 → RPE 0~255，**恒等**（v2 起同量纲；只取整，RPE 那边是整数）
+    let scale = 1.0;
     let a = e.start_value.as_f64().unwrap_or(0.0) * scale;
     let b = e.end_value.as_f64().unwrap_or(0.0) * scale;
     let a = if track == "alpha" { a.round() } else { a };
@@ -858,7 +861,7 @@ fn export_event(
             None => json!([0.0, 0.0, 1.0, 1.0]),
         },
     );
-    // `easingLeft`/`easingRight`/`linkgroup` opm v1 没建模（在 `e.foreign` 里）：
+    // `easingLeft`/`easingRight`/`linkgroup` 本格式没建模（在 `e.foreign` 里）：
     // **来源有就原样写回**，只有来源没有才补默认。它们不是"常量装饰"——
     // 实测 12 份真实谱面里 `easingLeft` 有 27 条不是 0、`easingRight` 有 99 条不是 1
     // （0.337095 / 0.5773 / 0.5…），`linkgroup` 有 10 条是 1；以前一律写默认值再"跳过已有键"，
@@ -880,7 +883,7 @@ fn export_event(
     }
     if e.foreign.contains_key("easingLeft") || e.foreign.contains_key("easingRight") {
         fid.note(format!(
-            "/judgeLineList[{li}].eventLayers[{gi}].{track}Events：`easingLeft/Right` 原样写回（opm v1 未建模）"
+            "/judgeLineList[{li}].eventLayers[{gi}].{track}Events：`easingLeft/Right` 原样写回（本格式未建模）"
         ));
     }
     Value::Object(o)

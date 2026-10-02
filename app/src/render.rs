@@ -745,13 +745,16 @@ pub fn build_instances(state: &EditorState, out: &mut Vec<NoteInstance>) {
         // { continue; }`，注释还写着"含子音符"，是把这个耦合当成了前提）。
         // 完全透明的线省掉本体这一个实例就够，音符照走。
         let selected = li == state.selected_line;
-        if perf.alpha > 0.004 {
+        // `perf.alpha` 是 **0~255**（v2 口径）；顶点色要 0~1，所以**只在这一个地方**换算。
+        // 阈值 1.0 = 旧写法 0.004 × 255（"完全透明"的判据不为量纲改动而变）。
+        let line_alpha = perf.alpha / crate::doc::ALPHA_MAX;
+        if perf.alpha > 1.0 {
             let mut lc = if selected {
                 [0.95, 0.85, 0.35, 0.95]
             } else {
                 [0.55, 0.60, 0.75, 0.55]
             };
-            lc[3] *= perf.alpha;
+            lc[3] *= line_alpha;
             out.push(NoteInstance::new(
                 perf.apply([0.0, 0.0]),
                 [state.line_half_w, 3.0],

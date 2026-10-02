@@ -147,10 +147,10 @@ fn rpe_import_maps_fields_correctly() {
     assert!(line.notes[4].end.is_none(), "非 hold 不许带时长");
     assert_eq!(line.notes[5].kind.as_str(), "tap", "未知 type 按 tap");
 
-    // 事件：alpha ÷255、贝塞尔、缓动名、foreign 保留
+    // 事件：alpha **原样 0~255**（v2 起与 RPE 同量纲，不再 ÷255）、贝塞尔、缓动名、foreign 保留
     let a0 = &line.layers[0].alpha[0];
-    assert!((a0.start_value.as_f64().unwrap() - 1.0).abs() < 1e-9);
-    assert!((a0.end_value.as_f64().unwrap() - 128.0 / 255.0).abs() < 1e-9);
+    assert!((a0.start_value.as_f64().unwrap() - 255.0).abs() < 1e-9);
+    assert!((a0.end_value.as_f64().unwrap() - 128.0).abs() < 1e-9, "RPE 的 128 要原样落进来");
     let sp = &line.layers[0].speed[0];
     assert_eq!(sp.easing, "linear");
     assert!(sp.bezier && sp.bezier_points.is_some());
@@ -871,4 +871,77 @@ fn a_mask_zone_dragged_late_raises_the_end_for_every_line() {
         2,
         "两条线的轨道都止于 16，都该被点出来"
     );
+}
+
+/// **v1 → v2 迁移：判定线 alpha 轨道 0~1 → 0~255**（用户口径 2026-10-03："透明度数值和 RPE
+/// 保持一致，使用 0~255 计算法"）。
+///
+/// 为什么值得单独守：这条迁移是**打开旧文件时自动发生的**，错了不会报错 —— 只会让所有谱面的
+/// 判定线一起变全透明（`1.0` 若被当成 0~255 里的 1，就是不透明度 1/255）。所以三个性质都要钉：
+/// ① 值 ×255；② **无损**（v1 的值本来就是 `k/255`）；③ **幂等**（再读一次不许重复乘）。
+#[test]
+fn a_v1_document_gets_its_alpha_migrated_to_0_255() {
+    let v1 = json!({
+        "format": "opm", "formatVersion": 1, "minClientCapability": 1, "extensions": [],
+        "meta": {"name": "旧谱", "composer": "", "charter": "", "illustrator": "",
+                 "difficulty": "IN", "level": "IN 1", "offsetMs": 0,
+                 "audio": null, "background": null},
+        "bpmList": [{"startBeat": {"n": 0, "d": 1}, "bpm": 120.0}],
+        "judgeLines": [{
+            "name": "L0", "bpmFactor": 1.0,
+            "layers": [{"alpha": [
+                // 两个典型来源：手写的 1.0（不透明）与 RPE 导出的 128/255
+                {"startBeat": {"n": 0, "d": 1}, "endBeat": {"n": 4, "d": 1},
+                 "startValue": 1.0, "endValue": 0.5, "easing": "linear"},
+                {"startBeat": {"n": 4, "d": 1}, "endBeat": {"n": 8, "d": 1},
+                 "startValue": 128.0 / 255.0, "endValue": 0.0, "easing": "linear"}
+            ]}],
+            "notes": []
+        }]
+    });
+
+    let doc = Document::from_json(v1.clone()).expect("v1 应当能读进来");
+    assert_eq!(doc.format_version, opm_app::doc::FORMAT_VERSION, "读进来就升到当前版本");
+    let a = &doc.judge_lines[0].layers[0].alpha;
+    assert!((a[0].start_value.as_f64().unwrap() - 255.0).abs() < 1e-9, "1.0 → 255");
+    assert!((a[0].end_value.as_f64().unwrap() - 127.5).abs() < 1e-9, "0.5 → 127.5");
+    assert!(
+        (a[1].start_value.as_f64().unwrap() - 128.0).abs() < 1e-9,
+        "**无损**：RPE 的 128 除以 255 再乘回来必须还是 128，实际 {}",
+        a[1].start_value
+    );
+    assert!((a[1].end_value.as_f64().unwrap()).abs() < 1e-9);
+
+    // **幂等**：把迁移结果再读一遍，值不许再乘一次 255
+    let twice = Document::from_json(doc.to_json()).expect("迁移后的文档要能读回");
+    assert_eq!(twice.format_version, opm_app::doc::FORMAT_VERSION);
+    let b = &twice.judge_lines[0].layers[0].alpha;
+    assert!((b[0].start_value.as_f64().unwrap() - 255.0).abs() < 1e-9, "不许重复 ×255");
+    assert!((b[1].start_value.as_f64().unwrap() - 128.0).abs() < 1e-9);
+    assert_eq!(doc.to_json(), twice.to_json(), "迁移过一次之后应当是不动点");
+}
+
+/// 负 alpha（RPE 那条"连音符一起隐藏"的废弃分支）在 v1 里没有表达，迁移时**夹到 0** ——
+/// 这正是 v1 时代 `÷255` 那一步的既有口径，迁移不该让它变成负数。
+#[test]
+fn a_negative_v1_alpha_migrates_to_zero_not_below() {
+    let v1 = json!({
+        "format": "opm", "formatVersion": 1, "minClientCapability": 1, "extensions": [],
+        "meta": {"name": "负 alpha", "composer": "", "charter": "", "illustrator": "",
+                 "difficulty": "IN", "level": "IN 1", "offsetMs": 0,
+                 "audio": null, "background": null},
+        "bpmList": [{"startBeat": {"n": 0, "d": 1}, "bpm": 120.0}],
+        "judgeLines": [{
+            "name": "L0", "bpmFactor": 1.0,
+            "layers": [{"alpha": [
+                {"startBeat": {"n": 0, "d": 1}, "endBeat": {"n": 8, "d": 1},
+                 "startValue": -0.5, "endValue": 1.0, "easing": "linear"}
+            ]}],
+            "notes": []
+        }]
+    });
+    let doc = Document::from_json(v1).expect("应当能读进来");
+    let e = &doc.judge_lines[0].layers[0].alpha[0];
+    assert_eq!(e.start_value.as_f64().unwrap(), 0.0, "负值夹到 0");
+    assert!((e.end_value.as_f64().unwrap() - 255.0).abs() < 1e-9);
 }

@@ -87,7 +87,7 @@ impl Fidelity {
     }
     /// 同类警告合并计数（`key` 是类别名，`ptr` 是首次出现的 JSON 指针）
     pub fn warn_grouped(&mut self, key: &str, ptr: &str) {
-        self.warn_grouped_note(key, ptr, "opm v1 未建模，已原样保留");
+        self.warn_grouped_note(key, ptr, "本格式未建模，已原样保留");
     }
     /// 同上，但**自己写说明**：有些合并警告说的不是"未建模"，而是"已建模、按另一种口径求值"
     /// （例：流速事件的缓动按 linear 求值，缓动名原样保留）。
