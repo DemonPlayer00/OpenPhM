@@ -794,3 +794,81 @@ fn declaring_a_capability_below_the_mask_level_is_an_error() {
         issues.iter().map(|i| format!("{} {}", i.pointer, i.message)).collect::<Vec<_>>().join("; ")
     );
 }
+
+/// 只为"谱面末尾"这条判据造一份最小多线文档：每条线一条常量轨 + 一个音符。
+fn two_lines_json(a_track_end: i64, a_note: i64, b_track_end: i64, b_note: i64) -> Value {
+    let beat = |n: i64| json!({"n": n, "d": 1});
+    let line = |name: &str, track_end: i64, note: i64| {
+        json!({
+            "name": name,
+            "bpmFactor": 1.0,
+            "layers": [{"moveX": [
+                {"startBeat": beat(0), "endBeat": beat(track_end),
+                 "startValue": 0.0, "endValue": 0.0, "easing": "linear"}
+            ]}],
+            "notes": [{"kind": "tap", "startBeat": beat(note), "laneX": 0.0}]
+        })
+    };
+    json!({
+        "format": "opm", "formatVersion": 1, "minClientCapability": 1, "extensions": [],
+        "meta": {"name": "末尾判据", "composer": "", "charter": "", "illustrator": "",
+                 "difficulty": "IN", "level": "IN 1", "offsetMs": 0,
+                 "audio": null, "background": null},
+        "bpmList": [{"startBeat": beat(0), "bpm": 120.0}],
+        "judgeLines": [line("A", a_track_end, a_note), line("B", b_track_end, b_note)]
+    })
+}
+
+/// 「轨道末事件早于谱面末尾」这类问题的指针。
+fn short_track_errors(doc: &Document) -> Vec<String> {
+    validate(doc)
+        .into_iter()
+        .filter(|i| i.severity == Severity::Error && i.message.contains("早于谱面末尾"))
+        .map(|i| format!("{} {}", i.pointer, i.message))
+        .collect()
+}
+
+/// **"谱面末尾"是全文档一个数**（音符 ∪ 五条基础轨 ∪ 遮蔽区七条通道），不是每条线各算一份。
+///
+/// 这条判据曾经在两个实现里分家：`cmd::validate` 用 `Document::chart_end`（全局），
+/// 而 `spec/check.py` 按**每条线自己的音符**算末尾 —— 于是"多线谱面里 A 线的轨道铺到末尾、
+/// B 线的轨道只铺到自己的音符"这种文件：Rust 报错、`check.py` 放行，同一份文件两个答案。
+/// 2026-10-03 把 `check.py` 收口到同一份定义，这个用例守住它。
+#[test]
+fn the_chart_end_is_one_number_for_the_whole_document() {
+    // A 线铺到 32、B 线只铺到自己的音符 8 ⇒ 末尾是全局的 32，B 线不合格
+    let doc = Document::from_json(two_lines_json(32, 32, 8, 8)).unwrap();
+    assert_eq!(doc.chart_end().to_f64(), 32.0);
+    let errs = short_track_errors(&doc);
+    assert_eq!(errs.len(), 1, "只有 B 线该被点出来：{errs:?}");
+    assert!(errs[0].starts_with("/judgeLines[1].layers[0].moveX"), "{errs:?}");
+    assert!(errs[0].contains('8') && errs[0].contains("32"), "{errs:?}");
+
+    // 两条线都铺到末尾就没问题（对照组：证明上面的报错来自"长度"，不是别的）
+    let doc = Document::from_json(two_lines_json(32, 32, 32, 32)).unwrap();
+    assert!(short_track_errors(&doc).is_empty());
+}
+
+/// **遮蔽区把谱面末尾抬高**，判定线轨道因此得够到那里。
+///
+/// 别与 §4.6 那条搞混：遮蔽区通道**自己**允许早于谱末结束，但它的末事件**会抬高**末尾。
+/// 写这条测试的直接原因：本轮改 `check.py` 时我先按"遮蔽区不计入"写了一遍，
+/// 被 `mask_events_extend_the_chart_end` 撞回来 —— 直觉在这里是错的，所以要有一条正面的用例。
+#[test]
+fn a_mask_zone_dragged_late_raises_the_end_for_every_line() {
+    let mut v = two_lines_json(16, 16, 16, 16);
+    assert!(short_track_errors(&Document::from_json(v.clone()).unwrap()).is_empty());
+
+    v["minClientCapability"] = json!(4);
+    v["maskZones"] = json!([{
+        "x1": [{"startBeat": {"n": 8, "d": 1}, "endBeat": {"n": 40, "d": 1},
+                "startValue": 0.0, "endValue": 100.0, "easing": "linear"}]
+    }]);
+    let doc = Document::from_json(v).unwrap();
+    assert_eq!(doc.chart_end().to_f64(), 40.0, "遮蔽区事件要参与谱面末尾");
+    assert_eq!(
+        short_track_errors(&doc).len(),
+        2,
+        "两条线的轨道都止于 16，都该被点出来"
+    );
+}

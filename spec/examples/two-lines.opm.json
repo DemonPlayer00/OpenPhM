@@ -1,0 +1,52 @@
+{
+  "format": "opm",
+  "formatVersion": 1,
+  "minClientCapability": 1,
+  "extensions": [],
+  "meta": {
+    "name": "谱面末尾是全局的（负样例）",
+    "composer": "",
+    "charter": "",
+    "illustrator": "",
+    "difficulty": "IN",
+    "level": "IN 1",
+    "offsetMs": 0,
+    "audio": null,
+    "background": null
+  },
+  "bpmList": [
+    { "startBeat": { "n": 0, "d": 1 }, "bpm": 120.0 }
+  ],
+  "judgeLines": [
+    {
+      "name": "A 铺到 32",
+      "bpmFactor": 1.0,
+      "layers": [
+        {
+          "moveX": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 32, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+          ]
+        }
+      ],
+      "notes": [
+        { "kind": "tap", "startBeat": { "n": 32, "d": 1 }, "laneX": 0.0 }
+      ]
+    },
+    {
+      "name": "B 只铺到自己的音符 8（不合格：末尾是全文档的 32）",
+      "bpmFactor": 1.0,
+      "layers": [
+        {
+          "moveX": [
+            { "startBeat": { "n": 0, "d": 1 }, "endBeat": { "n": 8, "d": 1 },
+              "startValue": 0.0, "endValue": 0.0, "easing": "linear" }
+          ]
+        }
+      ],
+      "notes": [
+        { "kind": "tap", "startBeat": { "n": 8, "d": 1 }, "laneX": 0.0 }
+      ]
+    }
+  ]
+}

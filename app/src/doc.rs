@@ -558,9 +558,15 @@ pub struct Meta {
     pub constant: Option<f32>,
     #[serde(rename = "offsetMs", default)]
     pub offset_ms: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // **这两个键永远写出来**（没有就写 `null`）：规范 §2.1 把它们标成"必需（可空）"，
+    // 而"没有音乐"一旦允许"键缺席"就有两种写法，读取方只会按其中一种理解。
+    // 早先这里带 `skip_serializing_if = "Option::is_none"`，于是 app 存一次就把
+    // `"background": null` 抹掉 —— 规范（必需）、`spec/check.py`（当时没查）、序列化器
+    // （抹掉）三家口径不一致（2026-10-03 收口成"规范那一份"）。
+    // `constant` 不在此列：规范 §2.1 确实把它标成可选（⭕），缺席有语义（SP 谱为 null）。
+    #[serde(default)]
     pub audio: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub background: Option<String>,
     #[serde(flatten)]
     pub foreign: Foreign,
@@ -719,11 +725,20 @@ impl Document {
         Ok(doc)
     }
 
-    /// 谱面末尾（所有音符结束拍的最大值）
-    /// 谱面末尾：音符与事件取最大。
+    /// 谱面末尾：**音符、五条基础轨事件、七条遮蔽区通道事件取最大**，全文档取最大。
     ///
     /// 事件必须计入 —— 判定线的表演（移动/旋转/透明度）常常比最后一个音符更长，
     /// 只按音符算会让"只有事件、还没放音符"的谱面时长为 0（本轮事件成为一等对象后补上）。
+    /// 遮蔽区同样计入：一块区域的顶点表演也常常跟在最后一个音符之后
+    /// （`tests/codec.rs::mask_events_extend_the_chart_end` 守着这条）。注意这与 §4.6
+    /// "遮蔽区通道允许早于谱末结束"**不矛盾**：它自己不受约束，但它的末事件会**抬高**
+    /// 判定线轨道必须够到的地方。
+    ///
+    /// 这是**全文档唯一**的"谱面末尾"定义：`cmd::validate` 的"轨道末事件不得早于谱面末尾"、
+    /// `TimeMap::from_doc` 的时长、以及 `spec/check.py` 的同名判据都以它为准。
+    /// 早先 `check.py` 是**逐线**算（按该线自己的音符），于是"多线谱面里 A 线的轨道铺到末尾、
+    /// B 线的轨道只铺到自己的音符"这种谱面：Rust 报错、`check.py` 放行（2026-10-03 收口）。
+    /// `extended` / `controls` 两个词典**不计入**（它们没被建模，落在 `foreign` 里）。
     pub fn chart_end(&self) -> Beat {
         let mut end = Beat::zero();
         for line in &self.judge_lines {

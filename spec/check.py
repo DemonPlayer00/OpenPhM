@@ -13,6 +13,19 @@
     0 = 无错误（可能含警告）
     1 = 存在错误
     2 = 用法错误 / 文件读取或 JSON 解析失败
+
+**与 app 里那份校验器（`app/src/cmd.rs` 的 `validate`）是两份独立实现，两者应当在同一份文件上
+给出相同结论** —— 这句话一直写在 `cmd.rs` 的注释里，但 2026-10-03 之前没有任何东西在守它，
+于是真的分家了：本文件按**每条判定线自己的音符**算"谱面末尾"，而 Rust 用 `Document::chart_end`
+（全文档一个数），"A 线铺到末尾、B 线只铺到自己音符"这种文件 Rust 报错、本文件放行。
+
+`spec/examples/` 里的样例就是用来手工核对这一点的（`two-lines.opm.json` 正是上面那个反例；
+`bad.opm.json` 故意一堆错、`minimal`/`mask` 必须全过）:
+
+    python3 spec/check.py spec/examples/*.json
+    for f in spec/examples/*.json; do opm-ctl --file "$f" validate; done
+
+逐份比对**指针与措辞**，不是只看退出码 —— 两边都说"错"但指到不同地方，等于没对齐。
 """
 
 from __future__ import annotations
@@ -175,6 +188,78 @@ def check_event_track(track: list, name: str, ptr: str, rep: Report,
                      "（官谱语义下会导致谱面停顿）")
 
 
+def beat_quiet(v):
+    """`beat_of` 的**不出声**版本：预扫"谱面末尾"用它。
+
+    预扫必须静默 —— 不静默的话，主扫那一遍会在同一个位置再报一次，
+    同一条错误于是在报告里出现两次（错误数看起来翻倍，实际只有一条）。
+    """
+    if not isinstance(v, dict):
+        return None
+    n, d = v.get("n"), v.get("d")
+    if not isinstance(n, int) or isinstance(n, bool) or not isinstance(d, int) \
+            or isinstance(d, bool) or d < 1:
+        return None
+    return Fraction(n, d)
+
+
+def chart_end_of(lines: list, zones: list | None = None) -> Fraction:
+    """**全文档的谱面末尾**：音符、**基础轨**事件、以及**遮蔽区通道**事件里最晚的 `endBeat`。
+
+    刻意与 `app/src/doc.rs` 的 `Document::chart_end` 逐条对应（那是唯一的实现）：
+    · 音符取 `endBeat`，非 hold 没有该键 ⇒ 取 `startBeat`（= `Note::end_beat`）；
+    · 基础轨五条（`moveX`/`moveY`/`rotate`/`alpha`/`speed`）；
+    · **遮蔽区七条通道也算内容** —— 一块区域的顶点表演常常跟在最后一个音符之后
+      （`tests/codec.rs::mask_events_extend_the_chart_end` 就是守着这条的）。
+      注意别和第 8 节那条搞混：遮蔽区通道**自己**不受"末事件 ≥ 谱面末尾"约束（§4.6 允许它
+      早于谱末结束），但它的末事件**会抬高**这个末尾，从而抬高**判定线轨道**要够到的地方。
+    · `extended` / `controls` **不计入**（Rust 那边也不扫这两个词典）。
+
+    早先这里是**逐线**算的（而且只按该线自己的音符），于是"多线谱面里 A 线的轨道铺到末尾、
+    B 线的轨道只铺到自己的音符"这种谱面：Rust 的 `validate` 报错、本校验器放行 ——
+    同一份文件两个答案。2026-10-03 收口成全局。
+    """
+    end = EVENT_EPOCH
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        notes = line.get("notes")
+        if isinstance(notes, list):
+            for note in notes:
+                if not isinstance(note, dict):
+                    continue
+                b = beat_quiet(note.get("endBeat", note.get("startBeat")))
+                if b is not None and b > end:
+                    end = b
+        layers = line.get("layers")
+        if isinstance(layers, list):
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                for name in TRACKS:
+                    track = layer.get(name)
+                    if not isinstance(track, list):
+                        continue
+                    for ev in track:
+                        if isinstance(ev, dict):
+                            b = beat_quiet(ev.get("endBeat"))
+                            if b is not None and b > end:
+                                end = b
+    for zone in zones or []:
+        if not isinstance(zone, dict):
+            continue
+        for name in MASK_TRACKS:
+            track = zone.get(name)
+            if not isinstance(track, list):
+                continue
+            for ev in track:
+                if isinstance(ev, dict):
+                    b = beat_quiet(ev.get("endBeat"))
+                    if b is not None and b > end:
+                        end = b
+    return end
+
+
 def check_note(note: dict, ptr: str, rep: Report) -> None:
     if not isinstance(note, dict):
         rep.err(ptr, "音符必须是对象")
@@ -231,11 +316,16 @@ def check_note(note: dict, ptr: str, rep: Report) -> None:
             rep.err(f"{ptr}.judgeAreaScale", "判定区宽度倍率必须是正数")
 
 
-def check_judge_line(line: dict, idx: int, rep: Report, count: int) -> Fraction:
+def check_judge_line(line: dict, idx: int, rep: Report, count: int,
+                     chart_end: Fraction) -> None:
+    """一条判定线。`chart_end` 是**全文档**的谱面末尾（`chart_end_of` 算一次，所有线共用）。
+
+    它以前在这里现算，而且只按**本线自己的**音符算 —— 见 `chart_end_of` 的说明。
+    """
     ptr = f"/judgeLines[{idx}]"
     if not isinstance(line, dict):
         rep.err(ptr, "判定线必须是对象")
-        return EVENT_EPOCH
+        return
     unknown_keys(line, LINE_KEYS, ptr, rep)
 
     if line.get("bpmFactor", 1.0) == 0:
@@ -277,19 +367,12 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int) -> Fraction:
     if not isinstance(notes, list):
         rep.err(f"{ptr}.notes", "notes 必须是数组")
         notes = []
-
-    chart_end = EVENT_EPOCH
     for i, note in enumerate(notes):
         check_note(note, f"{ptr}.notes[{i}]", rep)
-        if isinstance(note, dict):
-            for key in ("startBeat", "endBeat"):
-                if key in note:
-                    b = beat_of(note[key], f"{ptr}.notes[{i}].{key}", rep)
-                    if b is not None and b > chart_end:
-                        chart_end = b
 
+    # `chart_end` 是**全文档**一份（由 `check_document` 传入，见 `chart_end_of`）：
+    # 早先它在这里现算，而且只按本线自己的音符算 —— 那是同一份文件两个答案的根源。
     has_hold = any(isinstance(n, dict) and n.get("kind") == "hold" for n in notes)
-
     for li, layer in enumerate(layers):
         lp = f"{ptr}.layers[{li}]"
         if not isinstance(layer, dict):
@@ -351,8 +434,6 @@ def check_judge_line(line: dict, idx: int, rep: Report, count: int) -> Fraction:
                     rep.err(f"{kp}.value", "缺少数值 value")
                 if kf.get("easing", "linear") not in EASINGS:
                     rep.err(f"{kp}.easing", f"未知缓动 {kf.get('easing')!r}")
-
-    return chart_end
 
 
 def active_state(v):
@@ -492,7 +573,10 @@ def check_document(doc, rep: Report) -> None:
         rep.err("/meta", "meta 必须是对象")
     else:
         unknown_keys(meta, META_KEYS, "/meta", rep)
-        for key in ("name", "composer", "charter", "difficulty", "level", "offsetMs"):
+        # `audio` / `background` 是**必需（可空）**（§2.1）：没有音乐就写 `null`，别把键省掉。
+        # 早先这里不查它们，而序列化器又会把 `null` 抹掉 —— "必需"于是只写在纸上。
+        for key in ("name", "composer", "charter", "difficulty", "level", "offsetMs",
+                    "audio", "background"):
             if key not in meta:
                 rep.err(f"/meta.{key}", "缺少必需字段")
         if meta.get("difficulty") not in DIFFICULTIES:
@@ -534,8 +618,11 @@ def check_document(doc, rep: Report) -> None:
     if len(lines) > 100:
         rep.warn("/judgeLines", f"判定线 {len(lines)} 条 > 100：官谱格式下会导致谱面停顿")
 
+    # 谱面末尾**先算一次**（全文档一份），再逐线校验 —— 顺序不能反：
+    # 每条线都要拿它去判"本线的轨道铺到末尾了吗"，而它取的是**所有线**的最大值。
+    chart_end = chart_end_of(lines, zones)
     for i, line in enumerate(lines):
-        check_judge_line(line, i, rep, len(lines))
+        check_judge_line(line, i, rep, len(lines), chart_end)
 
     # 父线成环检测
     n = len(lines)

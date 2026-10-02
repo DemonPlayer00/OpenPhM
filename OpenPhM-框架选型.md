@@ -5710,3 +5710,92 @@ pub fn resize_pending(&mut self, edge: EventEdge, beat: f64) { … }
 把两处行为临时改回旧写法 ⇒ 四条新测试全红（尾拖 8 帧零动作；身体平移那档读到 3.33 而不是 4.0）；
 只去掉"回到按下点"那一掉 ⇒ off-grid 那条单独红（`[47,5]` 写成 `[38,4]`）。
 真机：debug 与 release 两个二进制跑同一脚本，三档结果一致。
+
+---
+
+## 7.97 四处「口径不一致」收口：`background` 的落盘、`chart_end` 的算法、一句陈旧注释、`speed` 的缺省值（2026-10-03 第二批）
+
+触发：上一批做 BPM120 示例谱面时**顺路撞见**四个"规范 / 校验器 / 实现三家说法不同"的地方。
+都不是崩溃，都是"同一件事有两种答案"——这类问题不修就会一直靠人记住哪一份才对。
+
+### 7.97.1 `audio` / `background`：规范说「必需（可空）」，序列化器却把它抹掉
+
+`Meta.audio` / `Meta.background` 带 `#[serde(default, skip_serializing_if = "Option::is_none")]`，
+于是 **app 存一次盘就把 `"background": null` 删掉**。而 `spec/opm-format.md` §2.1 把这两个键标成
+✅「必需（可空）」，`spec/examples/*.json` 三份也都写着它们。
+
+三方口径：**规范 = 必需**、**序列化器 = 抹掉**、**`check.py` = 压根没查**。
+"这份谱面没有音乐"因此有了两种写法（键缺席 / 键为 `null`），而读取方只会按其中一种理解。
+
+收口方向选的是**规范那一份**（理由：键在、值为 `null` 是显式的；缺席是隐式的，隐式的才有歧义）：
+
+- `app/src/doc.rs`：两个键去掉 `skip_serializing_if`，**永远写出来**。
+  `constant` **刻意不一起改** —— 规范 §2.1 把它标成 ⭕「可选」，缺席**有语义**
+  （键不在 = 没填，`null` = SP 谱没有定数）。
+- `spec/check.py`：`meta` 的必需键列表补上 `audio` / `background`。
+
+红/绿：`minimal.opm.json` 删掉一个 `meta.background` ⇒ **旧 `check.py` PASS、新 `check.py` 报
+`/meta.background 缺少必需字段`**；Rust 侧把两行 `serde` 属性改回去 ⇒
+`meta_always_carries_the_nullable_asset_keys_but_not_the_optional_constant` 立刻红，改回来绿。
+
+### 7.97.2 `chart_end`：「谱面末尾」曾经是**每条线各算一份**
+
+`cmd::validate` 用 `Document::chart_end()`（**全文档一个数**：音符 ∪ 五条基础轨 ∪ 遮蔽区七条通道），
+而 `spec/check.py` 在 `check_judge_line` 里**按该线自己的音符**现算一个 ——
+于是"多线谱面里 A 线的轨道铺到末尾、B 线的轨道只铺到自己最后一个音符"这种文件：
+**Rust 报错、`check.py` 放行**。`cmd.rs` 的注释写着"两者应在同一份文件上给出相同结论"，
+但没有任何东西在守这句话。
+
+修法：`check.py` 新增 `chart_end_of(lines, zones)`，**与 `doc::chart_end` 逐条对应**，
+在 `check_document` 里**先算一次**再逐线校验。三条边界都写进了规范 §8 第 5 条：
+
+1. **全局** —— 每线各自铺到自己音符是**不够**的；
+2. **遮蔽区通道计入** —— 拖一块区域到很晚，会让**所有判定线轨道**都必须够到那里；
+3. `extended` / `controls` **不参与取值**（没建模），但它们**自身**仍受本条约束。
+
+> **差点写错的一次**：第 2 条我先按"遮蔽区不计入"写了一版（理由是 §4.6 说遮蔽区通道允许早于谱末结束）。
+> 被 `tests/codec.rs::mask_events_extend_the_chart_end` 撞回来 —— 直觉在这里是错的：
+> "通道自己不受约束"与"它的末事件抬高末尾"是两件事。现在有一条正面用例守着
+> （`a_mask_zone_dragged_late_raises_the_end_for_every_line`）。
+
+同时收掉一个**重复报错**：预扫"谱面末尾"若用会报错的 `beat_of`，同一个坏拍会被报两次
+（错误数看着翻倍），所以预扫用静默的 `beat_quiet`。也顺手删掉 `doc.rs` 里那行自相矛盾的旧文档注释
+（"谱面末尾（所有音符结束拍的最大值）"——它下面一行就写着"事件必须计入"）。
+
+### 7.97.3 可复跑的证据：`spec/examples/two-lines.opm.json`
+
+上面那个反例以前只存在于"我这次跑了一下"里。现在它是**入库的负样例**：
+A 线轨道铺到 32、B 线只铺到自己的音符 8。两份校验器都 FAIL，而且
+**指到同一个指针、说同一句话**（`/judgeLines[1].layers[0].moveX  轨道末事件止于 8，早于谱面末尾 32`）；
+旧 `check.py` 在它上面 PASS —— 这条落差就是回归探针。
+
+`check.py` 的模块 docstring 与规范 §8 都加上了这段核对方法（含"逐份比对**指针与措辞**，
+不是只看退出码"这条要求 —— 两边都说"错"但指到不同地方，等于没对齐）。
+
+### 7.97.4 一句陈旧注释：`masks` 说"无头出图看不见它"
+
+`opm-ctl ... masks` 的注释写着"遮蔽区画在 egui 层，无头出图看不见它 —— 判据得走数字"，
+但 `headless::render_png` 里它与 GUI **共用** `mask::push_mask_vertices`，出图**看得见**
+（本轮实测：45° 网格档与纯色档在 `render --at` 的 PNG 里清晰可辨）。
+注释已改成真正的理由：`masks` 的价值是**精度**（存在性判据 + 顶点数值），不是"图上看不见"。
+
+### 7.97.5 `speed` 轨缺席 = **10**，这条以前一处都没写
+
+`LinePerf::default()` 是 `{x:0, y:0, rotate:0, alpha:1, speed:10}` —— 缺省的流速是 **10 不是 1**
+（RPE 口径）。示例谱面里写 `"speed": 1` 不报错、校验器也不管，表现却是音符爬着掉：
+典型的"语法对、观感全错"，只能靠文档。规范 §4.1 补了一张表把五条轨道缺席时的取值写清楚，
+并单独点出 `speed` 这一格。
+
+### 7.97.6 验收
+
+- **458 测试**（+2 `codec` 的末尾判据用例、+1 `lifecycle` 的落盘用例），0 失败；
+- 四配置（Linux / Windows-gnu × debug / release）**0 警告**，test-profile 0 警告；
+- 两份校验器在 `spec/examples/` 四份样例上逐份比对：`minimal`/`mask` 双 PASS，
+  `bad`/`two-lines` 双 FAIL 且指针一致（`bad.opm.json` 在 Rust 侧是**载入期**就拒 ——
+  `unknown variant 'laser'`，退出码 2；`check.py` 则逐条报 21 个错。两边都拒，拒的阶段不同）；
+- BPM120 示例工程（`~/.dsh/workspace/OpenPhM-artifacts/demo-bpm120/`）重跑：
+  存盘后 `"background": null` **保住了**，连存三次字节不变。
+
+**没做、且刻意没做**：`extended` / `controls` 的**渲染**（那是功能线，不是口径问题），
+以及给它们补 Rust 侧的结构校验（`check.py` 有、`validate` 没有，方向是"危险的那一侧"，
+已记进规范第 10 节第 8 条）。两条都留着，别和这次的口径收口混在一起。

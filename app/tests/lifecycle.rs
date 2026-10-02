@@ -7,7 +7,7 @@
 
 use opm_app::broadcast::TopicFilter;
 use opm_app::core::{EditCore, SaveFormat};
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// 每个用例一个**独立**目录。
 ///
@@ -893,4 +893,51 @@ fn mask_zones_survive_a_real_save_and_reload() {
         }
     }
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// **`audio` / `background` 永远写出来**（没有就写 `null`）—— 规范 §2.1 的"必需（可空）"。
+///
+/// 这两个键曾经带 `skip_serializing_if = "Option::is_none"`：app 存一次就把
+/// `"background": null` 抹掉，于是"这份谱面没有音乐"有了两种写法（键缺席 / 键为 null），
+/// 而规范说必需、`check.py` 当时又没查 —— 规范、校验器、序列化器三家口径不一致
+/// （2026-10-03 收口成"按规范那一份"）。
+///
+/// `constant` 刻意**不在**这条里：规范 §2.1 把它标成 ⭕，缺席有语义（键不在 = 没填，
+/// `null` = SP 谱没有定数）。
+#[test]
+fn meta_always_carries_the_nullable_asset_keys_but_not_the_optional_constant() {
+    let mut core = EditCore::new();
+    core.exec(&json!({"op": "new", "meta": {"name": "没有音乐"}, "bpm": 120.0}));
+
+    let meta = core.doc().to_json()["meta"].clone();
+    assert!(meta.get("audio").is_some(), "audio 必须写出来（可为 null）：{meta}");
+    assert!(meta["audio"].is_null(), "没有音乐 ⇒ null，而不是省略：{meta}");
+    assert!(meta.get("background").is_some(), "background 必须写出来（可为 null）：{meta}");
+    assert!(meta["background"].is_null());
+    assert!(meta.get("constant").is_none(), "constant 是可选，缺席有语义：{meta}");
+
+    // 有值时照写；再从有值改回 null，键仍然在
+    core.exec(&json!({"op": "set_meta", "set": {"audio": "song.ogg", "background": "bg.png"}}));
+    let meta = core.doc().to_json()["meta"].clone();
+    assert_eq!(meta["audio"], json!("song.ogg"));
+    assert_eq!(meta["background"], json!("bg.png"));
+
+    core.exec(&json!({"op": "set_meta", "set": {"audio": null, "background": null}}));
+    let meta = core.doc().to_json()["meta"].clone();
+    assert!(meta.get("background").is_some(), "清空也不能把键丢掉：{meta}");
+    assert!(meta["background"].is_null());
+    assert!(meta.get("audio").is_some(), "清空也不能把键丢掉：{meta}");
+    assert!(meta["audio"].is_null());
+
+    // 存盘走的是同一个 `to_json()`（`EditCore::save` 里 `to_string_pretty(&doc.to_json())`），
+    // 所以上面这几条断言等价于"落盘的文件里有这两个键"。用**文件夹形态**落一次盘再读文件核对
+    // —— 裸 `.opm.json` 不是"新建"的保存形态（见 `suggested_extension_*` 那条的说明）。
+    let dir = tmpdir("meta-nullable-assets");
+    let (written, _) = core.save_as(&dir.join("a.opm.d"), SaveFormat::OpmFolder).unwrap();
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+    assert!(on_disk["meta"].get("audio").is_some(), "落盘文件缺 audio：{on_disk}");
+    assert!(on_disk["meta"]["audio"].is_null());
+    assert!(on_disk["meta"].get("background").is_some(), "落盘文件缺 background：{on_disk}");
+    assert!(on_disk["meta"]["background"].is_null());
+    std::fs::remove_dir_all(&dir).ok();
 }
