@@ -560,7 +560,6 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
     let ec = &mut out.commands;
     let beat = st.chart.tmap.beat(st.playhead);
     let snapped = st.snap_beat(beat).max(0.0);
-    let anchor = opm_app::codec::beat_from_f64(snapped);
 
     ui.horizontal(|ui| {
         ui.label("遮蔽区");
@@ -570,13 +569,21 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
             st.chart.zones.len()
         ));
     });
+    // 「新建」的起点：**0 区时是拍 0**（那块草稿三角就是它），已有区时是播放头 ——
+    // 口径只有一处（`EditorState::mask_new_zone_start`），树面板那颗按钮调的是同一个。
+    let new_start = st.mask_new_zone_start();
     ui.horizontal(|ui| {
         if ui
             .small_button("新建")
-            .on_hover_text("在播放头摆一个中央正三角形（六条常量事件；active 不写事件）")
+            .on_hover_text(format!(
+                "摆一个中央正三角形（六条常量事件、长 {} 拍；active 不写事件）。\n\
+                 起点：一块都没有时 = 拍 0（与编辑区里那块草稿三角同一块），否则 = 播放头（{:.3} 拍）",
+                opm_app::doc::MASK_EVENT_BEATS,
+                new_start.to_f64()
+            ))
             .clicked()
         {
-            ec.push(opm_app::edit::add_zone_command(anchor));
+            ec.push(opm_app::edit::add_zone_command(new_start));
         }
         if ui
             .add_enabled(
@@ -598,7 +605,12 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
         );
         return;
     };
-    // 有命令产出的那一刻就置位（草稿态下调用方要先建区再应用，见 `InspectorOut::mask_edits`）
+    // 从**这一行往后**产生的命令才是"假定已经有区"的编辑（草稿态下要先建区再应用，
+    // 见 `InspectorOut::mask_edits`）。
+    //
+    // 为什么要落在「新建/删除」**之后**：`add_zone` 本身就是一条完整命令 —— 再被草稿包装
+    // 套一层，一次点击就会建出**两块**区（草稿那块 + 新建那块）。删除在草稿态是禁用的，
+    // 所以只有新建这一颗需要挡。
     let mask_edits_mark = ec.len();
 
     // ---- 名字 ----
@@ -633,24 +645,35 @@ fn mask_panel(ui: &mut Ui, st: &EditorState, out: &mut InspectorOut) {
     ));
 
     // ---- 在播放头放一块 ----
+    //
+    // 跨度规则与编辑区里的手势草稿**同一条**（`EditorState::mask_span_at`）：长度一个格点、
+    // 不越过下一块；这一点上已经有一块时按钮禁用并说明原因 —— 以前这里写死 4 拍、也不夹取，
+    // 于是"在播放头放一块"能造出一条与下一块重叠的事件（自己的产物过不了自己的校验器）。
     ui.separator();
     let ch = mi.channel;
+    let place = st.mask_span_at(ch, snapped);
+    let reason = format!(
+        "给当前列 {} 放一个事件块：长度一个格点（当前 {:.3} 拍）、**值取此刻的值**（放下不跳变）\n\
+         · 不越过下一块（通道内不许重叠）\n\
+         · 与编辑区里的 R 起稿是**同一条跨度规则**，只是这里没有鼠标可拖",
+        ch.key(),
+        st.beat_step()
+    );
     ui.horizontal(|ui| {
         if ui
-            .small_button("在播放头放一块")
-            .on_hover_text(format!(
-                "给当前列 {} 放一个 4 拍的事件块，**值取此刻的值**（放下一刻不跳变）",
-                ch.key()
-            ))
+            .add_enabled(place.is_some(), egui::Button::new("在播放头放一块").small())
+            .on_hover_text(if place.is_some() {
+                reason
+            } else {
+                format!("{reason}\n\n**这里放不下**：播放头那一拍上已经有一块了 —— 挪一下播放头，或先删掉那一块")
+            })
             .clicked()
         {
-            let end = opm_app::codec::beat_from_f64(snapped + 4.0);
-            ec.push(opm_app::edit::add_mask_event_command(
-                mi.index,
-                ch,
-                anchor,
-                end,
-            ));
+            if let Some((start, end)) = place {
+                ec.push(opm_app::edit::add_mask_event_command(
+                    mi.index, ch, start, end,
+                ));
+            }
         }
     });
 

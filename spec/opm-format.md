@@ -203,6 +203,10 @@
 **`[起点, 起点 + 1 拍]`**（种子块；"初始屏蔽区事件区间为 0~1 拍"）—— 想要更长就拖事件块的尾巴，
 或者在别处再放块。`active` **不写事件**（于是新建出来是 `false` 那一档）。命令层的细节见 4.6.1。
 
+**放一块的跨度规则**（编辑器手势、属性编辑器、命令层**共用一份实现**）：
+起点与已有块的起点重合 ⇒ 不许放；终点**不越过下一块的起点**；缺省长度 = `MASK_EVENT_BEATS` = 1 拍
+（命令行不带 `endBeat` 时）。落点在某一块**里面**是合法的插入 —— 前一块被裁到新起点，切点上的值不变。
+
 ### 4.6.1 遮蔽区相关命令（`app/src/core.rs`）
 
 | 命令 | 说明 |
@@ -210,10 +214,10 @@
 | `add_zone` | `{startBeat?, endBeat?, name?, empty?, set?}`；默认写中央正三角形；`empty:true` 建一个没有任何事件、**不显示**的区 |
 | `del_zone` | `{index}`（`zone` 也认） |
 | `set_zone` | `{zone, set:{name}}` |
-| `add_zone_event` | `{zone, track, startBeat, endBeat?, startValue?, endValue?, easing?}`；缺省值 = 该通道**此刻的值**；插入时会把被压住的前一块**裁到新块起点**（切点值不变） |
-| `set_zone_event` | `{zone, track, index, set:{startBeat?, endBeat?, startValue?, endValue?, easing?}}` |
+| `add_zone_event` | `{zone, track, startBeat, endBeat?, startValue?, endValue?, easing?}`；缺省值 = 该通道**此刻的值**；缺省终点 = 起点 + 1 拍（`MASK_EVENT_BEATS`）**且不越过下一块**；**起点与已有块的起点重合、或显式终点越过下一块 ⇒ 报错**；插入时会把被压住的前一块**裁到新块起点**（切点值不变） |
+| `set_zone_event` | `{zone, track, index, set:{startBeat?, endBeat?, startValue?, endValue?, easing?}}`；改完**与邻块重叠 ⇒ 报错**（通道不变量） |
 | `del_zone_event` | `{zone, track, index}` |
-| `resize_zone_event` | `{zone, track, index, edge:"start"\|"end", toBeat}` —— 只动这一个端点 |
+| `resize_zone_event` | `{zone, track, index, edge:"start"\|"end", toBeat}` —— 只动这一个端点；与邻块重叠会被拒 |
 | `move_zone_event` | `{zone, track, index, delta}` —— 整块平移；与邻块重叠会被拒 |
 
 ---
@@ -337,5 +341,7 @@
 5. **遮蔽区的"点不进去"要不要在编辑器里模拟**：当前**不模拟**（编辑器里被盖住的音符照常可选可编 ——
    否则那块区域里的谱就没法编了）。"点不进去"是播放器的行为。
 6. 遮蔽区通道的**重叠检测还没进冲突浏览器**（只有 `validate` 会报）：`cmd::overlap` 是按判定线建模的，
-   而遮蔽区没有图层/线号。当前靠"插入时裁前一块"让它很难发生。
+   而遮蔽区没有图层/线号。当前靠"写入侧的跨度规则"让它很难发生 —— `add_zone_event` 拒绝越界与起点重合、
+   `set_zone_event` / `resize_zone_event` / `move_zone_event` 拒绝压到邻块（判定见 §4.6.1），
+   编辑器的拖动还会在邻块边界处停住。
 7. 遮蔽区编辑模式下的**事件块多选**（框选/Ctrl+点）还没做 —— 当前是单选。

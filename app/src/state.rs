@@ -1213,6 +1213,89 @@ impl PendingEvent {
     }
 }
 
+/// 遮蔽区编辑模式下**正在跟随鼠标的事件块草稿**（按 R 起稿）。
+///
+/// 与 [`PendingEvent`] 是同一条手势的两种数据源，差别只有两点，都是格式带来的：
+/// · 它的跨度**用 `Beat` 存**（不是浮点）：最后写进文档的就是这几个有理数，
+///   中间任何一次"拍 → 浮点 → 再按网格取整"都可能把终点推过邻块（那会造成重叠，
+///   而遮蔽区通道不许重叠）；
+/// · 它带一个**终点上限** `limit`（= 下一块的起点）：拖到那儿就停住 ——
+///   判定线那边重叠可以留给冲突浏览器，遮蔽区没有那个东西。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PendingMaskEvent {
+    /// 命中的区（草稿态就是 0 —— 第一次编辑会把区建出来）
+    pub zone: usize,
+    pub channel: MaskChannel,
+    pub start: crate::doc::Beat,
+    pub end: crate::doc::Beat,
+    /// 终点上限 = 后面那一块的起点（`None` = 后面没有块）
+    pub limit: Option<crate::doc::Beat>,
+}
+
+impl PendingMaskEvent {
+    /// 起稿：跨度先给 `[起点, 起点 + min]`，再夹到 `limit`（空档比一个格点还窄时就是它本身）
+    pub fn new(
+        zone: usize,
+        channel: MaskChannel,
+        start: crate::doc::Beat,
+        min: crate::doc::Beat,
+        limit: Option<crate::doc::Beat>,
+    ) -> Self {
+        let mut d = Self {
+            zone,
+            channel,
+            start,
+            end: start.checked_add(min).unwrap_or(start),
+            limit,
+        };
+        d.clamp();
+        d
+    }
+
+    /// 终点不越过上限（**唯一一处**夹取 —— 起稿、跟随、拖控制杆都走它）
+    fn clamp(&mut self) {
+        if let Some(limit) = self.limit {
+            if self.end > limit {
+                self.end = limit;
+            }
+        }
+    }
+
+    /// 鼠标移动：改**终点**（与判定线那边同一条规则：保底一个格点，反向拖不会拖没）
+    pub fn follow(&mut self, beat: crate::doc::Beat, min: crate::doc::Beat) {
+        let floor = self.start.checked_add(min).unwrap_or(self.start);
+        self.end = beat.max(floor);
+        self.clamp();
+    }
+
+    /// 拖控制杆：只动那一头，且不许交叉
+    pub fn resize(&mut self, edge: EventEdge, beat: crate::doc::Beat, min: crate::doc::Beat) {
+        match edge {
+            EventEdge::Start => {
+                // start ≤ end - min：`Beat` 只有精确加法，减一个正数就是加它的相反数
+                let ceiling = self
+                    .end
+                    .checked_add(crate::doc::Beat::new(-min.n, min.d))
+                    .unwrap_or(self.start);
+                self.start = beat.min(ceiling);
+            }
+            EventEdge::End => {
+                let floor = self.start.checked_add(min).unwrap_or(self.start);
+                self.end = beat.max(floor);
+            }
+        }
+        self.clamp();
+    }
+
+    pub fn len(&self) -> f64 {
+        (self.end.to_f64() - self.start.to_f64()).abs()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() <= 1e-9
+    }
+}
+
 /// 选区里装的是哪一类（框选时由**拖动起始点**落在哪个半区决定，用户定的规则）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SelKind {
@@ -1393,6 +1476,11 @@ pub struct EditorState {
     pub pending_hold: Option<PendingHold>,
     /// 在事件区按键之后正在跟随鼠标的事件块草稿（与 hold **互斥**：同时只放一个东西）
     pub pending_event: Option<PendingEvent>,
+    /// 遮蔽区编辑模式下正在跟随鼠标的**事件块草稿**（R 起稿）。
+    ///
+    /// 与 `pending_event` 是同一套手势的两种数据源（判定线轨道 / 遮蔽区通道）——
+    /// 用户口径 2026-10-02："创建流程应与普通编辑模式下的事件块放置一样"。
+    pub pending_mask: Option<PendingMaskEvent>,
     /// 演奏区**实例构建窗口**（秒）：以播放头为基准往后看 `lookahead` 秒的**音符**才会被送进
     /// 渲染管线。
     ///
@@ -1471,6 +1559,7 @@ impl EditorState {
             sel: Selection::default(),
             pending_hold: None,
             pending_event: None,
+            pending_mask: None,
             lookahead: 2.0,
             show_boundary: true,
             line_half_w: RPE_LINE_HALF_W, // = 3000 的一半
@@ -1670,6 +1759,14 @@ impl EditorState {
         1.0 / self.effective_beat_div().max(1) as f64
     }
 
+    /// 网格步长（拍）的**有理形态** —— 草稿的保底长度用它。
+    ///
+    /// 浮点那份（[`Self::beat_step`]）继续给判定线那条链用；遮蔽区草稿全程在 `Beat` 上走，
+    /// 需要一个精确的"一个格点"。
+    pub fn beat_step_exact(&self) -> crate::doc::Beat {
+        crate::doc::Beat::new(1, self.effective_beat_div().max(1) as i64)
+    }
+
     /// 开始放置一个 hold（按下 R）：起点取指针处，终点先给一个格点。
     /// **同时只允许一个草稿** —— 起 hold 就把事件草稿清掉。
     pub fn begin_pending_hold(&mut self, lane_x: f32, start_beat: f64) {
@@ -1704,15 +1801,129 @@ impl EditorState {
         self.pending_event.take()
     }
 
-    /// 现在有没有草稿（hold 或事件块）——面板用它决定"是不是在放置模式"
+    // ---- 遮蔽区事件块草稿（R 起稿，与事件草稿同一套手势）----
+
+    /// 在遮蔽区的某个通道上起一个草稿（按 R）：`false` = 这一点上已经有一块，起不了。
+    ///
+    /// 起点/终点一律**先在网格上取成有理拍**（`beat_at_grid`）——
+    /// 判定线那边是 `f64` 一路到提交才转，这里不行：终点要能精确地停在"下一块起点"上。
+    pub fn begin_pending_mask(&mut self, channel: MaskChannel, zone: usize, start_beat: f64) -> bool {
+        let Some((start, end)) = self.mask_span_at(channel, start_beat) else {
+            return false;
+        };
+        self.pending_hold = None;
+        self.pending_event = None;
+        self.pending_mask = Some(PendingMaskEvent {
+            zone,
+            channel,
+            start,
+            end,
+            limit: self.mask_end_limit_for(channel, start),
+        });
+        true
+    }
+
+    /// 鼠标移动 ⇒ 草稿的终点跟着走
+    pub fn follow_pending_mask(&mut self, beat: f64) {
+        let (step, b) = (self.beat_step_exact(), self.beat_at_grid(beat));
+        if let Some(d) = self.pending_mask.as_mut() {
+            d.follow(b, step);
+        }
+    }
+
+    /// 拖控制杆 ⇒ 改草稿的起点或终点（起点一动，终点上限要重算 —— 上限是"起点之后"的函数）
+    pub fn resize_pending_mask(&mut self, edge: EventEdge, beat: f64) {
+        let (step, b) = (self.beat_step_exact(), self.beat_at_grid(beat));
+        if let Some(d) = self.pending_mask.as_mut() {
+            d.resize(edge, b, step);
+        }
+        self.refresh_pending_mask_limit();
+    }
+
+    /// 取走遮蔽区草稿（提交用）
+    pub fn take_pending_mask(&mut self) -> Option<PendingMaskEvent> {
+        self.pending_mask.take()
+    }
+
+    /// 草稿提交时的**文档跨度**（有理拍）。
+    ///
+    /// `None` 有两种情形，调用方都该给用户一句解释：起点上已经有块了，或者草稿被拖空了。
+    /// 被夹在"下一块起点"上的那一头**直接用那个精确拍** —— 它是从文档里读出来的，
+    /// 不在网格上（见 `PendingMaskEvent` 的头注）。
+    pub fn mask_pending_span(&self) -> Option<(crate::doc::Beat, crate::doc::Beat)> {
+        let d = self.pending_mask?;
+        let track = self.mask_edit_track(d.channel);
+        if !crate::edit::mask_can_start(&track, d.start) {
+            return None;
+        }
+        let end = match d.limit {
+            Some(limit) if d.end == limit => limit,
+            _ => d.end,
+        };
+        (end > d.start).then_some((d.start, end))
+    }
+
+    /// 草稿当前通道的终点上限（`None` = 后面没有块）
+    fn mask_end_limit_for(
+        &self,
+        channel: MaskChannel,
+        start: crate::doc::Beat,
+    ) -> Option<crate::doc::Beat> {
+        crate::edit::mask_end_limit(&self.mask_edit_track(channel), start)
+    }
+
+    /// 起点一动就要重算上限（`resize` 拖的就是起点）：只有这一处算 —— 起稿与拖动都走它
+    fn refresh_pending_mask_limit(&mut self) {
+        let Some(d) = self.pending_mask else { return };
+        let limit = self.mask_end_limit_for(d.channel, d.start);
+        if let Some(d) = self.pending_mask.as_mut() {
+            d.limit = limit;
+            d.clamp();
+        }
+    }
+
+    /// 编辑区此刻画的那条通道的事件表（草稿态是**草稿区**的那一份 —— 与眼睛看到的一致）
+    fn mask_edit_track(&self, channel: MaskChannel) -> Vec<crate::doc::Event> {
+        self.mask_edit_view()
+            .map(|z| z.track(channel).events.clone())
+            .unwrap_or_default()
+    }
+
+    /// 在 `start_beat`（浮点拍，调用方已按网格吸附）处放一块的**文档跨度**。
+    ///
+    /// 长度 = **一个格点**（与草稿的初始长度同一条规则 —— 用户口径："和普通编辑模式下的事件块
+    /// 放置一样"），且不越过下一块；这里放不下（起点上已有块）⇒ `None`。
+    /// 属性编辑器那颗按钮与草稿起稿共用它。
+    pub fn mask_span_at(
+        &self,
+        channel: MaskChannel,
+        start_beat: f64,
+    ) -> Option<(crate::doc::Beat, crate::doc::Beat)> {
+        let start = self.beat_at_grid(start_beat.max(0.0));
+        let track = self.mask_edit_track(channel);
+        if !crate::edit::mask_can_start(&track, start) {
+            return None;
+        }
+        let full = start.checked_add(self.beat_step_exact())?;
+        let end = match crate::edit::mask_end_limit(&track, start) {
+            Some(limit) if limit < full => limit,
+            _ => full,
+        };
+        (end > start).then_some((start, end))
+    }
+
+    /// 现在有没有草稿（hold、判定线事件块、或遮蔽区事件块）——面板用它决定"是不是在放置模式"
     pub fn drafting(&self) -> bool {
-        self.pending_hold.is_some() || self.pending_event.is_some()
+        self.pending_hold.is_some()
+            || self.pending_event.is_some()
+            || self.pending_mask.is_some()
     }
 
     /// 取消任何草稿（Esc / 左键放下时都会走到这里）
     pub fn cancel_pending(&mut self) {
         self.pending_hold = None;
         self.pending_event = None;
+        self.pending_mask = None;
     }
 
     /// 鼠标移动：hold 的长度跟着走（保底一个格点）
@@ -1793,16 +2004,26 @@ impl EditorState {
         Some(std::borrow::Cow::Owned(mask_view_of_zone(&zone, 0, &self.chart.tmap)))
     }
 
-    /// 新建遮蔽区那颗三角形的**起止拍**：**起点固定拍 0**（用户口径 2026-10-02：
-    /// "0 个屏蔽区时初始事件固定在 0 处"），终点按 `default_span`（谱面末尾与"起点+4 拍"取大者）。
+    /// 新建遮蔽区的**起点拍** —— 所有"新建区"的入口都从它取起点（属性编辑器、树、草稿）。
+    ///
+    /// 两条口径合成一句：
+    /// · **一块都没有**（草稿态）⇒ **拍 0**：屏幕上画的那块草稿三角就是它，按「新建」= 把它
+    ///   落成真区（用户口径 2026-10-02："0 个屏蔽区时初始事件固定在 0 处"）；
+    /// · 已有区 ⇒ 当前**播放头**（按网格吸附）：那时没有草稿可落，"在播放头新建"才是用户的意图。
+    pub fn mask_new_zone_start(&self) -> crate::doc::Beat {
+        if self.chart.zones.is_empty() {
+            return crate::doc::Beat::zero();
+        }
+        self.beat_at_grid(self.snap_beat(self.chart.tmap.beat(self.playhead)).max(0.0))
+    }
+
+    /// 新建遮蔽区那颗三角形的**起止拍**：`default_span(起点)`（起点见
+    /// [`Self::mask_new_zone_start`]，长度 [`crate::doc::MASK_EVENT_BEATS`] = 1 拍）。
     ///
     /// 界面（草稿视图 + `add_zone` 命令）与核心那边用的是**同一个** `default_span`，
     /// 所以"屏幕上画的那个三角"与"真正建出来的那个"不会分家。
     pub fn mask_new_zone_span(&self) -> (crate::doc::Beat, crate::doc::Beat) {
-        // **起点固定在拍 0**（用户口径 2026-10-02："0 个屏蔽区时初始事件固定在 0 处"），
-        // 长度 1 拍（同一批："调整初始屏蔽区事件区间为 0~1 拍"）⇒ 草稿就是 `[0, 1]`：
-        // 拖动播放头不该让待建的区前后挪动，而"整首都在"也不该是默认。
-        crate::doc::MaskZone::default_span(crate::doc::Beat::zero())
+        crate::doc::MaskZone::default_span(self.mask_new_zone_start())
     }
 
     /// 选中区的那条通道
@@ -1912,6 +2133,15 @@ impl EditorState {
     pub fn beat_json(&self, beat: f64) -> [i64; 2] {
         let d = self.effective_beat_div().max(1) as i64;
         [((beat * d as f64).round() as i64), d]
+    }
+
+    /// 拍 → [`crate::doc::Beat`]：**与 [`Self::beat_json`] 同一条规则**，只是给有理拍形状。
+    ///
+    /// 遮蔽区那条链（草稿、落块）要的是"吸附过的拍的有理形态"：`[n, d]` 再约分就是它。
+    /// 不要用 `beat_from_f64`（毫拍）—— 那会把 1/3 拍写成 333333/1000000。
+    pub fn beat_at_grid(&self, beat: f64) -> crate::doc::Beat {
+        let [n, d] = self.beat_json(beat);
+        crate::doc::Beat::new(n, d)
     }
 
     /// 音符区当前显示的 laneX 区间（左端, 右端）
@@ -2909,5 +3139,148 @@ mod mask_draft_tests {
         let st2 = EditorState::new(chart_from_doc(&doc2));
         assert_eq!(st2.chart.zones.len(), 1);
         assert_eq!(st2.mask_edit_view().map(|v| v.index), Some(0));
+    }
+
+    /// 一块 [1/2, 4) 的 x1 事件 + **3 等分**的网格（1/2 拍不在网格上）。
+    ///
+    /// 这组数字是刻意的：`beat_json(0.5)` 在 3 等分下会**四舍五入到 2/3**（0.667），
+    /// 于是"先把终点按网格取整、再夹到下一块起点"的顺序会把它推到邻块**里面** ——
+    /// 那正是遮蔽区通道不变量禁止的重叠（旧的两条放块路径都有这个隐患）。
+    fn off_grid_neighbour() -> EditorState {
+        let mut doc = Document::default();
+        doc.bpm_list = vec![crate::doc::BpmEntry {
+            start: crate::doc::Beat::zero(),
+            bpm: 180.0,
+            foreign: Default::default(),
+        }];
+        let mut z = MaskZone::default();
+        z.x1 = vec![
+            crate::doc::Event::new(
+                crate::doc::Beat::new(1, 2),
+                crate::doc::Beat::new(4, 1),
+                serde_json::json!(100.0),
+                serde_json::json!(100.0),
+                "linear",
+            ),
+            // 第二条是**落在网格上**的（5 拍），用来验"起点重合 ⇒ 放不下"
+            crate::doc::Event::new(
+                crate::doc::Beat::new(5, 1),
+                crate::doc::Beat::new(6, 1),
+                serde_json::json!(100.0),
+                serde_json::json!(100.0),
+                "linear",
+            ),
+        ];
+        doc.mask_zones = vec![z];
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.mask_edit = true;
+        st.overlay_beats = 8.0;
+        st.grid.beat_div = 3;
+        st
+    }
+
+    /// 在播放头放一块：长度一个格点、**终点精确停在下一块起点上**（不经过浮点再取整）
+    #[test]
+    fn placing_a_block_stops_exactly_at_an_off_grid_neighbour() {
+        let st = off_grid_neighbour();
+        assert_eq!(st.effective_beat_div(), 3, "3 等分：1/2 拍不在网格上");
+        assert_eq!(
+            st.beat_at_grid(0.5),
+            crate::doc::Beat::new(2, 3),
+            "朴素做法（先按网格取整）会把 1/2 推成 2/3 —— 那就压进邻块了"
+        );
+        // 起点 0：长度一个格点（1/3），没碰到邻块
+        assert_eq!(
+            st.mask_span_at(MaskChannel::X1, 0.0),
+            Some((crate::doc::Beat::zero(), crate::doc::Beat::new(1, 3)))
+        );
+        // 起点 1/3：1/3 + 1/3 = 2/3 越过了 1/2 ⇒ 终点**精确**停在 1/2（邻块起点）
+        assert_eq!(
+            st.mask_span_at(MaskChannel::X1, 1.0 / 3.0),
+            Some((crate::doc::Beat::new(1, 3), crate::doc::Beat::new(1, 2)))
+        );
+        // 起点落在**网格上**、又正好压在邻块起点上（5 拍）⇒ 放不下
+        assert_eq!(st.mask_span_at(MaskChannel::X1, 5.0), None);
+        // 起点吸附到 2/3（1/2 不在 3 等分的网格上，用户点不到那儿）：落在 [1/2,4) 里面 ⇒
+        // 允许插一块（核心会把前一块裁到新起点），终点受**再往后**那一块约束
+        assert_eq!(
+            st.mask_span_at(MaskChannel::X1, 0.5),
+            Some((crate::doc::Beat::new(2, 3), crate::doc::Beat::new(1, 1)))
+        );
+        // 另一条通道（x2 没事件）⇒ 只有长度，没有上限
+        assert_eq!(
+            st.mask_span_at(MaskChannel::X2, 1.0 / 3.0),
+            Some((crate::doc::Beat::new(1, 3), crate::doc::Beat::new(2, 3)))
+        );
+    }
+
+    /// R 起稿：起点重合起不了稿；跟随被**下一块起点**夹住；提交时给的就是那几个有理拍
+    #[test]
+    fn the_mask_draft_is_clamped_by_the_next_block_and_commits_exact_beats() {
+        let mut st = off_grid_neighbour();
+        assert!(!st.drafting());
+        // 起点 1/3：起稿成功，长度先给一个格点（1/3 → 2/3），再夹到下一块起点 1/2
+        assert!(st.begin_pending_mask(MaskChannel::X1, 0, 1.0 / 3.0));
+        assert!(st.drafting(), "起稿之后面板要切成放置模式");
+        let d = st.pending_mask.expect("有草稿");
+        assert_eq!(d.start, crate::doc::Beat::new(1, 3));
+        assert_eq!(d.end, crate::doc::Beat::new(1, 2));
+        assert_eq!(d.limit, Some(crate::doc::Beat::new(1, 2)));
+        // 鼠标拖到 10 拍：终点**不许越过**邻块起点
+        st.follow_pending_mask(10.0);
+        assert_eq!(st.pending_mask.unwrap().end, crate::doc::Beat::new(1, 2));
+        // 反向拖到 0：保底一个格点（1/3 + 1/3 = 2/3），仍被上限夹住
+        st.follow_pending_mask(0.0);
+        assert_eq!(st.pending_mask.unwrap().end, crate::doc::Beat::new(1, 2));
+        // 提交：跨度是精确有理拍，且不含重叠
+        assert_eq!(
+            st.mask_pending_span(),
+            Some((crate::doc::Beat::new(1, 3), crate::doc::Beat::new(1, 2)))
+        );
+        // 起点重合（5 拍那块）⇒ 起不了稿
+        assert!(!st.begin_pending_mask(MaskChannel::X1, 0, 5.0));
+        // 取消：草稿清干净
+        st.cancel_pending();
+        assert!(!st.drafting());
+        assert!(st.pending_mask.is_none());
+    }
+
+    /// 拖控制杆把草稿的起点挪到别处：终点上限**跟着起点重算**
+    #[test]
+    fn moving_the_draft_start_recomputes_its_end_limit() {
+        let mut st = off_grid_neighbour();
+        // 从 10 拍起稿（[1/2,4) 那块在它前面，不算障碍）
+        assert!(st.begin_pending_mask(MaskChannel::X1, 0, 10.0));
+        let d = st.pending_mask.unwrap();
+        assert_eq!(d.limit, None, "后面没有块");
+        // 把起点拖回 1/3：上限变成 1/2，终点被夹下来
+        st.resize_pending_mask(EventEdge::Start, 1.0 / 3.0);
+        let d = st.pending_mask.unwrap();
+        assert_eq!(d.start, crate::doc::Beat::new(1, 3));
+        assert_eq!(d.end, crate::doc::Beat::new(1, 2), "上限重算了");
+    }
+
+    /// 新建区的起点口径：**一块都没有 ⇒ 拍 0**（草稿三角就是它），已有区 ⇒ 播放头
+    #[test]
+    fn a_new_zone_starts_at_beat_zero_only_while_there_are_none() {
+        let doc = Document::default();
+        let mut st = EditorState::new(chart_from_doc(&doc));
+        st.seek(20.0);
+        assert_eq!(st.mask_new_zone_start(), crate::doc::Beat::zero());
+        assert_eq!(
+            st.mask_new_zone_span(),
+            (crate::doc::Beat::zero(), crate::doc::Beat::new(1, 1))
+        );
+        // 有了一块区之后：起点 = 播放头（按网格吸附）
+        let mut doc2 = doc.clone();
+        doc2.mask_zones = vec![MaskZone::with_default_triangle(
+            crate::doc::Beat::zero(),
+            crate::doc::Beat::new(1, 1),
+        )];
+        let mut st2 = EditorState::new(chart_from_doc(&doc2));
+        st2.seek(20.0);
+        let want = st2.beat_at_grid(st2.snap_beat(st2.chart.tmap.beat(st2.playhead)).max(0.0));
+        assert_eq!(st2.mask_new_zone_start(), want);
+        assert!(want > crate::doc::Beat::zero());
     }
 }

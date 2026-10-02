@@ -20,6 +20,18 @@ pub struct Beat {
 }
 
 impl Beat {
+    /// 相加（`None` = 溢出）—— **精确**，不经过浮点。
+    ///
+    /// 与顺序比较一样是"拍运算"的基础件，放这里是为了让命令层（`add_zone_event` 的缺省终点、
+    /// 草稿的保底长度、`move_zone_event` 的平移）**共用一份**：各写一遍交叉相乘
+    /// 迟早会有一处忘了 `checked_`。
+    pub fn checked_add(self, other: Beat) -> Option<Beat> {
+        Some(Beat::new(
+            self.n.checked_mul(other.d)?.checked_add(other.n.checked_mul(self.d)?)?,
+            self.d.checked_mul(other.d)?,
+        ))
+    }
+
     pub fn new(n: i64, d: i64) -> Self {
         let (n, d) = if d == 0 { (n, 1) } else { (n, d) };
         let g = gcd(n.unsigned_abs() as i64, d.unsigned_abs() as i64).max(1);
@@ -205,6 +217,18 @@ impl Layer {
 /// 按规范第 1 节第 6 条（永不删除字段）**追加**即可，不必预先挖坑。
 pub const MASK_TRACKS: [&str; 7] = ["x1", "y1", "x2", "y2", "x3", "y3", "active"];
 
+/// 一个**遮蔽区事件块**的默认长度（拍）—— **只有这一处**。
+///
+/// 三条口径共用它：
+/// · 新建遮蔽区时那六条种子事件的跨度（[`MaskZone::default_span`]）；
+/// · 命令层 `add_zone_event` 不带 `endBeat` 时的终点（`起点 + 它`，太窄就缩到空档）；
+/// · 编辑区里起一个草稿时的**保底长度**参照（草稿实际用一个格点，见
+///   `EditorState::beat_step_exact`）。
+///
+/// 以前这三处各写各的（界面手势 1 拍、属性编辑器 4 拍、核心缺省 4 拍）—— 同一个动作
+/// 换个入口就得到不一样长的块。现在只有这一个数字，改它就全变。
+pub const MASK_EVENT_BEATS: i64 = 1;
+
 /// 新建遮蔽区的默认形状：以屏幕中心为外心的**正三角形**（外接圆半径 200 RPE 单位）。
 ///
 /// 顶点坐标按"Y 向上"给（与 RPE 坐标系一致）：第一个顶点在上，另两个在下。
@@ -297,7 +321,7 @@ impl MaskZone {
     /// 新建遮蔽区的**默认跨度**：`[起点, 起点 + 1 拍]`（**就 1 拍**）。
     ///
     /// 用户口径（2026-10-02）："调整初始屏蔽区事件区间为 0~1 拍" —— 草稿的起点恒为拍 0
-    /// （见 `EditorState::mask_new_zone_span`），于是草稿正好是 `[0, 1]`。
+    /// （见 `EditorState::mask_new_zone_start`），于是草稿正好是 `[0, 1]`。
     ///
     /// 为什么不铺到谱面末尾：**块的跨度就是这块区域存在的时段**（见
     /// [`crate::perf::mask_state_at`] 的可见性规则）—— 铺满全谱等于"整首都在"，
@@ -307,7 +331,9 @@ impl MaskZone {
     /// 终点由核心按这条规则补）：两处各算一次的话，"屏幕上画的那个三角"与"动手之后真正
     /// 建出来的那个"会在第一次点击那一瞬间不一样。
     pub fn default_span(start: Beat) -> (Beat, Beat) {
-        let one = Beat::new(start.n + start.d, start.d.max(1));
+        let one = start
+            .checked_add(Beat::new(MASK_EVENT_BEATS, 1))
+            .unwrap_or(start);
         (start, one)
     }
 

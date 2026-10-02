@@ -109,13 +109,13 @@ pub enum OverlayAction {
     MaskDragStart,
     /// 遮蔽区编辑：拖动结束（调用方提交事务）
     MaskDragEnd,
-    /// 遮蔽区编辑：**R 或双击**放一个新块（起止已吸附；值由核心取"此刻的值"）。
-    /// 两条入口共用 `mask_block_span` 那一条跨度规则（长度 1 拍、不越过下一块）。
-    MaskPlace {
+    /// 遮蔽区编辑：**R 起一个事件块草稿**（与判定线事件区同一套手势 —— 用户口径
+    /// "创建流程应与普通编辑模式下的事件块放置一样"）。起点是吸附后的拍，值由核心取
+    /// "此刻的值"；长度随鼠标，上限是下一块的起点。
+    StartMaskDraft {
         zone: usize,
         channel: MaskChannel,
-        start: f64,
-        end: f64,
+        beat: f64,
     },
     /// 面板想跟用户说一句话（例如"指针不在音符区，快速放置用不了"）——
     /// 动作只描述意图，显示在状态栏/控制台由调用方决定
@@ -564,34 +564,6 @@ fn mask_drag_get(ui: &egui::Ui) -> Option<MaskDrag> {
     ui.data(|d| d.get_temp::<MaskDrag>(egui::Id::new("opm_mask_drag")))
 }
 
-/// **要在某条通道上放的那一块占哪一段**（R 键与双击**共用这一条规则**）。
-///
-/// 三条（都是用户口径的延续）：
-/// · 起点 = 指针所在拍（调用方已按网格吸附过，且 ≥ 0）；
-/// · 长度 = `len` 拍（R/双击默认 **1 拍** —— 与"初始屏蔽区事件区间 0~1 拍"同一个口径）；
-/// · **不越过下一块**（越过了就贴到它起点；起点本身已经压在块里时给 `None`）。
-///
-/// 返回 `None` = 这里放不下（紧挨着下一块），调用方去提示而不是硬塞。
-pub fn mask_block_span(
-    events: &[opm_app::doc::Event],
-    start: f64,
-    len: f64,
-) -> Option<(f64, f64)> {
-    let start = start.max(0.0);
-    // 已经有一块**正好从这一点开始** ⇒ 这里放不下（放下去就是两条起点相同的事件 = 重叠，
-    // 而遮蔽区通道的不变量是"不许重叠"）。指针落在块的**里面**是另一回事：那是有意插一块，
-    // 核心的 `trim_before_insert` 会把前一块裁到新块起点。
-    if events.iter().any(|e| (e.start.to_f64() - start).abs() < 1e-9) {
-        return None;
-    }
-    let next = events
-        .iter()
-        .filter(|e| e.start.to_f64() > start)
-        .map(|e| e.start.to_f64())
-        .fold(f64::INFINITY, f64::min);
-    let end = (start + len.max(1e-3)).min(next);
-    (end > start + 1e-3).then_some((start, end))
-}
 
 /// 按 `pad` 把闭区间夹进合法范围（`[0, ∞)` 里的一个"有长度的"区间）
 fn clamp_span(start: f64, end: f64, min_len: f64) -> (f64, f64) {
@@ -1597,95 +1569,43 @@ pub fn draw(
             }
         }
     }
-    if st.drafting() {
-        // 放下 / 取消：只有这一处判键，免得和别处抢。
-        // `keys_enabled` 同样管着它们 —— 在控制台打字时按回车不该把草稿放下。
-        let (commit_key, cancel) = if keys_enabled {
-            (
-                key_pressed_once(ui, egui::Key::R) || key_pressed_once(ui, egui::Key::Enter),
-                key_pressed_once(ui, egui::Key::Escape),
-            )
-        } else {
-            (false, false)
+    // ---- 草稿（hold / 事件块）：矩形由本模式算，手势两个模式共用 ----
+    //
+    // 用户口径 2026-10-02（遮蔽区）："创建流程应与普通编辑模式下的事件块放置一样" ——
+    // 于是"按 R 起稿 → 鼠标定长度 → R/回车/左键放下 → Esc 取消"只有一份实现
+    //（`draft_gesture`），两个模式各自只负责回答"草稿画在哪"和"指针在不在我这半区里"。
+    let draft_rect = {
+        let span_rect = |x0: f32, x1: f32, y0: f32, y1: f32| {
+            egui::Rect::from_min_max(egui::pos2(x0, y0.min(y1)), egui::pos2(x1, y0.max(y1)))
         };
-        // **左键点一下 = 放下**（用户要求）：拖动控制杆仍然是改起止、拖动别处仍然是跟随，
-        // 所以只认"没有拖动过的单击"。
-        let commit_click = !resp.dragged() && resp.clicked_by(egui::PointerButton::Primary);
-        if commit_key || commit_click {
-            actions.push(OverlayAction::DraftCommit);
-        } else if cancel {
-            actions.push(OverlayAction::DraftCancel);
-        }
-        // 草稿的几何：hold 在音符区（横向 = 音符宽）、事件块在它那一列（横向 = 列宽）
-        let draft_geom: Option<(f32, f32, f32, f32)> = if let Some(h) = st.pending_hold {
+        if let Some(h) = st.pending_hold {
+            // hold 在音符区（横向 = 音符宽）
             let x = x_of_lane(h.lane_x);
-            let (y0, y1) = (y_of(h.start_beat), y_of(h.end_beat));
-            Some((x - 5.0, x + 5.0, y0, y1))
+            Some(span_rect(x - 5.0, x + 5.0, y_of(h.start_beat), y_of(h.end_beat)))
         } else if let Some(e) = st.pending_event {
+            // 事件块在它那一列（横向 = 列宽）
             let k = TrackId::ALL.iter().position(|t| *t == e.track).unwrap_or(0);
             let x0 = ev_pane.min.x + col_w * k as f32;
-            let (y0, y1) = (y_of(e.start_beat), y_of(e.end_beat));
-            Some((x0 + 2.0, x0 + col_w - 2.0, y0, y1))
+            Some(span_rect(x0 + 2.0, x0 + col_w - 2.0, y_of(e.start_beat), y_of(e.end_beat)))
         } else {
             None
-        };
-        if let Some((x0, x1, y0, y1)) = draft_geom {
-            let draft = egui::Rect::from_min_max(
-                egui::pos2(x0, y0.min(y1)),
-                egui::pos2(x1, y0.max(y1)),
-            );
-            let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90);
-            let edge_col = egui::Color32::from_rgb(255, 235, 160);
-            if draft.is_positive() {
-                p.rect_filled(draft, 1.0, fill);
-                p.rect_stroke(
-                    draft.expand(1.0),
-                    1.0,
-                    egui::Stroke::new(1.2, edge_col),
-                    egui::StrokeKind::Outside,
-                );
-            }
-            let handle = TimeHandle::from_span(x0, x1, y0, y1);
-            let hot = ptr.map(|q| handle.hit(q));
-            let color = |hit: bool| if hit { egui::Color32::WHITE } else { edge_col };
-            handle.paint(&p, EventEdge::Start, color(hot == Some(EventPart::Start)));
-            handle.paint(&p, EventEdge::End, color(hot == Some(EventPart::End)));
-            if resp.drag_started() || resp.dragged() {
-                match hot {
-                    Some(EventPart::Start) | Some(EventPart::End) => {
-                        let edge = if hot == Some(EventPart::Start) {
-                            EventEdge::Start
-                        } else {
-                            EventEdge::End
-                        };
-                        if let Some(q) = ptr {
-                            actions.push(OverlayAction::DraftResize {
-                                edge,
-                                beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                            });
-                        }
-                    }
-                    // 拖在别处 = "长度跟着鼠标走"
-                    _ => {
-                        if let Some(q) = ptr {
-                            actions.push(OverlayAction::DraftFollow {
-                                beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                            });
-                        }
-                    }
-                }
-            } else if let Some(q) = ptr.filter(|q| pointer_in_notes(*q) || event_col_of(*q).is_some())
-            {
-                // 只有**真的移动**才改长度：滚动/缩放时指针没动，长度与视口都保持原样
-                let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
-                if moved {
-                    actions.push(OverlayAction::DraftFollow {
-                        beat: st.snap_beat(beat_of(q.y)).max(0.0),
-                    });
-                }
-            }
         }
-    }
+    };
+    let in_pane = ptr
+        .map(|q| pointer_in_notes(q) || event_col_of(q).is_some())
+        .unwrap_or(false);
+    draft_gesture(
+        ui,
+        &p,
+        st,
+        keys_enabled,
+        &resp,
+        ptr,
+        draft_rect,
+        in_pane,
+        &|y| st.snap_beat(beat_of(y)).max(0.0),
+        actions,
+    );
 
     // 滚轮：在编辑区里滚动就是**改谱面当前时间**（向上滚 = 往后）。跟随播放头的窗口会把这一变化
     // 直接体现出来，所以"滚动"与"移动播放头"在这里是同一件事（只此一处，别重复写第二份）。
@@ -1893,6 +1813,98 @@ pub fn draw(
     OverlayOut { note_stack }
 }
 
+
+/// 草稿（hold / 判定线事件块 / 遮蔽区事件块）的**手势**：放下、取消、控制杆、跟随。
+///
+/// 为什么抽成一份：用户口径 2026-10-02（遮蔽区）——"创建流程应与普通编辑模式下的事件块放置
+/// 一样"。以前遮蔽区是"按下 R 就地放一块、长度写死"，与普通模式那套"起稿 → 跟随 → 放下"
+/// 是两条流程，于是同一个动作在两个模式下得到不同的块。
+///
+/// 各模式只回答两件事：**草稿矩形**（列宽/列位置不同）与**指针在不在自己这半区里**
+/// （跟随只在指针留在本区时才改长度）；键位、放下条件、控制杆的判定与绘制都在这。
+#[allow(clippy::too_many_arguments)]
+fn draft_gesture(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    st: &EditorState,
+    keys_enabled: bool,
+    resp: &egui::Response,
+    ptr: Option<egui::Pos2>,
+    draft: Option<egui::Rect>,
+    in_pane: bool,
+    // 屏幕 y → 吸附后的拍（两个模式的 y 映射不同，但吸附规则同一条）
+    turn: &impl Fn(f32) -> f64,
+    actions: &mut Vec<OverlayAction>,
+) {
+    if !st.drafting() {
+        return;
+    }
+    // 放下 / 取消：只有这一处判键，免得和别处抢。
+    // `keys_enabled` 同样管着它们 —— 在控制台打字时按回车不该把草稿放下。
+    let (commit_key, cancel) = if keys_enabled {
+        (
+            key_pressed_once(ui, egui::Key::R) || key_pressed_once(ui, egui::Key::Enter),
+            key_pressed_once(ui, egui::Key::Escape),
+        )
+    } else {
+        (false, false)
+    };
+    // **左键点一下 = 放下**（用户要求）：拖动控制杆仍然是改起止、拖动别处仍然是跟随，
+    // 所以只认"没有拖动过的单击"。
+    let commit_click = !resp.dragged() && resp.clicked_by(egui::PointerButton::Primary);
+    if commit_key || commit_click {
+        actions.push(OverlayAction::DraftCommit);
+        return;
+    }
+    if cancel {
+        actions.push(OverlayAction::DraftCancel);
+        return;
+    }
+    let Some(draft) = draft else { return };
+    let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90);
+    let edge_col = egui::Color32::from_rgb(255, 235, 160);
+    if draft.is_positive() {
+        p.rect_filled(draft, 1.0, fill);
+        p.rect_stroke(
+            draft.expand(1.0),
+            1.0,
+            egui::Stroke::new(1.2, edge_col),
+            egui::StrokeKind::Outside,
+        );
+    }
+    // 矩形 → 控制杆：起点在下（纵轴越上越晚），与编辑区同一条约定
+    let handle = TimeHandle::from_span(draft.min.x, draft.max.x, draft.max.y, draft.min.y);
+    let hot = ptr.map(|q| handle.hit(q));
+    let color = |hit: bool| if hit { egui::Color32::WHITE } else { edge_col };
+    handle.paint(p, EventEdge::Start, color(hot == Some(EventPart::Start)));
+    handle.paint(p, EventEdge::End, color(hot == Some(EventPart::End)));
+    if resp.drag_started() || resp.dragged() {
+        match hot {
+            Some(EventPart::Start) | Some(EventPart::End) => {
+                let edge = if hot == Some(EventPart::Start) {
+                    EventEdge::Start
+                } else {
+                    EventEdge::End
+                };
+                if let Some(q) = ptr {
+                    actions.push(OverlayAction::DraftResize { edge, beat: turn(q.y) });
+                }
+            }
+            // 拖在别处 = "长度跟着鼠标走"
+            _ => {
+                if let Some(q) = ptr {
+                    actions.push(OverlayAction::DraftFollow { beat: turn(q.y) });
+                }
+            }
+        }
+    } else if let Some(q) = ptr.filter(|_| in_pane) {
+        // 只有**真的移动**才改长度：滚动/缩放时指针没动，长度与视口都保持原样
+        let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        if moved {
+            actions.push(OverlayAction::DraftFollow { beat: turn(q.y) });
+        }
+    }
+}
 
 /// 遮蔽区编辑模式的七条通道列。
 ///
@@ -2112,17 +2124,47 @@ fn draw_mask_pane(
         }
     });
 
-    // 光标：拖得动就直说（事件块只有时间一个轴 ⇒ 上下双头箭头）
-    match &hit {
-        Some(Hit::Block(_, _, _)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
-        Some(Hit::Channel(_)) if ptr.is_some() && !in_axis(ptr.unwrap()) => {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    // 光标：拖得动就直说（事件块只有时间一个轴 ⇒ 上下双头箭头）——草稿期间不改光标
+    // （那时左键是"放下"，说成"能拖"会误导）
+    if !st.drafting() {
+        match &hit {
+            Some(Hit::Block(_, _, _)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+            Some(Hit::Channel(_)) if ptr.is_some() && !in_axis(ptr.unwrap()) => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            _ => {}
         }
-        _ => {}
     }
 
-    // 拖动
-    if resp.drag_started() {
+    // ---- 事件块草稿（R 起稿）：矩形 + 手势 ----
+    //
+    // 矩形在这里算（列宽与列位置只有本模式知道），放下/取消/控制杆/跟随走两个模式共用的
+    // `draft_gesture` —— 与判定线事件区的创建流程**同一份实现**。
+    let draft_rect = st.pending_mask.and_then(|d| {
+        let k = MaskChannel::ALL.iter().position(|c| *c == d.channel)?;
+        let x0 = lanes.min.x + k as f32 * col_w;
+        let (y0, y1) = (y_of(d.start.to_f64()), y_of(d.end.to_f64()));
+        Some(egui::Rect::from_min_max(
+            egui::pos2(x0 + 2.0, y0.min(y1)),
+            egui::pos2(x0 + col_w - 2.0, y0.max(y1)),
+        ))
+    });
+    draft_gesture(
+        ui,
+        &p,
+        st,
+        keys_enabled,
+        &resp,
+        ptr,
+        draft_rect,
+        // 跟随只在指针留在通道区里时改长度（滚轮/缩放照常 —— 见 `draft_gesture` 的尾注）
+        ptr.map(|q| !in_axis(q) && !over_ruler(q)).unwrap_or(false),
+        &|y| st.snap_beat(beat_of(y)).max(0.0),
+        actions,
+    );
+
+    // 拖动（草稿期间不动事件块：那时左键是"放下"）
+    if resp.drag_started() && !st.drafting() {
         let press = ui
             .input(|i| i.pointer.press_origin())
             .or(resp.interact_pointer_pos())
@@ -2158,13 +2200,30 @@ fn draw_mask_pane(
     }
     if resp.drag_started() || resp.dragged() {
         if let (Some(d), Some(q)) = (mask_drag_get(ui), ptr) {
+            // 邻块给出这**一块**能待的窗口：上一块的终点 .. 下一块的起点。
+            // 通道的不变量是"不许重叠"，所以拖动必须在窗口里停下 —— 核心那边也会拒
+            //（`set_zone_event` 的重叠闸），但"拖到边界就停住"比"每帧弹一句错误"好用。
+            let evs = &zone.track(d.channel).events;
+            let floor = d
+                .index
+                .checked_sub(1)
+                .and_then(|i| evs.get(i))
+                .map_or(0.0, |e| e.end.to_f64());
+            let ceiling = evs.get(d.index + 1).map(|e| e.start.to_f64());
             // 吸附与夹取都在这里一次算完（拖动只改时间一个轴）
-            let snapped = st.snap_beat(beat_of(q.y)).max(0.0);
+            let snapped = st
+                .snap_beat(beat_of(q.y))
+                .max(0.0)
+                .max(floor)
+                .min(ceiling.unwrap_or(f64::INFINITY));
             let (start, end) = match d.edge {
                 Some(EventEdge::Start) => clamp_span(snapped, d.end, 1e-3),
                 Some(EventEdge::End) => clamp_span(d.start.min(snapped), snapped.max(d.start), 1e-3),
                 None => {
-                    let delta = snapped - d.press_beat;
+                    // 整块平移：两端一起走，两头都不许压到邻块（长度保住 —— 拖的是位置）
+                    let delta = (snapped - d.press_beat)
+                        .max(floor - d.start)
+                        .min(ceiling.map_or(f64::INFINITY, |hi| hi - d.end));
                     clamp_span(d.start + delta, d.end + delta, 1e-3)
                 }
             };
@@ -2186,24 +2245,8 @@ fn draw_mask_pane(
         }
     }
 
-    // 点选 / 双击新建
-    if resp.double_clicked() {
-        if let (Some(Hit::Channel(ch)), Some(q)) = (&hit, ptr) {
-            let ch = *ch;
-            let start = st.snap_beat(beat_of(q.y)).max(0.0);
-            match mask_block_span(&zone.track(ch).events, start, MASK_BLOCK_BEATS) {
-                Some((start, end)) => actions.push(OverlayAction::MaskPlace {
-                    zone: zone_idx,
-                    channel: ch,
-                    start,
-                    end,
-                }),
-                None => actions.push(OverlayAction::Notice(
-                    "这里放不下新块（紧挨着下一块）—— 双击稍微早一点的位置".to_owned(),
-                )),
-            }
-        }
-    } else if resp.clicked() && mask_drag_get(ui).is_none() {
+    // 点选（双击**不放块**：普通模式里双击是音符区的事，事件块一律"R 起稿再放下"）
+    if resp.clicked() && mask_drag_get(ui).is_none() && !st.drafting() {
         match hit {
             Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
             Some(Hit::Block(ch, i, _)) => actions.push(OverlayAction::MaskSelect {
@@ -2216,33 +2259,25 @@ fn draw_mask_pane(
         }
     }
 
-    // ---- R：在**指针所在的那一列**放一块（用户口径 2026-10-02："在屏蔽区按 r 添加事件块"）----
+    // ---- R：在**指针所在的那一列**起一个草稿 ----
     //
-    // 与双击**同一条规则**（同一个 `mask_block_span`）：长度 1 拍、不越过下一块、
-    // 值由核心取"该通道此刻的值"。这里不做草稿跟随（那套跟随状态属于判定线事件区，
-    // 见 `draw_mask_pane` 的头注）；`keys_enabled` 的门控与普通模式一致（打字/模态期间不响应）。
-    if keys_enabled && !resp.dragged() {
+    // 用户口径 2026-10-02："在屏蔽区按 r 添加事件块"，以及"创建流程应与普通编辑模式下的事件块
+    // 放置一样"—— 于是这里与判定线事件区**逐字同一条**：R 起稿 → 鼠标定长度（保底一个格点、
+    // 不越过下一块）→ R/回车/左键放下 → Esc 取消；放下/跟随/控制杆都在 `draft_gesture`。
+    if keys_enabled && !st.drafting() && !resp.dragged() {
         if key_pressed_once(ui, egui::Key::R) {
+            // 指针在列上（块里也算 —— 那时起点落在块内，放下会把前一块裁到新起点）
             let target = match (&hit, ptr) {
                 (Some(Hit::Channel(ch)), Some(q)) => Some((*ch, q)),
                 (Some(Hit::Block(ch, _, _)), Some(q)) => Some((*ch, q)),
                 _ => None,
             };
             match target {
-                Some((ch, q)) => {
-                    let start = st.snap_beat(beat_of(q.y)).max(0.0);
-                    match mask_block_span(&zone.track(ch).events, start, MASK_BLOCK_BEATS) {
-                        Some((start, end)) => actions.push(OverlayAction::MaskPlace {
-                            zone: zone_idx,
-                            channel: ch,
-                            start,
-                            end,
-                        }),
-                        None => actions.push(OverlayAction::Notice(
-                            "这里放不下新块（紧挨着下一块）—— 把指针挪到空档里再按 R".to_owned(),
-                        )),
-                    }
-                }
+                Some((ch, q)) => actions.push(OverlayAction::StartMaskDraft {
+                    zone: zone_idx,
+                    channel: ch,
+                    beat: st.snap_beat(beat_of(q.y)).max(0.0),
+                }),
                 None => actions.push(OverlayAction::Notice(
                     "按 R 放块：指针要放在某一条通道列上".to_owned(),
                 )),
@@ -2268,9 +2303,6 @@ fn draw_mask_pane(
     }
 }
 
-/// R / 双击放出来的那一块有多长（拍）—— 与"初始屏蔽区事件区间 0~1 拍"同一个口径
-pub const MASK_BLOCK_BEATS: f64 = 1.0;
-
 /// 七条通道的配色（与判定线那五条一样：颜色只用来分辨列，不承载语义）
 const MASK_COLORS: [[u8; 3]; 7] = [
     [240, 120, 120], // x1
@@ -2281,44 +2313,6 @@ const MASK_COLORS: [[u8; 3]; 7] = [
     [185, 160, 255], // y3
     [255, 220, 120], // active
 ];
-
-#[cfg(test)]
-mod mask_block_tests {
-    use super::*;
-    use opm_app::doc::{Beat, Event};
-
-    fn ev(a: f64, b: f64) -> Event {
-        Event::new(
-            Beat::new((a * 4.0) as i64, 4),
-            Beat::new((b * 4.0) as i64, 4),
-            serde_json::json!(0.0),
-            serde_json::json!(0.0),
-            "linear",
-        )
-    }
-
-    /// R / 双击放出来的那一块：长度 1 拍、**不越过下一块**、紧贴时给 `None`
-    #[test]
-    fn the_placed_block_is_one_beat_and_never_crosses_the_next_one() {
-        let none: Vec<Event> = Vec::new();
-        assert_eq!(mask_block_span(&none, 8.0, 1.0), Some((8.0, 9.0)));
-        // 负拍夹到 0
-        assert_eq!(mask_block_span(&none, -3.0, 1.0), Some((0.0, 1.0)));
-        // 下一块在 8.5：贴到它起点
-        let list = vec![ev(8.5, 12.0)];
-        assert_eq!(mask_block_span(&list, 8.0, 1.0), Some((8.0, 8.5)));
-        // 空档只剩 0.1 拍：给一条 0.1 拍的细块（能拖，不硬塞一个重叠）
-        assert_eq!(mask_block_span(&list, 8.4, 1.0), Some((8.4, 8.5)));
-        // 正好落在下一块的**起点**上 ⇒ 放不下（否则就是两条起点相同的事件 = 重叠）
-        assert_eq!(mask_block_span(&list, 8.5, 1.0), None);
-        // 落在块的**里面** ⇒ 可以（核心会把前一块裁到新块起点）
-        let list = vec![ev(8.0, 12.0)];
-        assert_eq!(mask_block_span(&list, 9.0, 1.0), Some((9.0, 10.0)));
-        // 起点在**已结束**的块之后：不受它影响
-        let list = vec![ev(0.0, 4.0), ev(20.0, 24.0)];
-        assert_eq!(mask_block_span(&list, 8.0, 1.0), Some((8.0, 9.0)));
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3907,5 +3901,56 @@ mod tests {
         assert_eq!(note_box_hits(&boxes, sel), vec![0], "框在 hold 身体上也要选中它");
         let sel2 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 50.0));
         assert!(note_box_hits(&boxes, sel2).is_empty());
+    }
+
+    /// **遮蔽区编辑模式下按 R 起的是草稿，不是就地放一块** —— 与判定线事件区同一套手势
+    /// （用户口径 2026-10-02："创建流程应与普通编辑模式下的事件块放置一样"）。
+    ///
+    /// 钉住的是这条流程的两个端点：R 产出的动作是 `StartMaskDraft`（起点已吸附），
+    /// 而草稿放下走的是全局的 `DraftCommit` —— 面板自己不再有"放块"这条路。
+    #[test]
+    fn r_in_the_mask_pane_starts_a_draft_instead_of_placing_a_block() {
+        let mut st = state_with_events();
+        st.mask_edit = true;
+        st.overlay_beats = 32.0;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        // 遮蔽区模式下七条通道铺满轴带以右：取右侧一条通道列的中段偏下
+        let col = egui::pos2(600.0, 360.0);
+        let mut all: Vec<String> = Vec::new();
+        for frame in 0..3 {
+            let mut events = vec![egui::Event::PointerMoved(col)];
+            if frame >= 1 {
+                events.push(egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: frame > 1,
+                    modifiers: Default::default(),
+                });
+            }
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            all.extend(acts.iter().map(|a| format!("{a:?}")));
+        }
+        let starts: Vec<&String> = all
+            .iter()
+            .filter(|a| a.starts_with("StartMaskDraft"))
+            .collect();
+        assert_eq!(starts.len(), 1, "自动重复不该反复起稿：{all:?}");
+        assert!(starts[0].contains("channel: "), "要带上通道：{}", starts[0]);
+        assert!(
+            !all.iter().any(|a| a.starts_with("MaskPlace")),
+            "按 R 不该再「就地放一块」：{all:?}"
+        );
     }
 }

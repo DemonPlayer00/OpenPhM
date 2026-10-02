@@ -46,14 +46,17 @@ pub fn line_tree_ui(
     .show(ui, |ui| {
         ui.horizontal(|ui| {
             if ui
-                .small_button("新建（播放头）")
-                .on_hover_text("在播放头摆一个中央正三角形（与属性编辑器里的「新建」同一条命令）")
+                .small_button("新建")
+                .on_hover_text(
+                    "摆一个中央正三角形（六条常量事件、长 1 拍；active 不写事件）。\n\
+                     起点：一块都没有时 = 拍 0（与编辑区里那块草稿三角同一块），否则 = 播放头\
+                     —— 与属性编辑器里的「新建」同一条命令、同一个起点口径",
+                )
                 .clicked()
             {
-                let anchor = opm_app::codec::beat_from_f64(
-                    st.snap_beat(tmap.beat(playhead)).max(0.0),
-                );
-                acts.push(TreeAction::Cmd(opm_app::edit::add_zone_command(anchor)));
+                acts.push(TreeAction::Cmd(opm_app::edit::add_zone_command(
+                    st.mask_new_zone_start(),
+                )));
             }
             if ui
                 .add_enabled(!st.chart.zones.is_empty(), egui::Button::new("删除").small())

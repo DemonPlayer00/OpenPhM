@@ -331,7 +331,10 @@ pub fn ping(path: &Path, timeout: std::time::Duration) -> Result<Value, String> 
 /// Windows `LockFileEx`，两边都有），ping 只是补一道核对。
 #[cfg(not(unix))]
 pub fn ping(path: &Path, _timeout: std::time::Duration) -> Result<Value, String> {
-    Err(format!("本平台没有控制通道，无法 ping {}（判据退回到"锁没人持"）", path.display()))
+    Err(format!(
+        "本平台没有控制通道，无法 ping {}（判据退回到「锁没人持」）",
+        path.display()
+    ))
 }
 
 /// 发现最新的 opm socket（给 `--attach auto` 用）

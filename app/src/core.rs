@@ -1940,9 +1940,9 @@ impl EditCore {
                 let before = self.line(line_idx)?.notes.clone();
                 let mut after = before.clone();
                 for n in after.iter_mut() {
-                    n.start = add_beat(n.start, delta).ok_or("拍数溢出")?;
+                    n.start = n.start.checked_add(delta).ok_or("拍数溢出")?;
                     if let Some(e) = n.end {
-                        n.end = Some(add_beat(e, delta).ok_or("拍数溢出")?);
+                        n.end = Some(e.checked_add(delta).ok_or("拍数溢出")?);
                     }
                 }
                 self.line_mut(line_idx)?.notes = after.clone();
@@ -2106,9 +2106,37 @@ impl EditCore {
                 let zone_idx = zone_arg(c)?;
                 let track = zone_track_arg(c)?;
                 let start = beat_arg(c, "startBeat")?;
+                let before = self.zone_track(zone_idx, &track)?;
+                // ---- 跨度规则：**只有 `edit::mask_*` 那一份判据** ----
+                //
+                // 界面的手势草稿与属性编辑器那颗按钮调的是同一条（用户口径 2026-10-02：
+                // "创建流程应与普通编辑模式下的事件块放置一样"）。放在核心是因为
+                // CLI/agent 与界面必须拿到同一个答案：遮蔽区通道的不变量是"不许重叠"
+                //（规范 §4.6），而判定线那边没有的不变量这里是**拒绝**而不是留给冲突浏览器。
+                if !crate::edit::mask_can_start(&before, start) {
+                    return Err(format!(
+                        "起点 {} 拍上已经有一块了（通道内不许重叠）—— 换个起点，或先删掉那一块",
+                        start.to_f64()
+                    ));
+                }
                 let end = match c.get("endBeat") {
-                    Some(v) => parse_beat(v)?,
-                    None => add_beat(start, Beat::new(4, 1)).ok_or("拍数溢出")?,
+                    // 显式给的终点：越界要**报错**，不悄悄夹 —— 那是"缺省值"才做的事
+                    Some(v) => {
+                        let end = parse_beat(v)?;
+                        if let Some(limit) = crate::edit::mask_end_limit(&before, start) {
+                            if end > limit {
+                                return Err(format!(
+                                    "终点 {} 拍会越过下一块（它起于 {} 拍）—— 通道内不许重叠",
+                                    end.to_f64(),
+                                    limit.to_f64()
+                                ));
+                            }
+                        }
+                        end
+                    }
+                    // 缺省终点 = 起点 + `MASK_EVENT_BEATS` 拍，缩到空档为止（缩不出来就报错）
+                    None => crate::edit::mask_default_end(&before, start)
+                        .ok_or("这里放不下新的事件块（起点上已有块，或与下一块之间没有空档）")?,
                 };
                 if end <= start {
                     return Err("endBeat 必须大于 startBeat".into());
@@ -2127,7 +2155,6 @@ impl EditCore {
                 let from = c.get("startValue").cloned().unwrap_or_else(neutral);
                 let to = c.get("endValue").cloned().unwrap_or_else(|| from.clone());
                 let ev = Event::new(start, end, from, to, &easing);
-                let before = self.zone_track(zone_idx, &track)?;
                 let mut after = before.clone();
                 // **先裁后插**：把被这一块压在下面的那些裁到它的起点（保持切点上的值）。
                 // 用户最常见的动作是"给一条铺满全谱的常量事件里插一个关键帧" ——
@@ -2188,6 +2215,17 @@ impl EditCore {
                 }
                 if ev.start < Beat::zero() {
                     return Err("拍不能为负".into());
+                }
+                // **不许压到邻块**：拖端点/属性编辑器改头尾都走这条命令，而通道的不变量是
+                // "不许重叠"（判定线那边由冲突浏览器兜着，遮蔽区没有那个东西）。
+                // 判据与 `move_zone_event` 同一句（半个区间相交），只是这里只重排一个事件的跨度。
+                if let Some(i) = crate::edit::mask_overlap(&ev, index, &after) {
+                    let o = &after[i];
+                    return Err(format!(
+                        "改完会与第 {i} 个事件重叠（{}..{}）—— 通道内不允许重叠",
+                        o.start.to_f64(),
+                        o.end.to_f64()
+                    ));
                 }
                 after[index] = ev;
                 ensure_sorted(&after, &format!("遮蔽区 {zone_idx} 的 {track}"))?;
@@ -2258,6 +2296,15 @@ impl EditCore {
                     }
                     other => return Err(format!("edge 只能是 start|end，收到 {other:?}")),
                 }
+                // 与 `set_zone_event` 同一道闸（见那里的注释）：只动一个端点也不许压到邻块
+                if let Some(i) = crate::edit::mask_overlap(&after[index], index, &after) {
+                    let o = &after[i];
+                    return Err(format!(
+                        "改完会与第 {i} 个事件重叠（{}..{}）—— 通道内不允许重叠",
+                        o.start.to_f64(),
+                        o.end.to_f64()
+                    ));
+                }
                 // 与判定线同一条纪律：**只动这一个事件的这一个端点**（空隙/重叠留给检测），
                 // 但顺序不能乱 —— `perf::active_event` 的二分依赖"按 start 升序"。
                 ensure_sorted(&after, &format!("遮蔽区 {zone_idx} 的 {track}"))?;
@@ -2281,8 +2328,8 @@ impl EditCore {
                     .get(index)
                     .cloned()
                     .ok_or_else(|| format!("事件索引 {index} 越界（共 {}）", after.len()))?;
-                let start = add_beat(cur.start, delta).ok_or("拍数溢出")?;
-                let end = add_beat(cur.end, delta).ok_or("拍数溢出")?;
+                let start = cur.start.checked_add(delta).ok_or("拍数溢出")?;
+                let end = cur.end.checked_add(delta).ok_or("拍数溢出")?;
                 if start < Beat::zero() {
                     return Err("事件起点不能为负".into());
                 }
@@ -2663,7 +2710,11 @@ impl EditCore {
             "set_track_constant" => {
                 let (line_idx, layer_idx, track) = layer_arg(c)?;
                 let value = c.get("value").cloned().unwrap_or(json!(0.0));
-                let end = add_beat(self.doc.chart_end(), Beat::new(1024, 1)).ok_or("拍数溢出")?;
+                let end = self
+                    .doc
+                    .chart_end()
+                    .checked_add(Beat::new(1024, 1))
+                    .ok_or("拍数溢出")?;
                 let before = self.track(line_idx, layer_idx, &track)?;
                 let after = vec![Event::new(Beat::zero(), end, value.clone(), value.clone(), "linear")];
                 *self.track_mut(line_idx, layer_idx, &track)? = after.clone();
@@ -2684,7 +2735,11 @@ impl EditCore {
                 //
                 // 早先这里另有一份实现，规则**与导入侧相反**（把后一条事件挪到前一条的终点）——
                 // 于是同一个 bug 有第三种表现：刚放好的事件被 `normalize` 挪走。
-                let end = add_beat(self.doc.chart_end(), Beat::new(1024, 1)).ok_or("拍数溢出")?;
+                let end = self
+                    .doc
+                    .chart_end()
+                    .checked_add(Beat::new(1024, 1))
+                    .ok_or("拍数溢出")?;
                 let tmap = crate::perf::TimeMap::from_parts(&self.doc.bpm_list, self.doc.chart_end());
                 let mut fixes = 0usize;
                 let mut touched: Vec<(usize, usize, String, Vec<Event>, Vec<Event>)> = Vec::new();
@@ -3003,13 +3058,6 @@ fn num(c: &Value, name: &str) -> Option<f64> {
 
 fn beat_arg(c: &Value, name: &str) -> Result<Beat, String> {
     parse_beat(c.get(name).ok_or_else(|| format!("缺少 {name}"))?)
-}
-
-fn add_beat(a: Beat, b: Beat) -> Option<Beat> {
-    Some(Beat::new(
-        a.n.checked_mul(b.d)?.checked_add(b.n.checked_mul(a.d)?)?,
-        a.d.checked_mul(b.d)?,
-    ))
 }
 
 fn apply_note_set(n: &mut Note, set: Option<&Value>) -> Result<(), String> {
@@ -3622,6 +3670,18 @@ mod mask_zone_tests {
         r["error"].as_str().unwrap_or_default().to_owned()
     }
 
+    /// 某条通道上**起点为 `at`** 的那条事件的终点（放块那几条断言读它 —— 回执只给下标）
+    fn end_of(c: &EditCore, track: &str, at: f64) -> f64 {
+        c.doc().mask_zones[0]
+            .track(track)
+            .and_then(|l| {
+                l.iter()
+                    .find(|e| (e.start.to_f64() - at).abs() < 1e-9)
+                    .map(|e| e.end.to_f64())
+            })
+            .unwrap_or(f64::NAN)
+    }
+
     /// 新建遮蔽区：**中央正三角形**（六条常量事件）+ 能力等级抬到 4
     #[test]
     fn adding_a_zone_writes_the_center_triangle_and_raises_the_capability() {
@@ -3726,6 +3786,45 @@ mod mask_zone_tests {
         assert_eq!(a[0].start_value, json!(false));
     }
 
+    /// **放一块的跨度规则**（用户口径 2026-10-02："创建流程应与普通编辑模式下的事件块放置一样"）：
+    /// 缺省终点 = 起点 + `MASK_EVENT_BEATS` 拍、缩到空档为止；起点重合被拒；显式终点越过下一块被拒。
+    ///
+    /// 这三条与界面（手势草稿 / 属性编辑器那颗按钮）共用 `edit::mask_*` 那一份判据 ——
+    /// 以前属性编辑器写死 4 拍又不夹取，于是"在播放头放一块"能造出一条与下一块重叠的事件。
+    #[test]
+    fn placing_a_block_never_makes_an_overlap() {
+        let mut c = EditCore::new();
+        exec_ok(&mut c, json!({"op": "add_zone", "set": {"x1": 100.0}}));
+        // 种子块是 [0, 1)：缺省终点 = 1 拍，正好接上，不重叠
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [1, 1], "endBeat": [5, 1], "startValue": 100.0}));
+        // 缺省终点（不带 endBeat）= 起点 + 1 拍
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [6, 1]}));
+        assert_eq!(end_of(&c, "x1", 6.0), 7.0);
+        // 空档只剩半拍：缺省终点**缩到空档**（10 拍处先摆一块）
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [10, 1], "endBeat": [12, 1]}));
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [19, 2]}));
+        assert_eq!(end_of(&c, "x1", 9.5), 10.0, "缺省终点缩到下一块起点");
+        // 起点重合 ⇒ 拒（两条起点相同的事件 = 重叠）
+        let e = exec_err(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [6, 1]}));
+        assert!(e.contains("已经有一块"), "{e}");
+        // 终点**正好**停在下一块起点上是允许的（相接不是重叠）：[5, 6) 紧贴 6 拍那块
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [5, 1], "endBeat": [6, 1]}));
+        // 显式终点越过下一块 ⇒ 拒（"悄悄夹"是缺省值才做的事）
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [16, 1], "endBeat": [18, 1]}));
+        let e = exec_err(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [13, 1], "endBeat": [17, 1]}));
+        assert!(e.contains("越过下一块"), "{e}");
+        // 落点在某一块**里面**（不是起点）是允许的：把前一块裁到新起点，切点值不变
+        exec_ok(&mut c, json!({"op": "add_zone_event", "track": "x1", "startBeat": [3, 1], "endBeat": [4, 1]}));
+        // 一整轮下来自己的校验器必须放行（这才是这几道闸存在的理由）
+        let issues = crate::cmd::validate(c.doc());
+        let bad: Vec<String> = issues
+            .iter()
+            .filter(|i| i.pointer.starts_with("/maskZones"))
+            .map(|i| format!("{} {}", i.pointer, i.message))
+            .collect();
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
     /// `resize` / `move` 只动那一个事件块，且**不许越过邻块**（顺序是求值的前提）
     #[test]
     fn resizing_and_moving_respect_the_channel_order() {
@@ -3750,9 +3849,19 @@ mod mask_zone_tests {
         // 负拍：拍不能为负（"这条通道的第一条事件可以晚于拍 0"不等于可以早于 0）
         let e = exec_err(&mut c, json!({"op": "resize_zone_event", "track": "x1", "index": 1, "edge": "start", "toBeat": [-1, 1]}));
         assert!(e.contains("拍不能为负"), "{e}");
-        // 把第三条的起点改到 8 **之前** ⇒ 通道不再按 start 升序 ⇒ 报错（求值的二分依赖这个不变量）
-        let e = exec_err(&mut c, json!({"op": "set_zone_event", "track": "x1", "index": 2, "set": {"startBeat": [1, 1]}}));
+        // 把第三条的起点改到 8 **之前** ⇒ 通道不再按 start 升序 ⇒ 报错（求值的二分依赖这个不变量）。
+        // 端点取 [6,7)：与 [0,6) 和 [8,12) 都只是**相接**（不算重叠），所以撞的是"升序"那道闸，
+        // 而不是重叠闸 —— 两道闸各管各的。
+        let e = exec_err(&mut c, json!({"op": "set_zone_event", "track": "x1", "index": 2, "set": {"startBeat": [6, 1], "endBeat": [7, 1]}}));
         assert!(e.contains("升序"), "{e}");
+        // 换成真的压到别人身上 ⇒ 重叠闸响（`set_zone_event` 以前没有这道闸：
+        // 拖一下端点就能造出"自己的校验器不认"的谱面）
+        let e = exec_err(&mut c, json!({"op": "set_zone_event", "track": "x1", "index": 2, "set": {"startBeat": [5, 1], "endBeat": [7, 1]}}));
+        assert!(e.contains("重叠"), "{e}");
+        // `resize_zone_event` 同一条闸：把第一条的终点拖过第二条的起点
+        let e = exec_err(&mut c, json!({"op": "resize_zone_event", "track": "x1", "index": 0, "edge": "end", "toBeat": [9, 1]}));
+        assert!(e.contains("重叠"), "{e}");
+        assert_eq!(c.doc().mask_zones[0].x1[0].end.to_f64(), 6.0, "被拒的命令一个字节都不该改");
         // 平移整块：与邻块重叠 ⇒ 报错
         let e = exec_err(&mut c, json!({"op": "move_zone_event", "track": "x1", "index": 1, "delta": [-6, 1]}));
         assert!(e.contains("重叠"), "{e}");

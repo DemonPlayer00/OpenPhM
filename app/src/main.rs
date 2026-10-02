@@ -480,9 +480,9 @@ fn main() -> eframe::Result<()> {
         );
     }
     let mut state = EditorState::new(headless::chart_from_doc(core0.doc()));
-    // 自动化钩子（截图/自检用）：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>` 或
-    // `OPM_EDIT_AUTO=event:<track>,<start>,<end>` —— 直接把"正在跟随鼠标的草稿"摆出来：
-    // 没人能往窗口里注入按键，这是唯一能把它拍下来的办法。
+    // 自动化钩子（截图/自检用）：`OPM_EDIT_AUTO=hold:<lane>,<start>,<end>`、
+    // `event:<track>,<start>,<end>` 或 `mask:<channel>,<start>,<end>` —— 直接把"正在跟随鼠标的
+    // 草稿"摆出来：没人能往窗口里注入按键，这是唯一能把它拍下来的办法。
     // 与 `OPM_LAUNCH_AUTO` 同类：**只在启动时读一次**，不影响交互路径。
     if let Ok(spec) = std::env::var("OPM_EDIT_AUTO") {
         let spec = spec.trim().to_owned();
@@ -522,8 +522,41 @@ fn main() -> eframe::Result<()> {
                 (None, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO：未知轨道 {track:?}（可选 moveX/moveY/rotate/alpha/speed）"),
                 (_, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO=event: 需要 `<track>,<start>,<end>`"),
             }
+        } else if let Some(rest) = spec.strip_prefix("mask:") {
+            // 遮蔽区的事件块草稿（`R` 起稿那一刻的样子）：同样没人能注入按键，
+            // 而"起稿 → 跟随 → 放下"这条新流程正是要拍下来看的东西。
+            let mut it = rest.splitn(2, ',');
+            let ch = it.next().unwrap_or("").trim().to_owned();
+            let n = nums(it.next().unwrap_or(""));
+            match (state::MaskChannel::from_key(&ch), n.len()) {
+                (Some(ch), 2) => {
+                    // 把编辑区切到遮蔽区模式（与点顶栏那颗按钮同一件事，只是这里没有 App）
+                    state.mask_edit = true;
+                    if state.begin_pending_mask(ch, 0, n[0]) {
+                        state.follow_pending_mask(n[1]);
+                        println!(
+                            "  待放置遮蔽区事件  : {}，{:.2} → {:.2} 拍（OPM_EDIT_AUTO）",
+                            ch.key(),
+                            n[0],
+                            n[1]
+                        );
+                    } else {
+                        eprintln!(
+                            "  ⚠️ OPM_EDIT_AUTO=mask: 这一点上已经有一块（{ch:?} @ {:.2} 拍）",
+                            n[0]
+                        );
+                    }
+                }
+                (None, _) => eprintln!(
+                    "  ⚠️ OPM_EDIT_AUTO=mask: 未知通道 {ch:?}（可选 x1/y1/x2/y2/x3/y3/active）"
+                ),
+                (_, _) => eprintln!("  ⚠️ OPM_EDIT_AUTO=mask: 需要 `<channel>,<start>,<end>`"),
+            }
         } else {
-            eprintln!("  ⚠️ OPM_EDIT_AUTO：只认 hold:<lane>,<start>,<end> 或 event:<track>,<start>,<end>");
+            eprintln!(
+                "  ⚠️ OPM_EDIT_AUTO：只认 hold:<lane>,<start>,<end>、\
+                 event:<track>,<start>,<end> 或 mask:<channel>,<start>,<end>"
+            );
         }
     }
     state.show_boundary = args.boundary;
@@ -1572,6 +1605,36 @@ impl App {
                         ));
                         self.file_message =
                             Some((true, format!("放下 hold：{start:.3} → {end:.3} 拍")));
+                    } else if let Some(d) = self.state.pending_mask {
+                        // 遮蔽区草稿：跨度**已经是精确有理拍**（草稿全程在 `Beat` 上走），
+                        // 这里只负责"翻译成命令" —— 与判定线那条的区别只有数据源。
+                        match self.state.mask_pending_span() {
+                            Some((start, end)) => {
+                                self.state.take_pending_mask();
+                                let one = opm_app::edit::add_mask_event_command(
+                                    d.zone, d.channel, start, end,
+                                );
+                                // 草稿态：先建区再应用，**一个撤销步**（用户口径）
+                                cmds.extend(self.mask_commands_many(vec![one]));
+                                self.file_message = Some((
+                                    true,
+                                    format!(
+                                        "放下遮蔽区事件（{}）：{:.3} → {:.3} 拍（值取此刻的值）",
+                                        d.channel.key(),
+                                        start.to_f64(),
+                                        end.to_f64()
+                                    ),
+                                ));
+                            }
+                            // 起稿之后把起点拖到了别人头上（罕见）：留着草稿，让用户挪回去
+                            None => {
+                                self.file_message = Some((
+                                    false,
+                                    "起点上已经有一块了 —— 把草稿挪开一点再放下（Esc 取消）"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
                     }
                 }
                 OverlayAction::DraftCancel => {
@@ -1617,23 +1680,26 @@ impl App {
                         cmds.push(opm_app::edit::commit_command());
                     }
                 }
-                OverlayAction::MaskPlace { zone, channel, start, end } => {
-                    let one = serde_json::json!({
-                        "op": "add_zone_event",
-                        "zone": zone,
-                        "track": channel.key(),
-                        "startBeat": self.state.beat_json(start),
-                        "endBeat": self.state.beat_json(end),
-                    });
-                    // 草稿态：先建区再应用，**一个撤销步**（用户口径）
-                    cmds.extend(self.mask_commands_many(vec![one]));
-                    self.file_message = Some((
-                        true,
-                        format!(
-                            "放下遮蔽区事件（{}）：{start:.3} → {end:.3} 拍（值取此刻的值）",
-                            channel.key()
-                        ),
-                    ));
+                OverlayAction::StartMaskDraft { zone, channel, beat } => {
+                    // 与判定线事件区**同一套手势**：起稿 → 跟随 → 放下（见 `draft_gesture`）。
+                    // 起不了稿只有一种情形：这一点上已经有一块了（起点重合 = 重叠）。
+                    if self.state.begin_pending_mask(channel, zone, beat) {
+                        self.file_message = Some((
+                            true,
+                            format!(
+                                "正在放置遮蔽区事件（{}）：移动鼠标定长度，R/回车/左键放下，Esc 取消",
+                                channel.key()
+                            ),
+                        ));
+                    } else {
+                        self.file_message = Some((
+                            false,
+                            format!(
+                                "这一点上已经有一块了（{}）—— 通道内不许重叠，挪开一点再按 R",
+                                channel.key()
+                            ),
+                        ));
+                    }
                 }
                 OverlayAction::Notice(t) => {
                     self.file_message = Some((false, t));

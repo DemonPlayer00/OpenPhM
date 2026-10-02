@@ -283,7 +283,7 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 | `{"op":"add_zone","startBeat":[0,1]}` | 新建一块：写 6 条常量事件 = **屏幕中央的正三角形**（`active` 不写事件），跨度 `[startBeat, startBeat + 1 拍]`（**种子块**，要更长就拖尾巴）。`empty:true` 建一个**没有任何事件、因此不显示**的区 |
 | `{"op":"del_zone","index":0}` | `zone` 与 `index` 都认 |
 | `{"op":"set_zone","zone":0,"set":{"name":"右侧躁域"}}` | 目前只有 `name` |
-| `{"op":"add_zone_event","zone":0,"track":"x1","startBeat":[8,1],"endBeat":[16,1],"startValue":0,"endValue":-400,"easing":"inOutCubic"}` | **缺省值 = 该通道此刻的值**（不传 `startValue` 时，放下一刻不跳变）；`endBeat` 缺省 = 起点 + 4 拍 |
+| `{"op":"add_zone_event","zone":0,"track":"x1","startBeat":[8,1],"endBeat":[16,1],"startValue":0,"endValue":-400,"easing":"inOutCubic"}` | **缺省值 = 该通道此刻的值**（不传 `startValue` 时，放下一刻不跳变）；`endBeat` 缺省 = 起点 + **1 拍**，且**自动缩到下一块的起点**；显式给的终点**越过下一块 ⇒ `ok:false`**（通道内不许重叠） |
 | `{"op":"set_zone_event","zone":0,"track":"active","index":0,"set":{"startValue":true,"endValue":true}}` | `active` 的值可以是布尔或数字 |
 | `{"op":"del_zone_event","zone":0,"track":"y3","index":1}` | |
 | `{"op":"resize_zone_event","zone":0,"track":"x1","index":0,"edge":"end","toBeat":[6,1]}` | 只动这一个端点（与 `resize_event` 同一语义） |
@@ -294,7 +294,15 @@ opm-app --audio-probe FILE      # → {"codec":"OGG Vorbis","sampleRate":48000,"
 **首事件也可以晚于拍 0**。**块的跨度就是这块区域存在的时段**：三条坐标通道都没有
 "覆盖当前拍"的块时，整块不显示（值会延续，但**存在不会**）—— "第 8~12 拍出现"就写成 `[8,12)`。
 `add_zone_event` 插入时会把被它压住的前一块**裁到它的起点**（切点上的值保持不变），
-所以"给一条铺满全谱的常量事件里插关键帧"不会留下重叠。
+所以"给一条铺满全谱的常量事件里插关键帧"不会留下重叠。**改端点也不许压到邻块**：
+`set_zone_event` / `resize_zone_event` / `move_zone_event` 一发现重叠就返回 `ok:false`
+（文档一个字节都不改）—— 判定线那边的重叠留给冲突浏览器，遮蔽区没有那个东西，
+编辑器自己造出来的重叠会让 `validate` 当场报错。
+
+放一块的**跨度规则只有一份**（`edit::mask_can_start` / `mask_end_limit` / `mask_default_end`）：
+界面手势、属性编辑器那颗按钮、核心命令共用它，所以"同一个动作换个入口"得到的块是一样的。
+编辑区里的手势是 **`R` 起稿 → 鼠标定长度 → `R`/回车/左键放下 → `Esc` 取消**（与普通模式
+放事件**同一套流程**，`overlay::draft_gesture` 一份实现）。
 
 ### 元信息与只读
 

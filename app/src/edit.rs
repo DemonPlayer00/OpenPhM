@@ -605,6 +605,72 @@ pub fn add_mask_event_command(
     })
 }
 
+// ---------------------------------------------------------------- 遮蔽区事件：跨度规则
+//
+// **这几条是"能不能放、最多放到哪"的唯一一份判据**（格式不变量：同一通道内不许重叠、
+// 必须按起点升序，见 `spec/opm-format.md` §4.6）。四个调用点共用它们：
+// 编辑区的手势草稿、属性编辑器那颗按钮、核心的 `add_zone_event` 缺省终点、
+// 以及 `set_zone_event` / `resize_zone_event` 的重叠闸门。
+//
+// 为什么必须共用：判定线那边的重叠留给冲突浏览器，遮蔽区**没有**那个东西 —— 编辑器自己
+// 造出来的重叠会让「校验谱面」当场报错（自己的产物过不了自己的校验器）。以前这四条规则
+// 分散在 `overlay::mask_block_span`（1 拍）、属性编辑器（4 拍，还不夹取）、核心（4 拍）
+// 三处，于是"同一个动作换个入口就得到不同的块"。
+
+/// `start` 处能不能起一块：**已经有一块正好从这一点开始** ⇒ `false`。
+///
+/// 两条起点相同的事件在任何求值口径下都是重叠，而"插一块"（起点落在别人**里面**）
+/// 是另一回事：那会把前一块裁到新起点，是合法的。
+pub fn mask_can_start(track: &[crate::doc::Event], start: crate::doc::Beat) -> bool {
+    !track.iter().any(|e| e.start == start)
+}
+
+/// 终点上限 = **下一块的起点**（`None` = 后面没有块，不设上限）。
+///
+/// 只看"起点严格晚于 `start`"的那些块：起点早于 `start` 的块会被新块裁掉（见
+/// `codec::trim_before_insert`），不是障碍。
+pub fn mask_end_limit(track: &[crate::doc::Event], start: crate::doc::Beat) -> Option<crate::doc::Beat> {
+    track
+        .iter()
+        .map(|e| e.start)
+        .filter(|s| *s > start)
+        .min()
+}
+
+/// 缺省终点：`start + MASK_EVENT_BEATS 拍`，**不越过下一块**；放不下（起点上已有块、
+/// 或空档里塞不进任何长度）⇒ `None`。
+///
+/// 核心的 `add_zone_event` 不带 `endBeat` 时走它 —— 缺省值天然合法，显式给的值越界则报错
+/// （见 `core.rs` 那条注释）。
+pub fn mask_default_end(
+    track: &[crate::doc::Event],
+    start: crate::doc::Beat,
+) -> Option<crate::doc::Beat> {
+    if !mask_can_start(track, start) {
+        return None;
+    }
+    let full = start.checked_add(crate::doc::Beat::new(crate::doc::MASK_EVENT_BEATS, 1))?;
+    let end = match mask_end_limit(track, start) {
+        Some(limit) if limit < full => limit,
+        _ => full,
+    };
+    (end > start).then_some(end)
+}
+
+/// `cur` 换到 `index` 这个位置之后，与**别的**块重叠的那个下标（没有 ⇒ `None`）。
+///
+/// `set_zone_event` / `resize_zone_event` 的闸门 —— 与 `move_zone_event` 里那段是同一句话
+/// （半个区间相交即重叠），只是那两个命令只动一个端点。
+pub fn mask_overlap(
+    cur: &crate::doc::Event,
+    index: usize,
+    track: &[crate::doc::Event],
+) -> Option<usize> {
+    track.iter().enumerate().find_map(|(i, o)| {
+        (i != index && cur.start < o.end && o.start < cur.end).then_some(i)
+    })
+}
+
 /// **草稿态**下"先建区、再应用编辑"的命令序列（用户口径 2026-10-02）。
 ///
 /// "遮蔽区数量为 0 时也能进入遮蔽区编辑，此时有默认的绘制三角形事件，当用户执行任意编辑后
@@ -1284,5 +1350,69 @@ mod mask_command_tests {
         let begin = zone_draft_begin(false, start, "拖动遮蔽区事件");
         assert_eq!(begin.len(), 1);
         assert_eq!(begin[0]["op"], serde_json::json!("begin"));
+    }
+
+    // ---- 跨度规则（R 起稿 / 属性编辑器 / 核心命令共用的那一份判据）----
+
+    fn ev(a: f64, b: f64) -> crate::doc::Event {
+        crate::doc::Event::new(
+            Beat::new((a * 4.0) as i64, 4),
+            Beat::new((b * 4.0) as i64, 4),
+            serde_json::json!(0.0),
+            serde_json::json!(0.0),
+            "linear",
+        )
+    }
+
+    /// 起点判据：只有"已经有一块**正好从这一点开始**"才不许放（起点落在别人里面是合法的插入）
+    #[test]
+    fn a_start_is_refused_only_when_a_block_starts_exactly_there() {
+        let list = vec![ev(8.0, 12.0)];
+        assert!(mask_can_start(&list, Beat::new(6, 1)));
+        assert!(mask_can_start(&list, Beat::new(9, 1)), "落在块里面：允许（会裁前一块）");
+        assert!(!mask_can_start(&list, Beat::new(8, 1)), "起点重合 = 重叠");
+        assert!(!mask_can_start(&list, Beat::new(16, 2)), "8/1 与 16/2 是同一拍");
+        assert!(mask_can_start(&[], Beat::zero()));
+    }
+
+    /// 终点上限 = **下一块的起点**（起点早于我们的那些不算 —— 它们会被裁掉）
+    #[test]
+    fn the_end_limit_is_the_next_blocks_start() {
+        let list = vec![ev(0.0, 4.0), ev(20.0, 24.0)];
+        assert_eq!(mask_end_limit(&list, Beat::new(8, 1)), Some(Beat::new(20, 1)));
+        // 落在某块里面：上限看**再往后**那一块
+        assert_eq!(mask_end_limit(&list, Beat::new(1, 1)), Some(Beat::new(20, 1)));
+        assert_eq!(mask_end_limit(&list, Beat::new(24, 1)), None, "后面没有块 = 不限");
+    }
+
+    /// 缺省终点：起点 + 1 拍，**不越过下一块**；起点重合或空档塞不下 ⇒ `None`
+    #[test]
+    fn the_default_end_stops_at_the_next_block() {
+        assert_eq!(mask_default_end(&[], Beat::new(8, 1)), Some(Beat::new(9, 1)));
+        // 下一块在 8.5：缩到它起点
+        let list = vec![ev(8.5, 12.0)];
+        assert_eq!(mask_default_end(&list, Beat::new(8, 1)), Some(Beat::new(17, 2)));
+        assert_eq!(mask_default_end(&list, Beat::new(17, 2)), None, "起点重合 ⇒ 放不下");
+        // 空档比一个格点还窄：给一条细块（能拖，不硬塞一个重叠）
+        let list = vec![ev(8.4, 12.0)]; // 下一块起于 33/4 拍
+        assert_eq!(mask_default_end(&list, Beat::new(8, 1)), Some(Beat::new(33, 4)));
+        // 起点在**已结束**的块之后：不受它影响
+        let list = vec![ev(0.0, 4.0), ev(20.0, 24.0)];
+        assert_eq!(mask_default_end(&list, Beat::new(8, 1)), Some(Beat::new(9, 1)));
+    }
+
+    /// 重叠判据：半个区间相交即重叠（相接不算）—— `set_zone_event` / `resize_zone_event` 走它
+    #[test]
+    fn overlap_is_half_open_interval_intersection() {
+        let list = vec![ev(0.0, 4.0), ev(8.0, 12.0)];
+        // 把第 0 块的终点拉到 10 ⇒ 压住了 [8,12) 那一块
+        let mut cur = list[0].clone();
+        cur.end = Beat::new(10, 1);
+        assert_eq!(mask_overlap(&cur, 0, &list), Some(1));
+        // 正好停在 8：相接，不算重叠
+        cur.end = Beat::new(8, 1);
+        assert_eq!(mask_overlap(&cur, 0, &list), None);
+        // 自己不算自己
+        assert_eq!(mask_overlap(&list[0], 0, &list), None);
     }
 }
