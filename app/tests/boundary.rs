@@ -108,7 +108,7 @@ fn view_state_never_leaks_into_the_document() {
     // 界面内部规则（网格、吸附、播放头、线长、叠加层…）改了又改，文档必须**逐字节不变**
     let mut core = EditCore::new();
     core.exec(&json!({"op": "add_line"}));
-    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [1, 1]}));
     let before = serde_json::to_string(&core.doc().to_json()).unwrap();
     let rev_before = core.revision();
     // 先记下"文档改动本身造成的脏状态"：前面两条命令确实改了文档且没保存 ⇒ 本来就是脏的

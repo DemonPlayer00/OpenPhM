@@ -710,7 +710,7 @@ fn core_owns_the_needs_save_state() {
 
     // 失败的命令：回滚干净，**不许**置脏（否则"手滑打错一条"会让界面喊未保存）
     let before = core.revision();
-    let bad = core.exec(&json!({"op": "add_note", "line": 99, "kind": "tap", "startBeat": [1, 1]}));
+    let bad = core.exec(&json!({"op": "add_note", "line": 99, "kind": "tap", "laneX": 0.0, "startBeat": [1, 1]}));
     assert_eq!(bad["ok"], json!(false), "{bad}");
     assert_eq!(core.revision(), before, "失败的命令不该推进版本号");
     assert!(!core.is_dirty(), "失败的命令不该置脏");

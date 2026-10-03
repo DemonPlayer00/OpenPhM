@@ -219,7 +219,8 @@ pub enum ViewCmd {
 pub enum TagCmd {
     Add {
         start: f64,
-        end: f64,
+        /// 省略 ⇒ 起点 + 最短长度（`TAG_MIN_BEATS`）
+        end: Option<f64>,
         color: Option<[u8; 3]>,
     },
     Del {
@@ -238,6 +239,26 @@ pub fn view_queue() -> ViewQueue {
 }
 
 /// 把一条 JSON 命令翻译成视图命令；不是视图命令则返回 None
+/// 认得出名字、但 [`parse_view_cmd`] 没收下的视图命令该怎么说。
+///
+/// 报错要指到点子上：`{"op":"tag","action":"add","end":8}` 缺的是 `start`，
+/// 不是"未知命令 tag"。
+///
+/// `#[cfg(unix)]`：它只被 Unix 那支控制线程用到（Windows 上整个控制通道都还没实现，
+/// 见下面的 `spawn_server`）—— 不门控的话 Windows 构建会报 dead_code。
+#[cfg(unix)]
+fn view_cmd_hint(op: &str) -> Option<&'static str> {
+    match op {
+        "tag" => Some(
+            "action 取 add / del / clear / select；**add 必须给 start（拍）**，end 可省             （缺省 = 起点 + 最短长度），color 可省（缺省 = 该来源的默认色）",
+        ),
+        "select" | "grid" | "zoom" | "window" | "nudge" | "seek" | "audio" | "audio_offset" => {
+            Some("参数不合格（这个 op 认，但这次的字段不对）")
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
     let op = v.get("op").and_then(|o| o.as_str())?;
     match op {
@@ -293,9 +314,12 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
         "tag" => {
             let idx = v.get("index").and_then(|x| x.as_u64()).map(|x| x as usize);
             match v.get("action").and_then(|x| x.as_str()).unwrap_or("add") {
+                // `start` **必需**：默认成 0 的话，"少写一个字段"的后果是标签静默跑到第 0 拍
+                // （与 `add_note` 的 `laneX` 同一个毛病）。缺它就**不是一条视图命令** ——
+                // 落到 EditCore 那边报错，比悄悄放一个标签在第 0 拍强。
                 "add" => Some(ViewCmd::Tag(TagCmd::Add {
-                    start: v.get("start").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                    end: v.get("end").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    start: v.get("start").and_then(|x| x.as_f64())?,
+                    end: v.get("end").and_then(|x| x.as_f64()),
                     // 颜色缺省 = 该来源的默认色（CLI 黄）；写歪了就当没写
                     color: v.get("color").and_then(|x| x.as_array()).and_then(|a| {
                         if a.len() < 3 {
@@ -561,6 +585,13 @@ fn handle_conn(
                     "note": "视图状态在下一帧生效；读 ui_stats 观察 playing/playhead_sec/audio_pos_ms",
                 }
             })
+        } else if let Some(hint) = view_cmd_hint(op_name) {
+            // **认得出名字、但参数不合格**的视图命令。
+            //
+            // 单独一支的理由：不加的话它会掉到 EditCore，报成"未知命令 tag" —— 而调用方
+            // 明明是**少写了一个字段**。用户 2026-10-03 报的"推 tag 到谱面中坐标都为 0"
+            // 就是这种情形的前身（那时更糟：不是报错，是静默放在第 0 拍）。
+            json!({"ok": false, "op": op_name, "error": format!("{op_name}：{hint}")})
         } else {
             let mut c = core.lock().unwrap();
             let before = c.revision();
@@ -673,7 +704,7 @@ mod tag_cmd_tests {
     fn the_tag_view_command_parses_all_four_actions() {
         match parse_view_cmd(&json!({"op": "tag", "action": "add", "start": 4.0, "end": 8.0})) {
             Some(ViewCmd::Tag(TagCmd::Add { start, end, color })) => {
-                assert_eq!((start, end), (4.0, 8.0));
+                assert_eq!((start, end), (4.0, Some(8.0)));
                 assert_eq!(color, None, "不写颜色 ⇒ 用该来源的默认色（由调用方补）");
             }
             other => panic!("add 没解析出来：{other:?}"),
@@ -686,7 +717,7 @@ mod tag_cmd_tests {
             other => panic!("带颜色的 add 没解析出来：{other:?}"),
         }
         // 颜色数组长度不够 ⇒ 当没写（而不是补 0 变成黑）
-        match parse_view_cmd(&json!({"op": "tag", "action": "add", "color": [1]})) {
+        match parse_view_cmd(&json!({"op": "tag", "action": "add", "start": 4.0, "color": [1]})) {
             Some(ViewCmd::Tag(TagCmd::Add { color, .. })) => assert_eq!(color, None),
             other => panic!("{other:?}"),
         }
@@ -706,6 +737,16 @@ mod tag_cmd_tests {
             parse_view_cmd(&json!({"op": "tag", "action": "select"})),
             Some(ViewCmd::Tag(TagCmd::Select { index: None }))
         ));
+        // **`start` 必需**：不给就**不是一条视图命令**（落到 EditCore 报错），
+        // 而不是静默地在第 0 拍放一个标签 —— 用户报的"坐标都为 0"就是这个毛病。
+        assert!(parse_view_cmd(&json!({"op": "tag", "action": "add", "end": 8.0})).is_none());
+        // 只给 start ⇒ end 交给调用方按最短长度补
+        match parse_view_cmd(&json!({"op": "tag", "action": "add", "start": 4.0})) {
+            Some(ViewCmd::Tag(TagCmd::Add { start, end, .. })) => {
+                assert_eq!((start, end), (4.0, None))
+            }
+            other => panic!("{other:?}"),
+        }
         // del 不给下标 ⇒ 不是命令（`None` 会让它落到 EditCore，由那边报"未知 op"）
         assert!(parse_view_cmd(&json!({"op": "tag", "action": "del"})).is_none());
         // 未知动作同理

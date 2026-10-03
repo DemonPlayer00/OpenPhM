@@ -2880,7 +2880,7 @@ impl App {
                     let src = opm_app::state::TagSource::Cli;
                     match cmd {
                         TagCmd::Add { start, end, color } => {
-                            let (a, b) = opm_app::state::tag_span_of(start, end);
+                            let (a, b) = opm_app::state::tag_span_of(start, end.unwrap_or(start));
                             // 长度给 0（只写 start）时按最短长度撑开 —— 与 GUI 起稿的保底一致
                             let b = if (b - a) < opm_app::state::TAG_MIN_BEATS {
                                 a + opm_app::state::TAG_MIN_BEATS

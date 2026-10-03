@@ -6325,3 +6325,51 @@ pub fn overlay_visible(enabled: bool, playing: bool, h_held: bool) -> bool {
 `holding_h_flips_the_overlay_visibility`，并把**四格全部**断言（含"工具栏关掉之后 H 也救不回来"）。
 
 验收：**475 测试**（+1 控制通道默认值）0 失败；四配置 + test-profile 0 警告。
+
+---
+
+## 7.104 坐标省略时**静默落 0**（用户报 2026-10-03）
+
+用户原话："推tag或hold到谱面中，坐标都为0"。
+
+### 7.104.1 这是缺陷，不是指令
+
+先做了一次实测（在**副本**上，不碰用户的谱面）：
+
+| 命令 | 结果 |
+|---|---|
+| `add_note` **不给** `laneX` | `laneX: 0.0` ← 静默 |
+| `add_note` 给 `laneX: 200` | `laneX: 200.0` ✓ |
+| `tag add` **不给** `start` | 落第 0 拍，还被最短长度撑成 `[0, 0.25]` ← 静默 |
+
+两处都是 `unwrap_or(0.0)`。而**规范 §4.3 把 `laneX` 标成「必需」**（没有默认值）——
+于是"少写一个字段"的后果是**所有音符静默堆在中轴上**，而命令回话是 `ok`。
+标签同理。缺参就该报错，不该替调用方猜一个 0。
+
+（判据：`tag` 根本没有 x 坐标，所以"坐标都为 0"只可能是在说"省略了就被当成 0"。
+若是"把他们都放在 0"那种指令，对 tag 不成立。）
+
+### 7.104.2 改法：必需就是必需
+
+- **`add_note`**：`laneX` 缺失 ⇒ `Err("add_note 需要 laneX（规范里它是必需字段，没有默认值）")`。
+  实测：`FAIL add_note: add_note 需要 laneX（…）`。
+- **`tag add`**：`start` 缺失 ⇒ **不是一条视图命令**（`parse_view_cmd` 返回 `None`）。
+- 但"掉到 EditCore 报 `未知命令 "tag"`"这个措辞不好 —— 调用方明明是少写了一个字段。
+  于是新增一支 `view_cmd_hint(op)`：**认得出名字、但参数不合格**的视图命令，回一句指到点子的错：
+
+  ```json
+  {"ok":false,"op":"tag","error":"tag：action 取 add / del / clear / select；**add 必须给 start（拍）**，end 可省（缺省 = 起点 + 最短长度），color 可省（缺省 = 该来源的默认色）"}
+  ```
+
+- `TagCmd::Add.end` 跟着改成 `Option<f64>`（缺省 = 起点 + 最短长度），语义比"0 与起点相等"清楚。
+- `view_cmd_hint` 挂 `#[cfg(unix)]`：它只被 Unix 那支控制线程用到，
+  不门控的话 Windows 构建报 dead_code（**这条是四配置扫描抓出来的**，不是推理出来的）。
+
+### 7.104.3 新规则当场抓出 10 处旧调用
+
+`laneX` 变必需之后，`cargo test` 立刻红了一批：`tests/broadcast.rs`（3 条）、
+`tests/boundary.rs`、`tests/lifecycle.rs`、`core.rs` 里一条事务用例 —— 它们的 `add_note`
+**本来就没给 `laneX`**，此前靠默认值静默成功。这正说明"静默默认值"会把错误悄悄带进测试里：
+那些用例本来就在测别的东西（广播、事务），坐标是顺手漏的。
+
+验收：**475 测试** 0 失败；四配置 + test-profile 0 警告。

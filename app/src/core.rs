@@ -1880,7 +1880,13 @@ impl EditCore {
                 let kind = NoteKind::parse(c.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
                     .ok_or_else(|| format!("未知音符类型 {:?}（可选 tap/hold/drag/flick）", c.get("kind")))?;
                 let start = beat_arg(c, "startBeat")?;
-                let mut note = Note::new(kind, start, num(c, "laneX").unwrap_or(0.0) as f32);
+                // **`laneX` 必需**（规范 §4.3 把它标成 ✅）。早先这里是 `unwrap_or(0.0)` ——
+                // 于是少写一个字段的后果是"所有音符静默堆在中轴上"，而命令回话是成功的。
+                // 用户 2026-10-03 报的正是这个："推 tag 或 hold 到谱面中，坐标都为 0"。
+                // 缺参就该报错，不该替调用方猜一个 0。
+                let lane_x = num(c, "laneX")
+                    .ok_or("add_note 需要 laneX（规范里它是必需字段，没有默认值）")?;
+                let mut note = Note::new(kind, start, lane_x as f32);
                 if kind == NoteKind::Hold {
                     let end = beat_arg(c, "endBeat").map_err(|_| "hold 必须提供 endBeat".to_string())?;
                     if end <= start {
@@ -3705,7 +3711,7 @@ mod tests {
             &mut c,
             serde_json::json!({"op": "set_target", "line": 0, "atBeat": [4, 1], "target": {"x": 7.0}}),
         );
-        exec_ok(&mut c, serde_json::json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1]}));
+        exec_ok(&mut c, serde_json::json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1], "laneX": 0.0}));
         exec_ok(&mut c, serde_json::json!({"op": "commit"}));
         assert_eq!(value_at(&c, "moveX", 4).to_bits(), 7.0f64.to_bits());
         assert_eq!(c.doc().judge_lines[0].notes.len(), 1);

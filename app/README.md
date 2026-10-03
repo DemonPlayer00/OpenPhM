@@ -527,6 +527,9 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 
 **agent 侧**（控制通道，与播放头/缩放/网格同一条视图通道）：
 
+**`start` 是必需项**（少了它这条命令**直接报错**，不会悄悄在第 0 拍放一个标签 ——
+这与 `add_note` 的 `laneX` 是同一条纪律：坐标不给就报错，不替调用方猜 0）。
+
 ```sh
 opm-ctl --attach auto --cmd '{"op":"tag","action":"add","start":12,"end":16,"color":[255,96,96]}'
 opm-ctl --attach auto --cmd '{"op":"tag","action":"add","start":20}'      # 只给起点 ⇒ 按最短长度撑开

@@ -83,7 +83,7 @@ fn only_matching_subscribers_receive() {
     assert_eq!(drain(&t.rx).len(), 1, "undo 掉的是轨道改动 → Track 订阅者收到");
 
     // ---- 6. 失败的命令不得广播（文档没变就不该叫醒任何人）----
-    let resp = core.exec(&json!({"op": "add_note", "line": 99, "kind": "tap", "startBeat": [1, 1]}));
+    let resp = core.exec(&json!({"op": "add_note", "line": 99, "kind": "tap", "laneX": 0.0, "startBeat": [1, 1]}));
     assert_eq!(resp["ok"], json!(false));
     assert_eq!(drain(&r.rx).len(), 0, "失败命令不广播");
     assert_eq!(drain(&b.rx).len(), 0);
@@ -96,8 +96,8 @@ fn only_matching_subscribers_receive() {
     // 前面几步已经改过文档，所以撤销深度要取**增量**，不能假设从 0 起
     let d0 = core.journal().undo_depth();
     core.exec(&json!({"op": "begin", "label": "batch"}));
-    core.exec(&json!({"op": "add_note", "line": 3, "kind": "tap", "startBeat": [9, 1]}));
-    core.exec(&json!({"op": "add_note", "line": 3, "kind": "tap", "startBeat": [10, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 3, "kind": "tap", "laneX": 0.0, "startBeat": [9, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 3, "kind": "tap", "laneX": 0.0, "startBeat": [10, 1]}));
     assert_eq!(drain(&b.rx).len(), 2, "事务中每条改动都要广播（拖拽要实时看到）");
     assert_eq!(core.journal().undo_depth(), d0, "事务未提交前不产生撤销步");
     core.exec(&json!({"op": "commit"}));
@@ -121,7 +121,7 @@ fn only_matching_subscribers_receive() {
     let _ = drain(&b.rx);
     let _ = drain(&t.rx);
     core.exec(&json!({"op": "begin", "label": "doomed"}));
-    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [20, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [20, 1]}));
     // 这条改动在 0 号线：全收的渲染层收到，只订阅 3 号线的 B 收不到（话题过滤器在起作用）
     assert_eq!(drain(&r.rx).len(), 1, "事务中被丢弃的改动当时也广播过");
     let leaked = drain(&b.rx);
@@ -142,7 +142,7 @@ fn only_matching_subscribers_receive() {
 fn broadcast_log_is_introspectable() {
     let mut core = EditCore::new();
     core.exec(&json!({"op": "add_line"}));
-    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [1, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [1, 1]}));
     let r = core.exec(&json!({"op": "broadcasts", "recent": 5}));
     assert_eq!(r["ok"], json!(true));
     let res = &r["result"];
@@ -173,8 +173,8 @@ fn abort_and_failure_roll_back_the_document() {
 
     // 事务里改两条，然后 abort：文档必须回到事务前
     core.exec(&json!({"op": "begin", "label": "doomed"}));
-    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [3, 1]}));
-    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [4, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [3, 1]}));
+    core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [4, 1]}));
     assert_eq!(core.doc().judge_lines[0].notes.len(), notes_before + 2, "事务中确实改到了文档");
     core.exec(&json!({"op": "abort"}));
     assert_eq!(
@@ -191,7 +191,7 @@ fn abort_and_failure_roll_back_the_document() {
     assert_eq!(core.journal().undo_depth(), d0);
 
     // 而且回滚之后还能正常继续用（pending 已清空，不会串到下一次事务）
-    let resp = core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "startBeat": [5, 1]}));
+    let resp = core.exec(&json!({"op": "add_note", "line": 0, "kind": "tap", "laneX": 0.0, "startBeat": [5, 1]}));
     assert_eq!(resp["ok"], json!(true));
     assert_eq!(core.doc().judge_lines[0].notes.len(), notes_before + 1);
 }
