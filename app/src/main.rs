@@ -1198,6 +1198,10 @@ struct App {
     line_rows: Vec<LineRow>,
     /// 检查器展示的选中对象快照（Inspector 脏时重建）
     insp: Option<Inspector>,
+    /// 正在拖的标签控制杆：`(下标, 抓的是哪一头)`。
+    /// **视图状态**（标签本身就不进文档），所以不进事务、不占撤销步 ——
+    /// 整段拖拽的撤销由 `state.begin_tag_drag()` 在开始时开的那一格负责。
+    tag_drag: Option<(usize, opm_app::state::EventEdge)>,
 
     // ---- 观测：广播与重建计数（**逐线**的代价在这里可见）----
     applied_broadcasts: u64,
@@ -1424,6 +1428,7 @@ impl App {
             doc_notes,
             line_rows,
             insp,
+            tag_drag: None,
             applied_broadcasts: 0,
             builds_structure: 0,
             builds_props: 0,
@@ -1750,6 +1755,20 @@ impl App {
                         ));
                     }
                 }
+                OverlayAction::ClearTagSelection => {
+                    self.state.selected_tag = None;
+                }
+                OverlayAction::TagResizeBegin { index, edge } => {
+                    // 整段拖拽 = **一格撤销**（每帧各开一格的话，拖一次会塞满撤销栈）
+                    self.state.begin_tag_drag();
+                    self.tag_drag = Some((index, edge));
+                }
+                OverlayAction::TagResize { beat } => {
+                    if let Some((index, edge)) = self.tag_drag {
+                        self.state.resize_tag(index, edge, beat);
+                    }
+                }
+                OverlayAction::TagResizeEnd => self.tag_drag = None,
                 OverlayAction::DeleteTag(i) => {
                     let who = self.state.tags.get(i).map(|t| t.source.key());
                     if self.state.delete_tag(i) {
@@ -2029,6 +2048,19 @@ impl App {
     /// 才会进核心日志，而且与控制通道、CLI 走的是同一条 —— 界面不发明第二套编辑入口。
     /// 界面只做三件事：按键 → 发命令 → 把结果说清楚（没事可撤时**明说**，不静默吞掉这一次按键）。
     fn apply_edit_action(&mut self, action: keymap::EditAction) {
+        // **标签先来**：标签不进文档，所以它有自己的撤销栈（见 `state::TagUndo`）。
+        // `undo_tag` / `redo_tag` 自带 revision 守卫：文档在标签之后被改过就返回 false，
+        // 于是这里自然落到文档那条路上 —— 次序不会错乱。
+        let tag_done = match action {
+            keymap::EditAction::Undo => self.state.undo_tag(),
+            keymap::EditAction::Redo => self.state.redo_tag(),
+        };
+        if tag_done {
+            self.insp = self.build_inspector();
+            self.file_message =
+                Some((true, format!("{}了标签（不进谱面）", action.verb())));
+            return;
+        }
         let resp = {
             let mut c = self.core.lock().unwrap();
             c.exec(&serde_json::json!({"op": action.op()}))
@@ -2164,6 +2196,16 @@ impl App {
     }
 
     fn delete_selection(&mut self) {
+        // **标签优先**：标签是视图状态，它不在文档里，所以"删选中的东西"这条全局语义要在这里
+        // 分一支。用户口径 2026-10-03："删除按 del，不要放删除按钮" —— 这一支就是那个 `Del`。
+        // 点了音符/事件/空白会把标签选中清掉（`ClearTagSelection`），所以两者不会同时选中。
+        if let Some(i) = self.state.selected_tag {
+            if self.state.delete_tag(i) {
+                self.insp = self.build_inspector();
+                self.file_message = Some((true, format!("删除标签 #{i}（不进谱面）")));
+                return;
+            }
+        }
         // **遮蔽区编辑模式**下 Del 删的是那块区当前通道里选中的事件块
         // （这个模式下音符区功能停用，选中的音符/事件与眼前的东西没关系，别误删）
         if self.state.mask_edit {
@@ -4280,6 +4322,9 @@ impl eframe::App for App {
         // ---- 控制通道的视图命令（play/pause/seek/audio）----
         self.pump_view_cmds();
 
+        // **文档 revision 的影子**：标签撤销栈靠它判断"上一次标签改动之后文档有没有动过"
+        // （见 `state::EditorState::undo_tag`）。抄一份是**只读**的旁路，不参与任何决策之外的用途。
+        self.state.core_revision = self.core.lock().map(|c| c.revision()).unwrap_or(0);
         // ---- 唯一的更新入口：抽广播 → 置脏 → 只重建脏掉的那块 ----
         // GUI 不轮询 `revision`、不直接读文档判断"要不要更新"：文档什么时候变了，由 EditCore 说。
         self.pump_broadcasts();
@@ -4987,16 +5032,10 @@ impl eframe::App for App {
             // 标签是**视图状态**：面板改的颜色/起止直接写回 `EditorState`，不发命令、不进撤销栈
             //（与"选中"同一条理由 —— 它压根不在文档里）。
             if let Some((i, c)) = ins_out.tag_color {
-                if let Some(t) = self.state.tags.get_mut(i) {
-                    t.color = c;
-                }
+                self.state.set_tag_color(i, c);
             }
             if let Some((i, a, b)) = ins_out.tag_span {
-                if let Some(t) = self.state.tags.get_mut(i) {
-                    let (s0, s1) = opm_app::state::tag_span_of(a, b);
-                    t.start = s0;
-                    t.end = s1;
-                }
+                self.state.set_tag_span(i, a, b);
             }
             // 遮蔽区面板产出的命令：草稿态（还没有区）下要先建区再应用，一个撤销步。
             // **只有这一路**这么包 —— 控制台里手打的命令不该顺手建出一块区来。

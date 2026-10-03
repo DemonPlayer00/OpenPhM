@@ -126,8 +126,19 @@ pub enum OverlayAction {
     StartTagDraft { beat: f64 },
     /// 选中中轴上的第 i 个标签（属性编辑器改颜色用它）
     SelectTag(usize),
-    /// 删掉中轴上的第 i 个标签（轴带里按 `D` / 点它旁边）
+    /// 清掉标签选区（点了音符/事件/空白 —— "选中的是什么"必须唯一，否则 `Del` 不知道该删谁）
+    ClearTagSelection,
+    /// 删掉中轴上的第 i 个标签（轴带里按 `D` / 点删除控制杆）
     DeleteTag(usize),
+    /// 拖**标签控制杆**开始：调用方开一格撤销（整段拖拽 = 一次撤销）
+    TagResizeBegin {
+        index: usize,
+        edge: opm_app::state::EventEdge,
+    },
+    /// 拖控制杆中：把那一头挪到某个拍（已吸附）。每帧都会发，所以**它自己不开撤销**
+    TagResize { beat: f64 },
+    /// 拖控制杆结束
+    TagResizeEnd,
     /// 面板想跟用户说一句话（例如"指针不在音符区，快速放置用不了"）——
     /// 动作只描述意图，显示在状态栏/控制台由调用方决定
     Notice(String),
@@ -262,10 +273,12 @@ pub fn pane_x_to_lane(pane: egui::Rect, x: f32, offset: f32) -> f32 {
 /// 两列的分工就是"来源"（用户口径："只留两列标注来源是 gui 还是 cli"）；
 /// **颜色不参与分列**，它是每个标签自己的属性，可以逐个改。
 pub fn tag_column_center(axis: egui::Rect, source: opm_app::state::TagSource) -> f32 {
-    let half = axis.width() * 0.5;
+    // 列只占**拍号区右边**的那一段（数字归 `AXIS_NUM_W` 独占）—— 这就是"数字移到标签外面"
+    let left = axis.min.x + AXIS_NUM_W;
+    let half = (axis.width() - AXIS_NUM_W).max(2.0) * 0.5;
     match source {
-        opm_app::state::TagSource::Gui => axis.min.x + half * 0.5,
-        opm_app::state::TagSource::Cli => axis.min.x + half * 1.5,
+        opm_app::state::TagSource::Gui => left + half * 0.5,
+        opm_app::state::TagSource::Cli => left + half * 1.5,
     }
 }
 
@@ -282,12 +295,82 @@ pub fn tag_rect(
     let y0 = beat_y(body, anchor, beats, s0);
     let y1 = beat_y(body, anchor, beats, s1);
     // 每列留 3px 边距；短标签至少 3px 高，否则点不着、也看不见
-    let hw = axis.width() * 0.25 - 3.0;
+    // 每列留 **2px** 内缩（原来是 3px）：列只有 (58−22)/2 = 18px 宽，
+    // 内缩太多的话标签条窄到放不下里面的删除按钮（实测 9px < 按钮的 11px）。
+    let hw = ((axis.width() - AXIS_NUM_W).max(2.0) * 0.25 - 2.0).max(2.0);
     let (lo, hi) = (y0.min(y1), y0.max(y1));
     egui::Rect::from_min_max(
         egui::pos2(cx - hw, lo.min(hi - 3.0)),
         egui::pos2(cx + hw, hi.max(lo + 3.0)),
     )
+}
+
+/// 标签上能抓的几个部分。
+///
+/// **没有"删除"这一档**（用户口径 2026-10-03："删除按 del，不要放删除按钮"）——
+/// 删除走全局的 `Del`（与"Del = 删掉选中的东西"这条既有约定同源），标签上只留两端的**拉长杆**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagPart {
+    /// 起点杆（下缘）
+    Start,
+    /// 终点杆（上缘）
+    End,
+    /// 本体（用来选中）
+    Body,
+}
+
+
+/// 标签的**两条拉长杆**：`(起点杆, 终点杆)`。
+///
+/// 与事件块的头/尾把手同一套语义（抓哪一头改哪一头）。
+/// 起点拍小 ⇒ 屏幕 y 大（纵向轴越往上越晚），所以起点杆在下缘。
+pub fn tag_handle_rects(
+    axis: egui::Rect,
+    body: egui::Rect,
+    anchor: f64,
+    beats: f64,
+    t: &opm_app::state::Tag,
+) -> (egui::Rect, egui::Rect) {
+    let r = tag_rect(axis, body, anchor, beats, t);
+    let (lo, hi) = (r.min.y.min(r.max.y), r.min.y.max(r.max.y));
+    let bar = |y: f32| {
+        egui::Rect::from_min_max(
+            egui::pos2(r.min.x, y - EDGE_BAND * 0.5),
+            egui::pos2(r.max.x, y + EDGE_BAND * 0.5),
+        )
+    };
+    // ⚠️ 顺序：`lo` 是**上**缘（y 小）、`hi` 是**下**缘。纵向轴"越往上越晚" ⇒
+    // **起点拍（小）在下缘**，所以第一个返回值取 `bar(hi)`。
+    (bar(hi), bar(lo)) // (起点杆 = 下缘, 终点杆 = 上缘)
+}
+
+/// 指针在标签的哪一部分上。**反序遍历**（后加的盖在上面，与绘制顺序一致）。
+pub fn tag_hit_part(
+    tags: &[opm_app::state::Tag],
+    axis: egui::Rect,
+    body: egui::Rect,
+    anchor: f64,
+    beats: f64,
+    pos: egui::Pos2,
+) -> Option<(usize, TagPart)> {
+    for (i, t) in tags.iter().enumerate().rev() {
+        let r = tag_rect(axis, body, anchor, beats, t);
+        if !r.expand(EDGE_BAND * 0.5).contains(pos) {
+            continue;
+        }
+        let (y0, y1) = (r.min.y.min(r.max.y), r.min.y.max(r.max.y));
+        return Some((
+            i,
+            match hit_event_part(pos.y, y1, y0, EDGE_BAND) {
+                // 注意实参顺序：`hit_event_part(指针, 起点y, 终点y, band)`，
+                // 而这里的"起点"是下缘（y 大）
+                EventPart::Start => TagPart::Start,
+                EventPart::End => TagPart::End,
+                _ => TagPart::Body,
+            },
+        ));
+    }
+    None
 }
 
 /// 命中的标签下标：**先按列筛 x、再按拍区间筛 y**。
@@ -950,7 +1033,12 @@ impl Default for OverlayCfg {
 const RULER_H: f32 = 18.0;
 /// 中间的**纵轴轴带**宽度：拍号写在这里，把"音符区"和"事件区"隔开。
 /// 放在中间而不是贴左边缘：它是两个区共用的纵轴，贴边会让它看起来只属于左半。
-const AXIS_W: f32 = 34.0;
+/// 轴带宽度。**用户口径 2026-10-03**："将时间轴数字移到标签外面" —— 于是它分成两段：
+/// 左边 [`AXIS_NUM_W`] 专画拍号，右边剩下的才是标签的两列。数字因此**永远不会**被标签盖住
+///（此前数字居中、标签占满两半，标签一长就把拍号糊掉一截）。
+const AXIS_W: f32 = 58.0;
+/// 轴带里**拍号区**的宽度（靠左）。剩下的宽度均分给两列标签。
+const AXIS_NUM_W: f32 = 22.0;
 
 /// 事件值的紧凑写法（块内空间小；长小数会被截成噪声）
 fn fmt_val(v: &serde_json::Value) -> String {
@@ -1136,8 +1224,10 @@ pub fn draw(
         // 数字居中写在**轴带**里，两侧各一个小刻度线指向相邻半区。
         // 遮蔽区模式下轴带贴在左边缘 ⇒ 这里必须用轴带自己的中心，不能用 `mid_x`
         //（用 `mid_x` 会把拍号写到通道列上 —— 截图里一眼看得出来，测试看不出来）
+        // 拍号画在**数字区**（轴带左侧那一条）里 —— 用户口径："将时间轴数字移到标签外面"。
+        // 此前它居中写在整条轴带上，而标签占满两半 ⇒ 标签一长就把拍号盖掉一截。
         p.text(
-            egui::pos2(axis.center().x, y - 1.0),
+            egui::pos2(axis.min.x + AXIS_NUM_W * 0.5, y - 1.0),
             egui::Align2::CENTER_BOTTOM,
             &t.text,
             egui::FontId::monospace(fsize),
@@ -1158,6 +1248,14 @@ pub fn draw(
     //
     // 只在普通模式下画：遮蔽区模式里轴带贴在左边缘，那里的"拍"仍然有意义，但那一栏
     // 整片是七条通道的地盘，再塞两列标签只会两边都看不清。
+    // 指针压着哪个标签（控制杆只在它身上亮）—— 用**按下时也算**的指针，拖的时候不闪
+    // 指针压着哪个标签（控制杆只在它身上亮）。这里用 egui 的**悬停**位置而不是后面那个
+    // `ptr`（按下时才有值）—— 绘制发生在交互解析之前，拿不到它。
+    let hovered_tag = ui
+        .ctx()
+        .pointer_hover_pos()
+        .filter(|q| rect.contains(*q))
+        .and_then(|q| tag_hit(&st.tags, axis, body, anchor, beats, q));
     if !mask_mode {
         for (i, t) in st.tags.iter().enumerate() {
             let r = tag_rect(axis, body, anchor, beats, t);
@@ -1173,6 +1271,19 @@ pub fn draw(
                     egui::Stroke::new(1.6, egui::Color32::WHITE),
                     egui::StrokeKind::Outside,
                 );
+            }
+            // ---- 控制杆：**悬停或选中的那一个**才亮 ----
+            //
+            // 用户口径："删除和变长控制杆"。两端的横条 = 拉长（抓哪头改哪头），
+            // 中间的 ✕ = 删除。全画出来会糊成一片，所以只在指针压着它、或它被选中时画。
+            let hot = hovered_tag == Some(i) || st.selected_tag == Some(i);
+            if hot {
+                // 只画两条**拉长杆**；删除不在这里做（用户口径："删除按 del，不要放删除按钮"）
+                let (sb, eb) = tag_handle_rects(axis, body, anchor, beats, t);
+                let bar_col = egui::Color32::from_rgb(255, 246, 200);
+                for bar in [sb, eb] {
+                    p.rect_filled(bar, 1.0, bar_col);
+                }
             }
         }
     }
@@ -1732,6 +1843,41 @@ pub fn draw(
             }
         }
     }
+    // ---- 标签控制杆的**拖拽**（视图状态：没有事务，但整段只占一格撤销）----
+    //
+    // 与点选分开：`drag_started()` 要等 egui 的拖拽阈值（约 6px）过了才为真，而那一刻指针
+    // 早已离开把手段 —— 所以"抓的是哪一头"要用**按下时**的指针位置判（`press_origin`），
+    // 这是判定线事件区与遮蔽区事件块都踩过同一个坑，见 `event_press_hit` / `mask_press_hit`。
+    if keys_enabled && !st.drafting() {
+        if resp.drag_started() {
+            if let Some(q) = ui.input(|i| i.pointer.press_origin()).or(ptr) {
+                if in_axis(q) {
+                    if let Some((i, part)) = tag_hit_part(&st.tags, axis, body, anchor, beats, q) {
+                        let edge = match part {
+                            TagPart::Start => Some(opm_app::state::EventEdge::Start),
+                            TagPart::End => Some(opm_app::state::EventEdge::End),
+                            _ => None,
+                        };
+                        if let Some(edge) = edge {
+                            actions.push(OverlayAction::SelectTag(i));
+                            actions.push(OverlayAction::TagResizeBegin { index: i, edge });
+                        }
+                    }
+                }
+            }
+        }
+        if resp.dragged() {
+            if let Some(q) = ptr.filter(|q| in_axis(*q)) {
+                actions.push(OverlayAction::TagResize {
+                    beat: st.snap_beat(beat_of(q.y)).max(0.0),
+                });
+            }
+        }
+        if resp.drag_stopped() {
+            actions.push(OverlayAction::TagResizeEnd);
+        }
+    }
+
     // ---- 草稿（hold / 事件块）：矩形由本模式算，手势两个模式共用 ----
     //
     // 用户口径 2026-10-02（遮蔽区）："创建流程应与普通编辑模式下的事件块放置一样" ——
@@ -1961,9 +2107,21 @@ pub fn draw(
         if !shift {
             match hit {
                 // 标尺只挪播放头：它和选区没关系，点它不该把选区清掉
-                Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
-                // 轴带上点中一个标签 ⇒ 选中它（属性编辑器据此显示/改颜色）
-                Some(Hit::Axis(Some(i))) => actions.push(OverlayAction::SelectTag(i)),
+                Some(Hit::Ruler(b)) => {
+                    actions.push(OverlayAction::ClearTagSelection);
+                    actions.push(OverlayAction::SeekBeat(b));
+                }
+                // 轴带上点中一个标签 ⇒ 选中它（属性编辑器据此显示/改颜色）。
+                // 但**控制杆优先**：删除按钮、两端拉长杆各自有语义，不能都被"选中"吃掉。
+                // 轴带上点中一个标签 ⇒ 选中它（属性编辑器据此显示/改颜色）。
+                // 两端拉长杆**不在这里起拖拽** —— 它们是"拖"的，不是"点"的；
+                // 单击若也发一次 `TagResizeBegin`，会留下一个永远等不到 `drag_stopped` 的悬空拖拽。
+                //
+                // 顺带清掉音符/事件选区：**"选中的是什么"必须唯一**，否则 `Del` 不知道该删谁。
+                Some(Hit::Axis(Some(i))) => {
+                    actions.push(OverlayAction::ClearSelection);
+                    actions.push(OverlayAction::SelectTag(i));
+                }
                 // Ctrl+左键：在"选中 / 未选中"之间切换（用户要求）
                 Some(Hit::Note(i)) => actions.push(if ctrl {
                     OverlayAction::ToggleNote(i)
@@ -4566,7 +4724,10 @@ mod tag_tests {
 
     fn pane() -> (egui::Rect, egui::Rect) {
         let body = egui::Rect::from_min_max(egui::pos2(300.0, 40.0), egui::pos2(1300.0, 840.0));
-        let axis = egui::Rect::from_min_max(egui::pos2(783.0, 40.0), egui::pos2(817.0, 840.0));
+        let axis = egui::Rect::from_min_max(
+            egui::pos2(783.0, 40.0),
+            egui::pos2(783.0 + AXIS_W, 840.0),
+        );
         (body, axis)
     }
 
@@ -4577,12 +4738,24 @@ mod tag_tests {
         let (_, axis) = pane();
         let gui = tag_column_center(axis, TagSource::Gui);
         let cli = tag_column_center(axis, TagSource::Cli);
-        assert!(gui < axis.center().x, "GUI 列应在左半：{gui} vs 中心 {}", axis.center().x);
-        assert!(cli > axis.center().x, "CLI 列应在右半：{cli} vs 中心 {}", axis.center().x);
-        assert!(gui < cli);
-        // 两列各自居中在半个轴带里（不留偏心）
-        assert!((gui - (axis.min.x + axis.width() * 0.25)).abs() < 1e-3);
-        assert!((cli - (axis.min.x + axis.width() * 0.75)).abs() < 1e-3);
+        // 注意：**两列都落在轴带右半**（左半让给拍号了）—— 所以"GUI 在轴带中心左边"这种
+        // 旧几何的断言不再成立。真正要守的是：GUI 在 CLI 左边、且两者都在数字区右边。
+        assert!(gui < cli, "GUI 列应在 CLI 列左边：{gui} vs {cli}");
+        // 数字区归拍号独占（用户口径：把时间轴数字移到标签外面）：
+        // 两列都必须落在 `axis.min.x + AXIS_NUM_W` 右边，一像素都不许侵进去。
+        let num_right = axis.min.x + AXIS_NUM_W;
+        assert!(gui > num_right, "GUI 列侵进了拍号区：{gui} <= {num_right}");
+        assert!(cli > num_right, "CLI 列侵进了拍号区：{cli} <= {num_right}");
+        let left = num_right;
+        let half = (axis.width() - AXIS_NUM_W) * 0.5;
+        assert!((gui - (left + half * 0.5)).abs() < 1e-3);
+        assert!((cli - (left + half * 1.5)).abs() < 1e-3);
+
+        // 而且标签的矩形也不许压到拍号区（这是真正会被看见的那一条）
+        let body = egui::Rect::from_min_max(egui::pos2(300.0, 40.0), egui::pos2(1300.0, 840.0));
+        let t = Tag { start: 4.0, end: 8.0, source: TagSource::Gui, color: [0, 0, 0] };
+        let r = tag_rect(axis, body, 0.0, 32.0, &t);
+        assert!(r.min.x >= num_right - 1e-3, "标签左缘压到了拍号区：{}", r.min.x);
     }
 
     /// 命中：**先按列筛、再按拍区间筛**。同一点上两列各有一个标签时，各自只能命中自己那一列。
@@ -4604,6 +4777,30 @@ mod tag_tests {
         assert_eq!(tag_hit(&tags, axis, body, anchor, beats, egui::pos2(tag_column_center(axis, TagSource::Gui), y_out)), None);
         // 轴带之外不命中（哪怕 y 对）
         assert_eq!(tag_hit(&tags, axis, body, anchor, beats, egui::pos2(axis.min.x - 20.0, y)), None);
+    }
+
+    /// **控制杆的优先级**：删除 > 拉长 > 本体。
+    ///
+    /// 这条必须钉住：三者的矩形是**叠在一起**的（✕ 在标签正中、拉长杆贴着两端），
+    /// 判错一个就会"点删除却选中了它"或者"想拉长却只是选中"。
+    #[test]
+    fn the_two_bars_are_the_only_handles() {
+        let (body, axis) = pane();
+        let (anchor, beats) = (0.0, 32.0);
+        let t = Tag { start: 4.0, end: 8.0, source: TagSource::Gui, color: [9, 9, 9] };
+        let tags = [t];
+        let r = tag_rect(axis, body, anchor, beats, &t);
+        let (start_bar, end_bar) = tag_handle_rects(axis, body, anchor, beats, &t);
+
+        let hit = |p: egui::Pos2| tag_hit_part(&tags, axis, body, anchor, beats, p);
+        assert_eq!(hit(end_bar.center()), Some((0, TagPart::End)), "上缘是终点杆");
+        assert_eq!(hit(start_bar.center()), Some((0, TagPart::Start)), "下缘是起点杆");
+        // **正中是本体**：标签上没有删除按钮了（用户口径："删除按 del，不要放删除按钮"），
+        // 所以正中回到"选中它"这条最朴素的语义上。
+        assert_eq!(hit(r.center()), Some((0, TagPart::Body)), "正中是本体");
+        // 拉长杆在标签**里面**（不是贴在外面的另一块），所以它天然被 `tag_rect` 圈住
+        assert!(r.expand(1.0).contains(start_bar.center()));
+        assert!(r.expand(1.0).contains(end_bar.center()));
     }
 
     /// 标签的矩形覆盖它的**拍区间**，而且同一个标签在窗口滚动后跟着移动

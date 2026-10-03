@@ -1283,6 +1283,20 @@ impl Tag {
     }
 }
 
+/// 标签撤销栈里的一格：**改之前**的整份标签表 + 当时的文档 revision。
+///
+/// 为什么整表快照而不是增量：标签是几十个的小列表，"改了什么"记不清时快照最不容易写歪；
+/// 而 `rev` 是**让标签撤销不越界**的那把钥匙 —— 见 [`EditorState::undo_tag`]。
+#[derive(Clone, Debug)]
+pub struct TagUndo {
+    pub rev: u64,
+    pub tags: Vec<Tag>,
+    pub selected: Option<usize>,
+}
+
+/// 标签撤销栈的上限。标签是临时标注，没必要无限长；拖控制杆时一帧一格，封顶更安全。
+pub const TAG_UNDO_MAX: usize = 200;
+
 /// 正在跟随鼠标拉长的**标签草稿**（中轴上按 `R` 起稿，与 hold 同一套跟随手势）。
 #[derive(Clone, Copy, Debug)]
 pub struct PendingTag {
@@ -1590,6 +1604,13 @@ pub struct EditorState {
     pub tags: Vec<Tag>,
     /// 选中的标签（属性编辑器改颜色用）
     pub selected_tag: Option<usize>,
+    /// **标签自己的撤销栈**。标签不进文档 ⇒ 也进不了 `EditCore` 的撤销栈，
+    /// 所以它得有一份自己的；`Ctrl+Z` 先问它（见 `EditorState::undo_tag`）。
+    pub tag_undo: Vec<TagUndo>,
+    pub tag_redo: Vec<TagUndo>,
+    /// **文档 revision 的影子**：App 每帧把它抄进来。用途只有一个 ——
+    /// 判断"上一次标签改动之后，文档有没有被别人动过"（动过就把标签栈作废）。
+    pub core_revision: u64,
     /// 演奏区**实例构建窗口**（秒）：以播放头为基准往后看 `lookahead` 秒的**音符**才会被送进
     /// 渲染管线。
     ///
@@ -1672,6 +1693,9 @@ impl EditorState {
             pending_tag: None,
             tags: Vec::new(),
             selected_tag: None,
+            tag_undo: Vec::new(),
+            tag_redo: Vec::new(),
+            core_revision: 0,
             lookahead: 2.0,
             show_boundary: true,
             line_half_w: RPE_LINE_HALF_W, // = 3000 的一半
@@ -1927,31 +1951,145 @@ impl EditorState {
         self.pending_tag.take()
     }
 
+    // ---- 标签自己的撤销栈（`Ctrl+Z` 先问它）----
+    //
+    // 为什么不能蹭文档的撤销栈：标签**压根不在文档里**（用户口径"不存储"）—— 它没有命令、
+    // 没有广播、没有 revision。硬塞进 `EditCore` 等于把它变成文档数据，与口径冲突。
+    // 所以它有一份平行的栈，**用 `core_revision` 与文档对齐次序**。
+
+    /// 任何**会改变标签表**的操作前调一次。存的是"改之前"的整表。
+    fn tag_checkpoint(&mut self) {
+        self.tag_undo.push(TagUndo {
+            rev: self.core_revision,
+            tags: self.tags.clone(),
+            selected: self.selected_tag,
+        });
+        if self.tag_undo.len() > TAG_UNDO_MAX {
+            self.tag_undo.remove(0);
+        }
+        // 新动作一发生，重做链就作废（与任何撤销栈同一条规矩）
+        self.tag_redo.clear();
+    }
+
+    /// **`Ctrl+Z` 先问这里**：撤销上一次标签改动。
+    ///
+    /// `rev` 守卫是这条路的**全部要害**：标签栈只在"文档自上次标签改动以来没被改过"时才算数。
+    /// 否则会出这种事 —— 用户改了一个音符（文档变了），再按 `Ctrl+Z`，跳过的却是那次音符改动、
+    /// 把很早以前的一个标签撤了。文档一动，标签栈就整体作废（返回 `false`，让给文档撤销）。
+    pub fn undo_tag(&mut self) -> bool {
+        let Some(top) = self.tag_undo.last() else {
+            return false;
+        };
+        if top.rev != self.core_revision {
+            // 文档在标签之后被改过 ⇒ 标签栈已经没有"紧接着的上一步"这层含义了
+            self.tag_undo.clear();
+            self.tag_redo.clear();
+            return false;
+        }
+        let e = self.tag_undo.pop().expect("刚看过 last");
+        self.tag_redo.push(TagUndo {
+            rev: self.core_revision,
+            tags: self.tags.clone(),
+            selected: self.selected_tag,
+        });
+        self.tags = e.tags;
+        self.selected_tag = e.selected;
+        true
+    }
+
+    /// 重做一次标签改动（`Ctrl+Shift+Z`）
+    pub fn redo_tag(&mut self) -> bool {
+        let Some(top) = self.tag_redo.last() else {
+            return false;
+        };
+        if top.rev != self.core_revision {
+            self.tag_redo.clear();
+            return false;
+        }
+        let e = self.tag_redo.pop().expect("刚看过 last");
+        self.tag_undo.push(TagUndo {
+            rev: self.core_revision,
+            tags: self.tags.clone(),
+            selected: self.selected_tag,
+        });
+        self.tags = e.tags;
+        self.selected_tag = e.selected;
+        true
+    }
+
     /// 落一个标签，返回它的下标。**来源与颜色由调用方给**（GUI 起稿是 `Gui`，
     /// 控制通道那条路带 `cli` + 自定义色）。返回下标是为了让调用方顺手选中它。
     pub fn add_tag(&mut self, start: f64, end: f64, source: TagSource, color: [u8; 3]) -> usize {
+        self.tag_checkpoint();
         let (a, b) = span_of(start, end);
         self.tags.push(Tag { start: a, end: b, source, color });
         self.tags.len() - 1
     }
 
-    /// 删掉一个标签（`D` 键 / 控制通道）。删完把选中项失效掉 ——
+    /// 删掉一个标签（`D` 键 / 删除控制杆 / 控制通道）。删完把选中项失效掉 ——
     /// 否则 `selected_tag` 会指到别人身上（下标整体前移）。
     pub fn delete_tag(&mut self, index: usize) -> bool {
         if index >= self.tags.len() {
             return false;
         }
+        self.tag_checkpoint();
         self.tags.remove(index);
         self.selected_tag = None;
         true
     }
 
-    /// 清空全部标签（控制通道 `{"op":"tag","action":"clear"}`）
+    /// 清空全部标签（控制通道 `{"action":"clear"}`）
     pub fn clear_tags(&mut self) -> usize {
+        if self.tags.is_empty() {
+            return 0;
+        }
+        self.tag_checkpoint();
         let n = self.tags.len();
         self.tags.clear();
         self.selected_tag = None;
         n
+    }
+
+    /// 改一个标签的颜色。返回"真的改了吗"（值没变就不该占一格撤销）。
+    pub fn set_tag_color(&mut self, index: usize, color: [u8; 3]) -> bool {
+        match self.tags.get(index) {
+            Some(t) if t.color != color => {
+                self.tag_checkpoint();
+                self.tags[index].color = color;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 改一个标签的起止（属性编辑器那两个输入框）。**自己开一格撤销**。
+    pub fn set_tag_span(&mut self, index: usize, a: f64, b: f64) -> bool {
+        let Some(t) = self.tags.get(index) else { return false };
+        let (s0, s1) = span_of(a, b);
+        if (t.start - s0).abs() < 1e-9 && (t.end - s1).abs() < 1e-9 {
+            return false;
+        }
+        self.tag_checkpoint();
+        let t = &mut self.tags[index];
+        t.start = s0;
+        t.end = s1;
+        true
+    }
+
+    /// 拖控制杆改端点（**每帧都调，所以它自己不 checkpoint**）。
+    ///
+    /// 一格撤销由拖动**开始时**的 [`Self::begin_tag_drag`] 负责 ——
+    /// 每帧各开一格的话，拖一次会塞满整个撤销栈（用户按一次 `Ctrl+Z` 只退回一帧的长度）。
+    pub fn resize_tag(&mut self, index: usize, edge: EventEdge, beat: f64) {
+        let snapped = self.snap_beat(beat).max(0.0);
+        if let Some(t) = self.tags.get_mut(index) {
+            resize_span(&mut t.start, &mut t.end, edge, snapped, TAG_MIN_BEATS);
+        }
+    }
+
+    /// 拖控制杆**开始**：开一格撤销（整段拖拽 = 一次撤销）
+    pub fn begin_tag_drag(&mut self) {
+        self.tag_checkpoint();
     }
 
     pub fn follow_pending_event(&mut self, beat: f64) {
@@ -3610,5 +3748,82 @@ mod tag_tests {
         }
         assert_eq!(TagSource::of_key("用户"), None);
         assert_ne!(TagSource::Gui.default_color(), TagSource::Cli.default_color());
+    }
+}
+
+#[cfg(test)]
+mod tag_undo_tests {
+    use super::*;
+
+    fn st(rev: u64) -> EditorState {
+        let mut s = EditorState::new(crate::state::chart_from_doc(&crate::doc::Document::default()));
+        s.core_revision = rev;
+        s
+    }
+
+    /// 标签有**自己的**撤销栈：加/删/改色/改跨度都能 `Ctrl+Z` 回去，再 `Ctrl+Shift+Z` 回来。
+    #[test]
+    fn tag_edits_undo_and_redo() {
+        let mut s = st(7);
+        s.add_tag(1.0, 2.0, TagSource::Gui, [1, 1, 1]);
+        s.add_tag(3.0, 4.0, TagSource::Cli, [2, 2, 2]);
+        assert_eq!(s.tags.len(), 2);
+        assert!(s.set_tag_color(1, [9, 9, 9]));
+        assert_eq!(s.tags[1].color, [9, 9, 9]);
+
+        assert!(s.undo_tag(), "撤销改色");
+        assert_eq!(s.tags[1].color, [2, 2, 2]);
+        assert!(s.undo_tag(), "撤销第二个标签");
+        assert_eq!(s.tags.len(), 1);
+        assert!(s.redo_tag(), "重做");
+        assert_eq!(s.tags.len(), 2);
+        assert_eq!(s.tags[1].color, [2, 2, 2], "重做回到加标签那一格的状态");
+
+        // 值没真的变 ⇒ 不占撤销格（`set_tag_color` 返回 false）
+        assert!(!s.set_tag_color(0, [1, 1, 1]));
+        assert!(!s.set_tag_span(0, 1.0, 2.0));
+        // 越界删不产生撤销格
+        let depth = s.tag_undo.len();
+        assert!(!s.delete_tag(99));
+        assert_eq!(s.tag_undo.len(), depth);
+    }
+
+    /// **revision 守卫**：这份栈只在"标签改完之后文档没被动过"时才算数。
+    ///
+    /// 没有它就会出这种事：用户改了一个音符（文档变了、文档撤销栈多了一格），再按 `Ctrl+Z`
+    /// —— 本该撤销那个音符，却跳过去撤了一个很早以前的标签。所以文档一动，标签栈整体作废。
+    #[test]
+    fn a_document_change_invalidates_the_tag_undo_stack() {
+        let mut s = st(7);
+        s.add_tag(1.0, 2.0, TagSource::Gui, [1, 1, 1]);
+        assert!(s.undo_tag(), "文档没动过 ⇒ 该撤标签");
+        assert!(s.redo_tag());
+
+        // 文档被改过（revision 前进）⇒ 标签栈作废，交还给文档撤销
+        s.core_revision = 8;
+        assert!(!s.undo_tag(), "文档动过之后不许再撤标签");
+        assert!(s.tag_undo.is_empty() && s.tag_redo.is_empty(), "作废要清干净");
+        // 之后新起的标签改动重新开始记
+        s.add_tag(5.0, 6.0, TagSource::Gui, [3, 3, 3]);
+        assert!(s.undo_tag(), "新改动之后又能撤了");
+    }
+
+    /// 拖动变形 = **一格撤销**：`begin_tag_drag` 开格，之后每帧的 `resize_tag` 不再开格。
+    ///
+    /// 不这么做的话，拖一次会塞满整个撤销栈 —— 用户按一次 `Ctrl+Z` 只退回一帧的长度。
+    #[test]
+    fn one_stretch_drag_is_one_undo_step() {
+        let mut s = st(3);
+        s.add_tag(2.0, 4.0, TagSource::Gui, [1, 1, 1]);
+        let depth = s.tag_undo.len();
+        s.begin_tag_drag();
+        assert_eq!(s.tag_undo.len(), depth + 1, "开始拖才开一格");
+        for b in [5.0, 6.0, 7.0, 8.0] {
+            s.resize_tag(0, EventEdge::End, b);
+        }
+        assert_eq!(s.tag_undo.len(), depth + 1, "拖的过程中不许再开格");
+        assert!(s.tags[0].end > 7.0);
+        assert!(s.undo_tag());
+        assert_eq!(s.tags[0].span(), (2.0, 4.0), "一格退回拖动之前");
     }
 }
