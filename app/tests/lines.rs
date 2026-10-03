@@ -666,18 +666,22 @@ fn line_length_is_an_editable_setting() {
     let n_after = inst2.iter().filter(|i| i.half()[1] < 20.0).count();
     assert_eq!(n_before, n_after, "改线长不该增减音符实例");
 }
-/// 编辑区叠加层的可见性规则：**自动播放中或按住 H 时隐藏**。
+/// 编辑区叠加层的可见性规则：**`H` = 翻转当前这一档**。
 ///
-/// 规则很窄，但正是容易在重构里被改坏的那种（"播放时也显示吧"会让预览看不干净）。
+/// 四格都要钉住 —— 这条规则很窄，但正是容易在重构里被改坏的那种。
+/// 尤其"播放中按住 H ⇒ **显示**"这一格：它是用户口径（2026-10-03）明确要的
+/// （"在播放时按住 H 可以重新显示编辑区，同时播放谱面"），
+/// 早先那条 `!playing && !h_held` 在这一格永远为假。
 #[test]
-fn overlay_hides_while_playing_or_holding_h() {
+fn holding_h_flips_the_overlay_visibility() {
     // 与 src/overlay.rs::overlay_visible 同一套规则
-    let f = |enabled: bool, playing: bool, h: bool| enabled && !playing && !h;
+    let f = |enabled: bool, playing: bool, h: bool| enabled && playing == h;
     assert!(f(true, false, false), "暂停且没按 H ⇒ 显示");
-    assert!(!f(true, true, false), "自动播放中 ⇒ 隐藏");
-    assert!(!f(true, false, true), "按住 H ⇒ 隐藏");
-    assert!(!f(true, true, true), "播放中按 H ⇒ 仍隐藏");
+    assert!(!f(true, false, true), "暂停时按住 H ⇒ 隐藏（想干净看一眼预览）");
+    assert!(!f(true, true, false), "播放中不按 H ⇒ 隐藏（预览要干净）");
+    assert!(f(true, true, true), "**播放中按住 H ⇒ 显示**，而且播放不停");
     assert!(!f(false, false, false), "用户在工具栏关掉 ⇒ 不显示");
+    assert!(!f(false, true, true), "工具栏关掉之后 H 也救不回来");
 }
 /// 编辑区滚轮：位移 → 拍增量的换算（含"向上滚 = 时间往后"与随缩放的步长）。
 ///

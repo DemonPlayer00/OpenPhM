@@ -85,7 +85,7 @@ cargo run --release -- --scale 1.5 --verify-align            # 分数缩放 + �
 
 参数：`--notes N` `--bench N` `--stress` `--scale F` `--idle-fps F` `--idle-seconds S` `--ws compose|timeline|perform|debug`
       `--fps-cap F` `--lookahead S` `--verify-align` `--width/--height`
-      `--doc FILE`（载入真实 opm 谱面）`--control [auto|PATH]`（开控制通道）`--verbose-updates`（每次广播/重建打一行）
+      `--doc FILE`（载入真实 opm 谱面）`--no-control`（关掉控制通道，**默认是开的**）`--verbose-updates`（每次广播/重建打一行）
       `--shot PATH --shot-frame N [--shot-exit]`（**应用自截屏**：与合成器无关，见下）
       `--audio FILE|off` `--autoplay` `--audio-offset-ms F`（音频见下一节）
 
@@ -306,6 +306,8 @@ OpenPhM | ▶ 播放 | ⏮ | demo-400 ♪ 400 | 📂 文件…
 
 演奏区是"游戏里会变成什么样"的唯一视图，而编辑要盯着数据 —— 所以编辑区**叠在预览上**，
 半透明，两边同时可见；不编辑时按 `H`（或一开始播放）就藏起来，预览立刻干净。
+**按住 `H` 是"翻转当前这一档"**（用户口径 2026-10-03："在播放时按住 H 可以重新显示编辑区，
+同时播放谱面"）：暂停时按住 = 藏起来看预览，**播放时按住 = 把它调回来边听边看**，播放不停。
 
 ```text
 ┌─────────────────────────── play_rect ───────────────────────────┐
@@ -565,8 +567,8 @@ opm-ctl --attach auto --cmd '{"op":"ui_stats"}'   # 读 tags / selected_tag 核�
 | 线档位（基准 = 一拍） | 每拍线 1.5px α170（正线）· 小节线 2.2px α215（略强）· 细分线 0.9px α110（细节但看得见）· 坐标分格线 0.9px α110 / 中线 1.3px α160；轴带每拍一个短刻度 |
 | 可见拍数（缩放） | **Ctrl+滚轮**（编辑区内）；工具栏 `可见 N 拍`；`--overlay-beats N`；CLI `{"op":"zoom","beats":N}` / `{"op":"zoom","factor":F}` |
 | 底板黑度（数据清晰度 vs 预览可见性） | 工具栏 `暗度` 拖动框（默认 **0.82**，越大越黑）；`--overlay-alpha F` |
-| 临时隐藏 | **按住 H**（放开即恢复；控制台输入时空格/H 都不触发） |
-| 播放时 | 自动隐藏（`ui_stats.overlay_visible` 可观察） |
+| 临时翻转 | **按住 H**（放开即恢复；控制台输入时空格/H 都不触发）。暂停时=隐藏，**播放时=显示** |
+| 播放时 | 自动隐藏 —— **按住 H 可以调回来，且播放不停**（`ui_stats.overlay_visible` 可观察） |
 
 无头出图（`render`）**不含**编辑区 —— 给 agent 的图里不该有编辑器 chrome。
 

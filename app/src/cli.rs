@@ -100,7 +100,13 @@ pub struct Args {
     pub idle_seconds: f64,
     pub ws: Option<Workspace>,
     pub doc: Option<String>,
-    /// 控制通道：`--control`（自动路径）或 `--control <path>`；不启用则不传该参数
+    /// 控制通道（**默认开启**）：`Some("auto")` = 自动路径，`Some(p)` = 指定路径，
+    /// `None` = 关掉（`--no-control`）。
+    ///
+    /// 用户口径 2026-10-03："让控制通道默认开启" —— 早先要显式写 `--control` 才有，
+    /// 而 agent 要改正在跑的那个进程**只有这一条路**（标签这类视图状态压根不落盘），
+    /// 忘了加参数就得重启编辑器、丢掉未保存的改动。socket 在 `$XDG_RUNTIME_DIR`
+    /// 且只有本用户可读写，默认开着不扩大暴露面。
     pub control: Option<String>,
     /// 每次广播与重建都打一行（排查"到底谁被更新了"用）
     pub verbose_updates: bool,
@@ -171,7 +177,7 @@ impl Default for Args {
             idle_seconds: 0.0,
             ws: None,
             doc: None,
-            control: None,
+            control: Some("auto".into()),
             verbose_updates: false,
             trace_startup: false,
             pos: None,
@@ -244,6 +250,9 @@ pub fn parse(argv: &[String]) -> Parsed {
                 }
             }
             "--doc" => a.doc = take(&mut i),
+            // 退出口：某些场合（CI 批量跑 bench、调试启动路径）不想要 socket。
+            // 与 `--control` 同一条链，**后写的赢**。
+            "--no-control" => a.control = None,
             "--control" => {
                 // 允许 `--control`（自动路径）或 `--control <path>`
                 let next = argv.get(i + 1).filter(|v| !v.starts_with('-')).cloned();
@@ -378,7 +387,8 @@ OpenPhM —— Phigros 谱面编辑器（GUI）
   --shot PATH           应用自截屏到 PATH（egui viewport 截图，与合成器无关）
   --shot-frame N        第几帧截（默认 30）
   --shot-exit           截完退出
-  --control [PATH]      开控制通道（不写路径 = 自动路径）
+  --control [PATH]      控制通道（**默认已开启**；不写路径 = 自动路径 `$XDG_RUNTIME_DIR/opm-<pid>.sock`）
+  --no-control          关掉控制通道（CI 批量跑、调启动路径时用）
   --idle-fps F          空闲重绘频率（默认 0 = 直接停下、不主动出帧；N>0 = 心跳，诊断用）
   --idle-seconds S      bench：活跃阶段后转空闲并测量 S 秒
   --bench N             跑 N 帧基准后打印报告
@@ -435,6 +445,22 @@ mod tests {
     }
 
     /// `--control` 两种写法：光杆 = 自动路径；带值 = 那个路径，且**不会**被当成多余的位置参数
+    #[test]
+    fn the_control_channel_is_on_by_default_and_can_be_turned_off() {
+        // 用户口径："让控制通道默认开启"
+        assert_eq!(parse_str(&[]).args.control.as_deref(), Some("auto"), "不写参数也该开");
+        assert_eq!(parse_str(&["--no-control"]).args.control, None, "退出口要管用");
+        // 后写的赢（两种顺序都试）
+        assert_eq!(
+            parse_str(&["--no-control", "--control", "/tmp/x.sock"]).args.control.as_deref(),
+            Some("/tmp/x.sock")
+        );
+        assert_eq!(
+            parse_str(&["--control", "/tmp/x.sock", "--no-control"]).args.control,
+            None
+        );
+    }
+
     #[test]
     fn control_accepts_bare_and_valued_forms() {
         assert_eq!(parse_str(&["--control"]).args.control.as_deref(), Some("auto"));

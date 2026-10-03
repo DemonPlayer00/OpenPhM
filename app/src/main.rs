@@ -729,6 +729,10 @@ fn main() -> eframe::Result<()> {
             }
             Err(e) => eprintln!("  控制通道启动失败: {e}"),
         }
+    } else {
+        // 默认是开的（用户口径），所以"没开"这件事要**说出来是哪来的** ——
+        // 否则 agent 找不到 socket 时会以为是程序坏了
+        println!("  控制通道          : 未启用（--no-control）");
     }
 
     trace.mark("音频（--audio/谱面 meta.audio：解码 + 开输出设备）");
