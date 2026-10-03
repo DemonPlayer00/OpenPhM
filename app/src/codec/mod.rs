@@ -547,9 +547,17 @@ pub fn detect(v: &Value) -> Option<Format> {
 pub fn to_document(v: Value) -> Result<(Document, Fidelity), String> {
     match detect(&v) {
         Some(Format::Opm) => {
-            let doc = Document::from_json(v)?;
-            let mut fid = Fidelity::new("opm", format!("v{}", doc.format_version));
-            fid.note("原生格式，无转换");
+            // 记**进来时**的版本：迁移是"读进来就发生"的，报告要说清楚"文件被改过了"
+            let was = v
+                .get("formatVersion")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1) as u32;
+            let (doc, migration) = Document::from_json_with_migration(v)?;
+            let mut fid = Fidelity::new("opm", format!("v{was}"));
+            match migration {
+                Some(m) => fid.note(format!("格式迁移到 v{}：{m}", doc.format_version)),
+                None => fid.note("原生格式，无转换"),
+            }
             Ok((doc, fid))
         }
         Some(Format::Rpe) => {

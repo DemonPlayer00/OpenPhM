@@ -945,3 +945,80 @@ fn a_negative_v1_alpha_migrates_to_zero_not_below() {
     assert_eq!(e.start_value.as_f64().unwrap(), 0.0, "负值夹到 0");
     assert!((e.end_value.as_f64().unwrap() - 255.0).abs() < 1e-9);
 }
+
+/// **迁移链的形状**：从最老的版本（v1）到当前版本，每一步都要有、且只能有一个。
+///
+/// 这条不变量比任何单步迁移都重要 —— 链上缺一步，那一版的文件就永远升不上来，
+/// 而且症状是"打开旧谱面时 alpha 全错 / 行为诡异"，**不是报错**。
+/// 加新格式版本时（`FORMAT_VERSION` +1 却忘了往 `MIGRATIONS` 追加）这条会先红。
+#[test]
+fn the_migration_chain_covers_every_version_without_gaps() {
+    use opm_app::doc::{FORMAT_VERSION, MIGRATIONS};
+
+    if FORMAT_VERSION > 1 {
+        assert!(!MIGRATIONS.is_empty(), "当前版本 > 1 就必须有迁移链");
+    }
+    let mut expect = 1_u32;
+    for m in MIGRATIONS {
+        assert_eq!(
+            m.from, expect,
+            "链上这一步应当是 v{expect} → v{}，实际写的是 v{} → v{}",
+            expect + 1,
+            m.from,
+            m.from + 1
+        );
+        assert!(!m.what.is_empty(), "每一步都要有一行话说明它做了什么");
+        expect += 1;
+    }
+    assert_eq!(
+        expect, FORMAT_VERSION,
+        "链必须**正好**铺到 FORMAT_VERSION：{expect} ≠ {FORMAT_VERSION}（少一步 = 旧文件升不上来）"
+    );
+}
+
+/// 链上缺一步时**拒绝载入**，不许"跳过这一版继续往上跑"。
+///
+/// 用一条**自己构造的空链**来制造缺口：真注册表里没有缺口（上面那条用例守着），
+/// 所以缺口这件事只能这样测 —— 而走链的逻辑必须与注册表解耦，否则这一条永远测不到。
+#[test]
+fn a_gap_in_the_chain_is_refused_not_skipped() {
+    use opm_app::doc::Migration;
+
+    // 注意：**绕开 `from_json`**（它一进来就迁移了），直接用 serde 反序列化拿到一份"v1 原始文档"
+    let mut doc: Document = serde_json::from_value(v1_doc_json()).expect("v1 应当能反序列化");
+    assert_eq!(doc.format_version, 1, "这条路不该迁移");
+
+    let empty: &[Migration] = &[];
+    let err = doc.migrate_with(empty).expect_err("没有 v1 → v2 的代码就该报错");
+    assert!(err.contains("迁移链断了"), "{err}");
+    assert!(err.contains("v1 → v2"), "错误里要指明缺的是哪一步：{err}");
+}
+
+/// 比本程序**更新**的 formatVersion 也拒绝载入 —— 硬读一个不认识的版本等于猜语义。
+#[test]
+fn a_newer_format_version_is_refused() {
+    let mut v = v1_doc_json();
+    v["formatVersion"] = json!(opm_app::doc::FORMAT_VERSION + 7);
+    let err = Document::from_json(v).expect_err("比本程序新的版本要拒绝");
+    assert!(err.contains("比本程序支持的"), "{err}");
+    assert!(err.contains("拒绝载入"), "{err}");
+}
+
+/// v1 的最小文档（只为迁移用例服务）：一条线、一条 alpha 事件。
+fn v1_doc_json() -> Value {
+    json!({
+        "format": "opm", "formatVersion": 1, "minClientCapability": 1, "extensions": [],
+        "meta": {"name": "v1", "composer": "", "charter": "", "illustrator": "",
+                 "difficulty": "IN", "level": "IN 1", "offsetMs": 0,
+                 "audio": null, "background": null},
+        "bpmList": [{"startBeat": {"n": 0, "d": 1}, "bpm": 120.0}],
+        "judgeLines": [{
+            "name": "L0", "bpmFactor": 1.0,
+            "layers": [{"alpha": [
+                {"startBeat": {"n": 0, "d": 1}, "endBeat": {"n": 8, "d": 1},
+                 "startValue": 1.0, "endValue": 0.5, "easing": "linear"}
+            ]}],
+            "notes": []
+        }]
+    })
+}

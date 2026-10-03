@@ -627,6 +627,53 @@ pub const FORMAT_VERSION: u32 = 2;
 /// `alpha` 的量纲上界（§3）。**线的事件与音符的字段共用它** —— 这是 v2 的要点。
 pub const ALPHA_MAX: f32 = 255.0;
 
+/// **一次相邻版本之间的迁移**：把 `format_version == from` 的文档升到 `from + 1`。
+///
+/// 为什么是"相邻版本"而不是"任意版本到最新"：这样每一步只需要认识**两个**版本，
+/// 加 v3 时不必回头改 v1 的代码 —— 一条链、每步只知道自己那一段。
+pub struct Migration {
+    /// 源版本：本步负责 `from → from + 1`
+    pub from: u32,
+    /// 这一步做了什么（一行话，进迁移报告）
+    pub what: &'static str,
+    /// 迁移本体；返回这一步的**细节**（改了多少处、怎么改的），进迁移报告
+    pub run: fn(&mut Document) -> String,
+}
+
+/// **迁移链**：每一项负责一步 `from → from + 1`。载入旧文件时从它的版本起依次跑，一路到
+/// [`FORMAT_VERSION`]。
+///
+/// **加新格式版本时只做两件事**：把 `FORMAT_VERSION` +1，往这个数组**追加**一项。
+/// 追加而不是修改 —— 已经发布出去的那一步必须保持原样，否则老文件会按新规则迁移。
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    what: "判定线 `alpha` 轨道 0~1 → 0~255",
+    run: migrate_v1_to_v2,
+}];
+
+/// v1 → v2：判定线 `alpha` 轨道的每个值 ×255（与 RPE、与音符的 alpha 同量纲）。
+///
+/// 为什么 ×255 是**无损**的：v1 的 alpha 只可能来自两个地方 —— 手写谱面（人写的就是 `k/255`，
+/// 如 `0.4`）或 RPE 导入（`RPE整数 / 255`）。两边都是 `k/255` 的形状，乘回去正好是那个整数
+/// （浮点误差在 `round` 之内）。反过来把 0~255 存成 0~1 才是有损的。
+fn migrate_v1_to_v2(doc: &mut Document) -> String {
+    let mut events = 0usize;
+    for line in &mut doc.judge_lines {
+        for layer in &mut line.layers {
+            for ev in &mut layer.alpha {
+                for v in [&mut ev.start_value, &mut ev.end_value] {
+                    if let Some(n) = v.as_f64() {
+                        // 负数（RPE 那条废弃的"连音符一起隐藏"）沿用 v1 时代的既有口径：夹到 0
+                        *v = json!((n * ALPHA_MAX as f64).clamp(0.0, ALPHA_MAX as f64));
+                    }
+                }
+                events += 1;
+            }
+        }
+    }
+    format!("{events} 条事件的起止值 ×255（无损）")
+}
+
 /// 按内容推导 `minClientCapability`（`spec/opm-format.md` §7）——**全工程唯一一份**。
 ///
 /// RPE 导入侧与遮蔽区命令都走它：两份实现迟早会在"加第 5 档"那天分家，
@@ -713,7 +760,9 @@ impl Document {
         v
     }
 
-    pub fn from_json(v: Value) -> Result<Self, String> {
+    /// 读文档，顺带把**迁移说明**交出来（`codec::to_document` 要把它写进保真度报告 ——
+    /// "文件被改过了"这件事不该只说给日志听）。
+    pub fn from_json_with_migration(v: Value) -> Result<(Self, Option<String>), String> {
         let obj = v.as_object().ok_or("根必须是对象")?;
         if obj.get("format").and_then(|f| f.as_str()) != Some("opm") {
             return Err(format!(
@@ -735,47 +784,62 @@ impl Document {
             "maskZones",
         ];
         doc.foreign = foreign_from(obj, &known);
-        doc.migrate_to_current();
-        Ok(doc)
+        let migration = doc
+            .migrate_to_current()
+            .map_err(|e| format!("格式迁移失败：{e}"))?;
+        Ok((doc, migration))
     }
 
-    /// **把载入的旧版本文档就地升到当前版本**；返回改了什么的说明（无需迁移时返回 `None`）。
-    ///
-    /// 目前只有一条迁移：**v1 → v2 的判定线 `alpha` 轨道 ×255**（0~1 → 0~255）。
-    ///
-    /// 为什么 ×255 是**无损**的：v1 的 alpha 只可能来自两个地方 —— 手写谱面（人写的就是
-    /// `k/255`，如 `0.4`）或 RPE 导入（`RPE整数 / 255`）。两边都是 `k/255` 的形状，
-    /// 乘回去正好是那个整数（浮点误差在 `round` 之内）。反过来把 0~255 存成 0~1 才是有损的。
-    ///
-    /// 幂等：靠 `format_version` 判断，升过一次就是 2，再读不会重复乘。
-    /// 迁移是**静默写回**的一部分（保存即 v2），但调用方应当把返回的说明报给用户
-    /// （`codec::to_document` 会把它写进保真度报告）——"文件被改过了"这件事不该只说给日志听。
-    pub fn migrate_to_current(&mut self) -> Option<String> {
-        if self.format_version >= FORMAT_VERSION {
-            return None;
-        }
-        let from = self.format_version;
+    /// 只要文档、不要迁移说明时用这个（不关心说明的调用点仍然是**同一条**实现）。
+    pub fn from_json(v: Value) -> Result<Self, String> {
+        Self::from_json_with_migration(v).map(|(doc, _)| doc)
+    }
 
-        // ---- v1 → v2：判定线 alpha 轨道 ×255 ----
-        let mut events = 0usize;
-        for line in &mut self.judge_lines {
-            for layer in &mut line.layers {
-                for ev in &mut layer.alpha {
-                    for v in [&mut ev.start_value, &mut ev.end_value] {
-                        if let Some(n) = v.as_f64() {
-                            // 负数（RPE 那条废弃的"连音符一起隐藏"）与 v1 的既有口径一致：夹到 0
-                            *v = json!((n * ALPHA_MAX as f64).clamp(0.0, ALPHA_MAX as f64));
-                        }
-                    }
-                    events += 1;
-                }
-            }
+    /// **把载入的旧版本文档就地升到当前版本**；返回每一步改了什么的说明（无需迁移时 `Ok(None)`）。
+    ///
+    /// 走的是 [`MIGRATIONS`] 那条**迁移链**：从文档自己的版本起，一步一个版本地往上跑，
+    /// 直到 [`FORMAT_VERSION`]。加新版本时**只往注册表里追加一步**，这里一个字都不用改。
+    ///
+    /// 两种拒绝（都不是"装作没事"）：
+    /// · **比本程序更新** ⇒ 拒绝载入。新版本可能有本程序不认识的语义，硬读等于猜。
+    /// · **链上缺一步** ⇒ 拒绝载入。只可能发生在注册表写漏了（下面的 `migration_chain_*` 用例守着）。
+    pub fn migrate_to_current(&mut self) -> Result<Option<String>, String> {
+        if self.format_version > FORMAT_VERSION {
+            return Err(format!(
+                "这份谱面的 formatVersion={} 比本程序支持的 {} 更新 —— 拒绝载入：                 新版本可能有本程序不认识的语义，硬读等于猜。请升级 OpenPhM。",
+                self.format_version, FORMAT_VERSION
+            ));
         }
+        let steps = self.migrate_with(MIGRATIONS)?;
+        if steps.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(steps.join("；")))
+    }
 
-        self.format_version = FORMAT_VERSION;
-        Some(format!(
-            "格式迁移 v{from} → v{FORMAT_VERSION}：判定线 `alpha` 轨道 {events} 条事件 ×255（0~1 → 0~255，无损）"
-        ))
+    /// 迁移链的**走法本体**（与注册表解耦，于是"链断了"这件事可以被单测构造出来）。
+    ///
+    /// 每一步成功后 `format_version` 就地 +1 ⇒ 幂等：升过的文档再读不会重复跑。
+    pub fn migrate_with(&mut self, chain: &[Migration]) -> Result<Vec<String>, String> {
+        let mut done: Vec<String> = Vec::new();
+        while self.format_version < FORMAT_VERSION {
+            let cur = self.format_version;
+            let Some(step) = chain.iter().find(|m| m.from == cur) else {
+                let done_txt = if done.is_empty() {
+                    "原地".to_owned()
+                } else {
+                    done.join("；")
+                };
+                return Err(format!(
+                    "迁移链断了：没有 v{cur} → v{} 的迁移代码。已完成的步骤：{done_txt}",
+                    cur + 1
+                ));
+            };
+            let detail = (step.run)(self);
+            self.format_version = cur + 1;
+            done.push(format!("v{cur} → v{}（{}）：{detail}", cur + 1, step.what));
+        }
+        Ok(done)
     }
 
     /// 谱面末尾：**音符、五条基础轨事件、七条遮蔽区通道事件取最大**，全文档取最大。

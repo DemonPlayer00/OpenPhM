@@ -6022,3 +6022,79 @@ RPE 文档写了线 alpha 管线的本体，没写击中效果归属谁；选"�
 
 > **量法备忘（踩过的坑）**：`opm-ctl ... | tail -1; echo $?` 拿到的是 `tail` 的退出码；
 > 读图前要确认取样点上没有别的东西（本批第一对 alpha 对照图挑在击中帧上，量出来方向是反的）。
+
+---
+
+## 7.100 版本迁移改成**链**：一步一版、依次跑、缺一步就拒绝载入（用户口径）（2026-10-03 第五批）
+
+用户口径："对旧版格式的变更保持以下策略：维护一个列表，都是从某一格式版本升级到下一个格式版本的代码，
+当读取一个旧格式时，从此格式版本开始依次运行升级代码，可以一路更新到最新格式。"
+
+### 7.100.1 之前是什么样：一个大函数 + 一次跳跃
+
+§7.99 里那版 `migrate_to_current` 长这样：
+
+```rust
+pub fn migrate_to_current(&mut self) -> Option<String> {
+    if self.format_version >= FORMAT_VERSION { return None; }
+    … // v1 → v2 的活，写死在这里
+    self.format_version = FORMAT_VERSION;   // ← 直接跳到目标版本
+    Some(...)
+}
+```
+
+只有一步时它是对的，但它**没有可扩展的形状**，而且有一处**会静默骗人**：
+`format_version` 被无条件写成 `FORMAT_VERSION`。等哪天加了 v3，这段代码会：
+跑完 v1→v2 的活 → **宣布自己是 v3**。旧文件于是"升上来了"，只是升错了版本 ——
+不报错、不警告，下一步的迁移永远不会跑。
+
+### 7.100.2 现在：注册表 + 走链器
+
+```rust
+pub struct Migration { pub from: u32, pub what: &'static str, pub run: fn(&mut Document) -> String }
+
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    what: "判定线 `alpha` 轨道 0~1 → 0~255",
+    run: migrate_v1_to_v2,
+}];
+```
+
+```text
+文件 v1 ──[ v1→v2 ]──▶ v2 ──[ v2→v3 ]──▶ v3 ──▶ … ──▶ 当前版本
+               从文件自己的版本起，一步一版地往上跑
+```
+
+- **一步只管相邻两版**（`from → from + 1`）⇒ 加 v3 时不必回头改 v1 那段代码。
+  已发布出去的那一步必须**保持原样**（改了老文件就按新规则迁移）⇒ 规矩是**追加，不修改**。
+- **加新版本 = 两件事**：`FORMAT_VERSION` +1；`MIGRATIONS` 追加一项。
+- 走链器 `migrate_with(&mut self, chain: &[Migration])` 与注册表**解耦** ——
+  于是"链断了"这件事可以被单测构造出来（注册表里没有缺口，缺口的逻辑就只能这样测）。
+- 每步成功后版本号**就地 +1** ⇒ 天然幂等。
+
+### 7.100.3 两种拒绝（都不装作没事）
+
+| 情况 | 处理 |
+|---|---|
+| `formatVersion` **比本程序新** | **拒绝载入**："新版本可能有本程序不认识的语义，硬读等于猜。请升级 OpenPhM。" |
+| **链上缺一步** | **拒绝载入**，错误里列出"已经跑完哪几步" |
+
+旧实现这两种情况都是"默默继续"。
+
+### 7.100.4 证据
+
+- **链的形状**有用例守着：`the_migration_chain_covers_every_version_without_gaps`
+  要求链从 v1 起、`from` 严格递增 1、`what` 非空、且**正好**铺到 `FORMAT_VERSION`。
+- **红/绿**：把 `FORMAT_VERSION` 临时提到 3、**不**加 v2→v3 那一步（这正是"忘了追加迁移代码"的真实场景）：
+  · `the_migration_chain_covers_every_version_without_gaps` 红：
+    `链必须**正好**铺到 FORMAT_VERSION：2 ≠ 3（少一步 = 旧文件升不上来）`；
+  · 载入一份 v1 文件被**拒绝**，错误是
+    `迁移链断了：没有 v2 → v3 的迁移代码。已完成的步骤：v1 → v2（判定线 alpha 轨道 0~1 → 0~255）：2 条事件的起止值 ×255（无损）`
+    —— **不是**旧实现那样"跑一步、宣布自己是 v3"。
+- **端到端**：造一份 v1 文件走 `opm-ctl convert`，保真度报告里出现
+  `格式迁移到 v2：v1 → v2（…）：1 条事件的起止值 ×255（无损）`；产物 `formatVersion: 2`、`alpha: 255`。
+  （`from_json` 因此拆成 `from_json_with_migration`（交出说明）与 `from_json`（丢弃说明）两入口，
+  实现仍然只有一份；`codec::to_document` 用前者把说明写进保真度报告 —— "文件被改过了"不该只说给日志听。）
+
+验收：**463 测试**（+3 链用例）0 失败；四配置 + test-profile 0 警告；规范 §2.3 补上机制说明与
+"加新版本只做两件事"的操作规程。
