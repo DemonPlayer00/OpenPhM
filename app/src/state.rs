@@ -1217,6 +1217,102 @@ impl PendingEvent {
     }
 }
 
+/// 标签的**来源** —— 中轴上的**两列**就是按它分的。
+///
+/// 用户口径 2026-10-03："蓝色标签代表从 gui 设置的标签，黄色标签代表从 cli 加入的标签
+/// （分开 agent 和用户）" → "只留两列标注来源是 gui 还是 cli"。
+/// 注意**来源只管"在哪一列"，不管颜色**：颜色是标签自己的属性，可以逐个改。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagSource {
+    /// 界面上按 `R` 起的（人）
+    Gui,
+    /// 控制通道 `{"op":"tag",…}` 加的（agent / 脚本）
+    Cli,
+}
+
+impl TagSource {
+    pub fn key(self) -> &'static str {
+        match self {
+            TagSource::Gui => "gui",
+            TagSource::Cli => "cli",
+        }
+    }
+    pub fn of_key(k: &str) -> Option<Self> {
+        match k {
+            "gui" => Some(TagSource::Gui),
+            "cli" => Some(TagSource::Cli),
+            _ => None,
+        }
+    }
+    /// 默认色：GUI 蓝、CLI 黄（用户最初的口径）。只是**默认**，可以改。
+    pub fn default_color(self) -> [u8; 3] {
+        match self {
+            TagSource::Gui => [96, 160, 255],
+            TagSource::Cli => [240, 196, 96],
+        }
+    }
+}
+
+/// **中轴上的一个标签**：一段拍区间 + 来源 + 颜色。
+///
+/// **视图状态，不进文档**（用户口径："不存储"）—— 它与播放头、选中项、网格同一层：
+/// 换个谱面就清空（"第 12 拍"这种坐标只对某一份谱面有意义），进程退出即消失。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tag {
+    pub start: f64,
+    pub end: f64,
+    pub source: TagSource,
+    /// 标签自己的颜色（0~255）。来源只决定它落在**哪一列**，不决定颜色。
+    pub color: [u8; 3],
+}
+
+/// 标签的最短长度（拍）。拉长不能拉成 0 —— 那样就点不着了。
+pub const TAG_MIN_BEATS: f64 = 0.25;
+
+/// 把一对端点整理成"起点 ≤ 终点"（标签与草稿共用）
+pub fn tag_span_of(a: f64, b: f64) -> (f64, f64) {
+    span_of(a, b)
+}
+
+impl Tag {
+    pub fn span(&self) -> (f64, f64) {
+        span_of(self.start, self.end)
+    }
+    pub fn len(&self) -> f64 {
+        (self.end - self.start).abs()
+    }
+}
+
+/// 正在跟随鼠标拉长的**标签草稿**（中轴上按 `R` 起稿，与 hold 同一套跟随手势）。
+#[derive(Clone, Copy, Debug)]
+pub struct PendingTag {
+    pub start: f64,
+    pub end: f64,
+    pub source: TagSource,
+    pub color: [u8; 3],
+}
+
+impl PendingTag {
+    pub fn new(start_beat: f64, source: TagSource) -> Self {
+        Self {
+            start: start_beat,
+            end: start_beat + TAG_MIN_BEATS,
+            source,
+            color: source.default_color(),
+        }
+    }
+    /// 鼠标移动 ⇒ 终点跟着走（吸附在调用方做过）
+    pub fn follow(&mut self, beat: f64) {
+        follow_span(&mut self.start, &mut self.end, beat, TAG_MIN_BEATS);
+    }
+    pub fn span(&self) -> (f64, f64) {
+        span_of(self.start, self.end)
+    }
+    pub fn len(&self) -> f64 {
+        (self.end - self.start).abs()
+    }
+}
+
 /// 遮蔽区编辑模式下**正在跟随鼠标的事件块草稿**（按 R 起稿）。
 ///
 /// 与 [`PendingEvent`] 是同一条手势的两种数据源，差别只有两点，都是格式带来的：
@@ -1485,6 +1581,15 @@ pub struct EditorState {
     /// 与 `pending_event` 是同一套手势的两种数据源（判定线轨道 / 遮蔽区通道）——
     /// 用户口径 2026-10-02："创建流程应与普通编辑模式下的事件块放置一样"。
     pub pending_mask: Option<PendingMaskEvent>,
+    /// 正在跟随鼠标拉长的**标签草稿**（中轴上按 `R` 起稿）
+    pub pending_tag: Option<PendingTag>,
+    /// **中轴上的标签**（视图状态，不进文档；见 [`Tag`]）。
+    ///
+    /// 无序：命中测试按"指针落在哪个矩形里"走，不依赖排序。**换谱面即清空**
+    /// （`EditorState::new` 重新构造 ⇒ 天然清空，不需要另写一处清理）。
+    pub tags: Vec<Tag>,
+    /// 选中的标签（属性编辑器改颜色用）
+    pub selected_tag: Option<usize>,
     /// 演奏区**实例构建窗口**（秒）：以播放头为基准往后看 `lookahead` 秒的**音符**才会被送进
     /// 渲染管线。
     ///
@@ -1564,6 +1669,9 @@ impl EditorState {
             pending_hold: None,
             pending_event: None,
             pending_mask: None,
+            pending_tag: None,
+            tags: Vec::new(),
+            selected_tag: None,
             lookahead: 2.0,
             show_boundary: true,
             line_half_w: RPE_LINE_HALF_W, // = 3000 的一半
@@ -1785,6 +1893,67 @@ impl EditorState {
     }
 
     /// 鼠标移动 ⇒ 哪个草稿在跟随就改哪个的长度
+    // ---- 中轴标签（视图状态，不进文档）----
+
+    /// 在中轴上起一个标签草稿（指针在轴带里按 `R`）。
+    ///
+    /// 与另外三种草稿**互斥**：起标签就把别的草稿收掉（同一时刻只放一个东西）。
+    pub fn begin_pending_tag(&mut self, start_beat: f64) {
+        self.pending_hold = None;
+        self.pending_event = None;
+        self.pending_mask = None;
+        self.pending_tag = Some(PendingTag::new(start_beat.max(0.0), TagSource::Gui));
+    }
+
+    /// 鼠标移动 ⇒ 标签草稿的终点跟着走（吸附由调用方做）
+    pub fn follow_pending_tag(&mut self, beat: f64) {
+        // 吸附在**外边**算好再借可变引用：`snap_beat` 也要 `&self`，同一句里借两次编译器不让过
+        let snapped = self.snap_beat(beat).max(0.0);
+        if let Some(d) = self.pending_tag.as_mut() {
+            d.follow(snapped);
+        }
+    }
+
+    /// 拖标签草稿的控制杆（与 hold 同一套手势：`draft_gesture` 共用）
+    pub fn resize_pending_tag(&mut self, edge: EventEdge, beat: f64) {
+        let snapped = self.snap_beat(beat).max(0.0);
+        if let Some(d) = self.pending_tag.as_mut() {
+            resize_span(&mut d.start, &mut d.end, edge, snapped, TAG_MIN_BEATS);
+        }
+    }
+
+    /// 取走标签草稿（提交用）
+    pub fn take_pending_tag(&mut self) -> Option<PendingTag> {
+        self.pending_tag.take()
+    }
+
+    /// 落一个标签，返回它的下标。**来源与颜色由调用方给**（GUI 起稿是 `Gui`，
+    /// 控制通道那条路带 `cli` + 自定义色）。返回下标是为了让调用方顺手选中它。
+    pub fn add_tag(&mut self, start: f64, end: f64, source: TagSource, color: [u8; 3]) -> usize {
+        let (a, b) = span_of(start, end);
+        self.tags.push(Tag { start: a, end: b, source, color });
+        self.tags.len() - 1
+    }
+
+    /// 删掉一个标签（`D` 键 / 控制通道）。删完把选中项失效掉 ——
+    /// 否则 `selected_tag` 会指到别人身上（下标整体前移）。
+    pub fn delete_tag(&mut self, index: usize) -> bool {
+        if index >= self.tags.len() {
+            return false;
+        }
+        self.tags.remove(index);
+        self.selected_tag = None;
+        true
+    }
+
+    /// 清空全部标签（控制通道 `{"op":"tag","action":"clear"}`）
+    pub fn clear_tags(&mut self) -> usize {
+        let n = self.tags.len();
+        self.tags.clear();
+        self.selected_tag = None;
+        n
+    }
+
     pub fn follow_pending_event(&mut self, beat: f64) {
         let step = self.beat_step();
         if let Some(e) = self.pending_event.as_mut() {
@@ -1921,6 +2090,7 @@ impl EditorState {
         self.pending_hold.is_some()
             || self.pending_event.is_some()
             || self.pending_mask.is_some()
+            || self.pending_tag.is_some()
     }
 
     /// 取消任何草稿（Esc / 左键放下时都会走到这里）
@@ -1928,6 +2098,7 @@ impl EditorState {
         self.pending_hold = None;
         self.pending_event = None;
         self.pending_mask = None;
+        self.pending_tag = None;
     }
 
     /// 鼠标移动 ⇒ 改**当前那个**草稿的长度。
@@ -1936,7 +2107,11 @@ impl EditorState {
     /// 让调用方自己判"现在是哪个草稿"正是这个 bug 的来源：加遮蔽区草稿时漏了一支，
     /// 表现是"按 R 能起稿、鼠标却不动长度"—— 而且不报错，因为那一支静默落到了 hold 上。
     pub fn follow_pending(&mut self, beat: f64) {
-        if self.pending_mask.is_some() {
+        // ⚠️ 加新草稿**必须在这里加一支**：漏掉的表现是"按键能起稿、鼠标却不动长度"，
+        // 而且不报错（静默落到 else 那一支上）—— 遮蔽区草稿就踩过一次。
+        if self.pending_tag.is_some() {
+            self.follow_pending_tag(beat);
+        } else if self.pending_mask.is_some() {
             self.follow_pending_mask(beat);
         } else if self.pending_event.is_some() {
             self.follow_pending_event(beat);
@@ -1947,7 +2122,9 @@ impl EditorState {
 
     /// 拖草稿的控制杆 ⇒ 改当前那个草稿的起点/终点（同 [`Self::follow_pending`]）
     pub fn resize_pending(&mut self, edge: EventEdge, beat: f64) {
-        if self.pending_mask.is_some() {
+        if self.pending_tag.is_some() {
+            self.resize_pending_tag(edge, beat);
+        } else if self.pending_mask.is_some() {
             self.resize_pending_mask(edge, beat);
         } else if self.pending_event.is_some() {
             self.resize_pending_event(edge, beat);
@@ -3361,5 +3538,77 @@ mod mask_draft_tests {
         let want = st2.beat_at_grid(st2.snap_beat(st2.chart.tmap.beat(st2.playhead)).max(0.0));
         assert_eq!(st2.mask_new_zone_start(), want);
         assert!(want > crate::doc::Beat::zero());
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    fn st() -> EditorState {
+        EditorState::new(crate::state::chart_from_doc(&crate::doc::Document::default()))
+    }
+
+    /// 标签是**视图状态**：加/删/清都在 `EditorState` 上，一个文档命令都不发。
+    #[test]
+    fn tags_live_in_the_view_state_and_can_be_added_deleted_cleared() {
+        let mut s = st();
+        assert!(s.tags.is_empty());
+        let i = s.add_tag(4.0, 8.0, TagSource::Cli, TagSource::Cli.default_color());
+        assert_eq!(i, 0);
+        assert_eq!(s.tags.len(), 1);
+        assert_eq!(s.tags[0].source, TagSource::Cli);
+        assert_eq!(s.tags[0].span(), (4.0, 8.0));
+        // 反向跨度也存成"起点 ≤ 终点"
+        s.add_tag(20.0, 12.0, TagSource::Gui, TagSource::Gui.default_color());
+        assert_eq!(s.tags[1].span(), (12.0, 20.0));
+        // 删一个要把选中项失效掉：否则 `selected_tag` 会指到别人身上（下标整体前移）
+        s.selected_tag = Some(1);
+        assert!(s.delete_tag(0));
+        assert_eq!(s.selected_tag, None);
+        assert_eq!(s.tags.len(), 1);
+        assert!(!s.delete_tag(99), "越界删要返回 false 而不是 panic");
+        assert_eq!(s.clear_tags(), 1);
+        assert!(s.tags.is_empty());
+    }
+
+    /// 起稿 → 跟随：**长度真的跟着鼠标走**，并且有最短长度保底。
+    ///
+    /// 这条守的是一个真踩过的坑（遮蔽区草稿）：`follow_pending` 里漏掉一支时，
+    /// 表现是"按 R 能起稿、鼠标却不动长度"，而且**不报错**。
+    #[test]
+    fn a_tag_draft_follows_the_mouse_and_keeps_a_minimum_length() {
+        let mut s = st();
+        s.begin_pending_tag(4.0);
+        assert!(s.drafting(), "起了草稿就该算 drafting（否则左键变成点选而不是放下）");
+        assert_eq!(s.pending_tag.map(|t| t.span()), Some((4.0, 4.0 + TAG_MIN_BEATS)));
+
+        s.follow_pending(10.0);
+        let sp = s.pending_tag.expect("草稿还在").span();
+        assert!(sp.1 > 9.0, "跟随之后长度要真的变长，实际 {sp:?}");
+
+        // 拖回起点附近 ⇒ 保底到最短长度，而不是塌成 0（塌了就点不着、也看不见）
+        s.follow_pending(4.0);
+        let sp = s.pending_tag.expect("草稿还在").span();
+        assert!(
+            (sp.1 - sp.0 - TAG_MIN_BEATS).abs() < 1e-9,
+            "应保底到 {TAG_MIN_BEATS} 拍，实际 {sp:?}"
+        );
+
+        // 起标签草稿要收掉别的草稿（同一时刻只放一个东西）
+        s.pending_hold = Some(PendingHold::new(100.0, 1.0, 1.0));
+        s.begin_pending_tag(6.0);
+        assert!(s.pending_hold.is_none(), "起标签草稿要收掉 hold 草稿");
+        assert!(s.pending_tag.is_some());
+    }
+
+    /// 来源 ↔ 字符串（控制通道与 `ui_stats` 都按这个键读写）
+    #[test]
+    fn tag_source_keys_round_trip() {
+        for s in [TagSource::Gui, TagSource::Cli] {
+            assert_eq!(TagSource::of_key(s.key()), Some(s));
+        }
+        assert_eq!(TagSource::of_key("用户"), None);
+        assert_ne!(TagSource::Gui.default_color(), TagSource::Cli.default_color());
     }
 }

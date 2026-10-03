@@ -75,6 +75,22 @@ pub struct Inspector {
     pub track_value: Option<f64>,
     pub event: Option<EventView>,
     pub note: Option<NoteView>,
+    /// **中轴标签**（视图状态，不进文档）：选中项的起止与颜色。
+    ///
+    /// 它出现在检查器里这件事本身是有意的 —— 标签唯一的"可编辑属性"就是颜色，
+    /// 而用户口径把改颜色的入口定在这里（"选中标签后，在右侧属性编辑器里改"）。
+    pub tag_edit: Option<TagEdit>,
+}
+
+/// 标签的可编辑快照（视图状态，不是文档数据）
+#[derive(Clone, Copy, Debug)]
+pub struct TagEdit {
+    pub index: usize,
+    pub start: f64,
+    pub end: f64,
+    /// `"gui"` / `"cli"` —— 只读显示用（来源由"在哪一列"决定，改不了）
+    pub source: &'static str,
+    pub color: [u8; 3],
 }
 
 /// 重叠组里的一行（属性编辑器那份列表用）
@@ -224,6 +240,20 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
             width_scale: d.width_scale,
             y_offset: d.y_offset,
         });
+    // 中轴标签：选中了才有（视图状态，直接取自 `EditorState`）
+    let tag_edit = st.selected_tag.and_then(|i| {
+        st.tags.get(i).map(|t| {
+            let (a, b) = t.span();
+            TagEdit {
+                index: i,
+                start: a,
+                end: b,
+                source: t.source.key(),
+                color: t.color,
+            }
+        })
+    });
+
     // 「就位目标」的草稿初值 = **选中事件块末**那一刻的线状态（不是播放头那一刻：
     // 那一组说的就是"块末就位"，初值给播放头会让人以为改的是别处）
     let target = event_edit_end_beat(&event)
@@ -265,6 +295,7 @@ pub fn inspector_of(st: &EditorState, doc: &Document) -> Option<Inspector> {
             .and_then(|_| perf::track_value(&track.events, st.chart.tmap.beat(st.playhead), &st.chart.tmap)),
         event,
         note,
+        tag_edit,
     })
 }
 

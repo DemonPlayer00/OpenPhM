@@ -52,6 +52,17 @@ pub fn no_waker() -> RepaintWaker {
 ///
 /// 粒度是**判定线**：`builds_notes`/`builds_tracks`/`builds_props` 计的是"重建了几条线的这一部分"，
 /// 所以"改 3 号线的音符"只让 `builds_notes` +1，其余线与其他面板一帧都不参与。
+/// `ui_stats.tags` 里的一项（**视图状态**，不是文档数据）
+#[derive(Clone, Debug, Serialize)]
+pub struct TagStat {
+    pub index: usize,
+    /// `"gui"`（界面按 R 起的）/ `"cli"`（控制通道加的）—— 决定它在中轴上的**列**
+    pub source: &'static str,
+    pub start: f64,
+    pub end: f64,
+    pub color: [u8; 3],
+}
+
 #[derive(Clone, Default, Serialize)]
 pub struct UiStats {
     pub frames: u64,
@@ -128,6 +139,12 @@ pub struct UiStats {
     /// 最近一次唤醒请求时刻（不序列化，仅在进程内传递）
     #[serde(skip)]
     pub wake_at: Option<Instant>,
+    /// **中轴标签**（视图状态，不进文档）：agent 写完 `{"op":"tag",…}` 靠它核实。
+    ///
+    /// 放进来是有意的 —— "不存储"意味着它没有任何文件痕迹，**不从这里读就没有第二条核实路径**。
+    pub tags: Vec<TagStat>,
+    /// 当前选中的标签下标（`null` = 没选）
+    pub selected_tag: Option<usize>,
 }
 
 pub type UiStatsHandle = Arc<Mutex<UiStats>>;
@@ -187,8 +204,31 @@ pub enum ViewCmd {
         channel: Option<String>,
         zone_event: Option<usize>,
     },
+    /// **中轴标签**（视图状态，不进文档 —— 用户口径"不存储"）。
+    ///
+    /// 一条命令管四种动作，因为它们共享同一批参数、而且是同一件事的几个面：
+    /// `add`（加一个，来源默认 `cli`）、`del`（按下标删）、`clear`（全清）、
+    /// `select`（选中某个，属性编辑器据此显示颜色）。
+    Tag(TagCmd),
     LoadAudio(String),
     SetOffsetMs(f64),
+}
+
+/// 控制通道的标签动作
+#[derive(Clone, Debug)]
+pub enum TagCmd {
+    Add {
+        start: f64,
+        end: f64,
+        color: Option<[u8; 3]>,
+    },
+    Del {
+        index: usize,
+    },
+    Clear,
+    Select {
+        index: Option<usize>,
+    },
 }
 
 pub type ViewQueue = Arc<Mutex<VecDeque<ViewCmd>>>;
@@ -250,6 +290,30 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
             channel: v.get("channel").and_then(|x| x.as_str()).map(|x| x.to_owned()),
             zone_event: v.get("zoneEvent").and_then(|x| x.as_u64()).map(|x| x as usize),
         }),
+        "tag" => {
+            let idx = v.get("index").and_then(|x| x.as_u64()).map(|x| x as usize);
+            match v.get("action").and_then(|x| x.as_str()).unwrap_or("add") {
+                "add" => Some(ViewCmd::Tag(TagCmd::Add {
+                    start: v.get("start").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    end: v.get("end").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    // 颜色缺省 = 该来源的默认色（CLI 黄）；写歪了就当没写
+                    color: v.get("color").and_then(|x| x.as_array()).and_then(|a| {
+                        if a.len() < 3 {
+                            return None;
+                        }
+                        let mut c = [0u8; 3];
+                        for (i, x) in a.iter().take(3).enumerate() {
+                            c[i] = x.as_u64()?.min(255) as u8;
+                        }
+                        Some(c)
+                    }),
+                })),
+                "del" => idx.map(|index| ViewCmd::Tag(TagCmd::Del { index })),
+                "clear" => Some(ViewCmd::Tag(TagCmd::Clear)),
+                "select" => Some(ViewCmd::Tag(TagCmd::Select { index: idx })),
+                _ => None,
+            }
+        }
         "nudge" => Some(ViewCmd::NudgeBeats(
             v.get("beats").and_then(|x| x.as_f64()).unwrap_or(0.0),
         )),
@@ -597,4 +661,54 @@ pub fn attach(
 /// 供 GUI 侧调用：把控制通道状态拼成一行摘要
 pub fn describe(path: &Path, name: &str) -> String {
     format!("控制通道 {name} → {}（opm-ctl --attach {}）", path.display(), path.display())
+}
+
+#[cfg(test)]
+mod tag_cmd_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 控制通道的标签命令：四个动作都要认，参数写歪了要**落回安全值**而不是整条命令没反应。
+    #[test]
+    fn the_tag_view_command_parses_all_four_actions() {
+        match parse_view_cmd(&json!({"op": "tag", "action": "add", "start": 4.0, "end": 8.0})) {
+            Some(ViewCmd::Tag(TagCmd::Add { start, end, color })) => {
+                assert_eq!((start, end), (4.0, 8.0));
+                assert_eq!(color, None, "不写颜色 ⇒ 用该来源的默认色（由调用方补）");
+            }
+            other => panic!("add 没解析出来：{other:?}"),
+        }
+        match parse_view_cmd(&json!({"op": "tag", "action": "add", "start": 1.0,
+                                     "color": [10, 20, 300]})) {
+            Some(ViewCmd::Tag(TagCmd::Add { color, .. })) => {
+                assert_eq!(color, Some([10, 20, 255]), "颜色要夹到 0~255")
+            }
+            other => panic!("带颜色的 add 没解析出来：{other:?}"),
+        }
+        // 颜色数组长度不够 ⇒ 当没写（而不是补 0 变成黑）
+        match parse_view_cmd(&json!({"op": "tag", "action": "add", "color": [1]})) {
+            Some(ViewCmd::Tag(TagCmd::Add { color, .. })) => assert_eq!(color, None),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_view_cmd(&json!({"op": "tag", "action": "del", "index": 2})),
+            Some(ViewCmd::Tag(TagCmd::Del { index: 2 }))
+        ));
+        assert!(matches!(
+            parse_view_cmd(&json!({"op": "tag", "action": "clear"})),
+            Some(ViewCmd::Tag(TagCmd::Clear))
+        ));
+        assert!(matches!(
+            parse_view_cmd(&json!({"op": "tag", "action": "select", "index": 1})),
+            Some(ViewCmd::Tag(TagCmd::Select { index: Some(1) }))
+        ));
+        assert!(matches!(
+            parse_view_cmd(&json!({"op": "tag", "action": "select"})),
+            Some(ViewCmd::Tag(TagCmd::Select { index: None }))
+        ));
+        // del 不给下标 ⇒ 不是命令（`None` 会让它落到 EditCore，由那边报"未知 op"）
+        assert!(parse_view_cmd(&json!({"op": "tag", "action": "del"})).is_none());
+        // 未知动作同理
+        assert!(parse_view_cmd(&json!({"op": "tag", "action": "??"})).is_none());
+    }
 }

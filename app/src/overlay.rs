@@ -121,6 +121,13 @@ pub enum OverlayAction {
         channel: MaskChannel,
         beat: f64,
     },
+    /// **中轴标签**：在轴带里按 `R` 起一个标签草稿（与 hold / 事件块同一套跟随手势）。
+    /// 来源一律是 `Gui` —— `Cli` 那条路走控制通道，不经过手势。
+    StartTagDraft { beat: f64 },
+    /// 选中中轴上的第 i 个标签（属性编辑器改颜色用它）
+    SelectTag(usize),
+    /// 删掉中轴上的第 i 个标签（轴带里按 `D` / 点它旁边）
+    DeleteTag(usize),
     /// 面板想跟用户说一句话（例如"指针不在音符区，快速放置用不了"）——
     /// 动作只描述意图，显示在状态栏/控制台由调用方决定
     Notice(String),
@@ -248,6 +255,57 @@ pub fn lane_to_pane_x(pane: egui::Rect, lane: f32, offset: f32) -> f32 {
 /// 音符区屏幕 x → laneX（`lane_to_pane_x` 的逆；不钳制，越界的值交给调用方吸附/判断）
 pub fn pane_x_to_lane(pane: egui::Rect, x: f32, offset: f32) -> f32 {
     offset - RPE_WINDOW_HALF_W + (x - pane.min.x) / pane.width().max(1e-6) * RPE_WINDOW_W
+}
+
+/// 标签在轴带上的**列中心**：轴带左右各一列 —— **左 = GUI、右 = CLI**。
+///
+/// 两列的分工就是"来源"（用户口径："只留两列标注来源是 gui 还是 cli"）；
+/// **颜色不参与分列**，它是每个标签自己的属性，可以逐个改。
+pub fn tag_column_center(axis: egui::Rect, source: opm_app::state::TagSource) -> f32 {
+    let half = axis.width() * 0.5;
+    match source {
+        opm_app::state::TagSource::Gui => axis.min.x + half * 0.5,
+        opm_app::state::TagSource::Cli => axis.min.x + half * 1.5,
+    }
+}
+
+/// 一个标签在轴带里的矩形：横向由**来源**定列，纵向由拍区间定。
+pub fn tag_rect(
+    axis: egui::Rect,
+    body: egui::Rect,
+    anchor: f64,
+    beats: f64,
+    t: &opm_app::state::Tag,
+) -> egui::Rect {
+    let cx = tag_column_center(axis, t.source);
+    let (s0, s1) = t.span();
+    let y0 = beat_y(body, anchor, beats, s0);
+    let y1 = beat_y(body, anchor, beats, s1);
+    // 每列留 3px 边距；短标签至少 3px 高，否则点不着、也看不见
+    let hw = axis.width() * 0.25 - 3.0;
+    let (lo, hi) = (y0.min(y1), y0.max(y1));
+    egui::Rect::from_min_max(
+        egui::pos2(cx - hw, lo.min(hi - 3.0)),
+        egui::pos2(cx + hw, hi.max(lo + 3.0)),
+    )
+}
+
+/// 命中的标签下标：**先按列筛 x、再按拍区间筛 y**。
+///
+/// 反向遍历：后加的盖在上面，点到的就该是它（与绘制顺序一致）。
+pub fn tag_hit(
+    tags: &[opm_app::state::Tag],
+    axis: egui::Rect,
+    body: egui::Rect,
+    anchor: f64,
+    beats: f64,
+    pos: egui::Pos2,
+) -> Option<usize> {
+    tags.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, t)| tag_rect(axis, body, anchor, beats, t).contains(pos))
+        .map(|(i, _)| i)
 }
 
 /// 头/尾把手的判定带宽（像素）
@@ -802,6 +860,8 @@ pub enum QuickKey {
     Note(opm_app::doc::NoteKind),
     /// 在事件区起一个事件块草稿
     EventDraft,
+    /// 在**中轴标签带**上起一个标签草稿（用户口径："光标在编辑区中间的时间轴上可以按 r 放置 tag"）
+    TagDraft,
     /// 这个键在这个半区里没有意义 —— **什么都不做**
     Nothing,
     /// 指针不在任何一个半区里（标尺/轴带上）：说一句话解释为什么没反应
@@ -810,7 +870,16 @@ pub enum QuickKey {
 
 /// 规则（用户定）：**音符区** Q/W/E/R 四个键各放一种音符；**事件区只有 R** 能用
 /// （起事件块草稿，与音符区的 hold 同一套跟随流程）；其余键在事件区**没有反应**。
-pub fn quick_key_rule(key: egui::Key, in_notes: bool, in_events: bool) -> QuickKey {
+pub fn quick_key_rule(key: egui::Key, in_notes: bool, in_events: bool, in_axis: bool) -> QuickKey {
+    // **轴带优先**：它是三块里最窄的一块，而且 `R` 在这里的含义与另外两块都不同
+    // （放标签，不是放音符/事件块）。先判它，免得被"指针 x 落在哪一半"顺手吃掉。
+    if in_axis {
+        return if key == egui::Key::R {
+            QuickKey::TagDraft
+        } else {
+            QuickKey::Nothing
+        };
+    }
     if in_notes {
         return match opm_app::keymap::quick_place_kind(key) {
             Some(kind) => QuickKey::Note(kind),
@@ -1082,6 +1151,32 @@ pub fn draw(
             );
         }
     }
+    // ---- 中轴标签：**两列**（左 = GUI，右 = CLI），颜色是标签自己的 ----
+    //
+    // 用户口径 2026-10-03："标签放置在中轴，黄色和蓝色分两列" → "只留两列标注来源是 gui 还是 cli，
+    // 可以自定义不同标签的颜色"。⇒ **分列管来源、颜色管标签自己**，两层信息互不干扰。
+    //
+    // 只在普通模式下画：遮蔽区模式里轴带贴在左边缘，那里的"拍"仍然有意义，但那一栏
+    // 整片是七条通道的地盘，再塞两列标签只会两边都看不清。
+    if !mask_mode {
+        for (i, t) in st.tags.iter().enumerate() {
+            let r = tag_rect(axis, body, anchor, beats, t);
+            if r.max.y < body.min.y || r.min.y > body.max.y {
+                continue; // 完全在窗口外
+            }
+            let col = egui::Color32::from_rgb(t.color[0], t.color[1], t.color[2]);
+            p.rect_filled(r, 1.5, col);
+            if st.selected_tag == Some(i) {
+                p.rect_stroke(
+                    r.expand(1.5),
+                    1.5,
+                    egui::Stroke::new(1.6, egui::Color32::WHITE),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+    }
+
     // 标题靠右放：左上角是 RPE 窗口标注的地盘，两边都放会叠字
     p.text(
         egui::pos2(rect.max.x - 4.0, rect.min.y + 1.0),
@@ -1392,7 +1487,9 @@ pub fn draw(
     #[derive(Clone, Copy)]
     enum Hit {
         Ruler(f64),
-        Axis,
+        /// 轴带：**带上指针下面的标签下标**（没有就是 `None`）。
+        /// 标签只住在这里（用户口径："标签放置在中轴"），所以命中信息挂在轴带这一支上。
+        Axis(Option<usize>),
         Note(usize),
         /// 事件：**轨道** + 该轨道**合并视图**里的下标 + 命中哪一部分（头/尾/本体）。
         /// 带上轨道是因为"选中优先"与"哪一块"都必须限定在这一列里 ——
@@ -1405,7 +1502,7 @@ pub fn draw(
             return Hit::Ruler(beat_of(pos.y.max(rect.min.y + RULER_H)));
         }
         if in_axis(pos) {
-            return Hit::Axis;
+            return Hit::Axis(tag_hit(&st.tags, axis, body, anchor, beats, pos));
         }
         if pos.x < mid_x {
             // 音符区：**以选择框为准**（`note_hit` 里写着优先级：非 hold > hold、锚优先、后画的优先）
@@ -1590,12 +1687,19 @@ pub fn draw(
             }
             let in_notes = ptr.map(pointer_in_notes).unwrap_or(false);
             let in_events = ptr.and_then(event_col_of).is_some();
-            match quick_key_rule(key, in_notes, in_events) {
+            let axis_hit = ptr.map(|q| in_axis(q)).unwrap_or(false);
+            match quick_key_rule(key, in_notes, in_events, axis_hit) {
                 QuickKey::Note(kind) => {
                     let pos = ptr.expect("in_notes 只可能来自指针");
                     actions.push(OverlayAction::QuickPlace {
                         kind,
                         lane_x: st.snap_lane(lane_of_x(pos.x)),
+                        beat: st.snap_beat(beat_of(pos.y)).max(0.0),
+                    });
+                }
+                QuickKey::TagDraft => {
+                    let pos = ptr.expect("TagDraft 只可能来自指针");
+                    actions.push(OverlayAction::StartTagDraft {
                         beat: st.snap_beat(beat_of(pos.y)).max(0.0),
                     });
                 }
@@ -1612,8 +1716,19 @@ pub fn draw(
                 QuickKey::Nothing => {}
                 // 指针不在两个半区里（标尺上/轴带上）：**说清楚为什么没反应**
                 QuickKey::Outside => actions.push(OverlayAction::Notice(
-                    "快速放置：音符区用 Q/W/E/R，事件区只有 R（指针要放在半区里）".to_owned(),
+                    "快速放置：音符区用 Q/W/E/R，事件区 R，中轴 R 放标签（指针要放在某一栏里）"
+                        .to_owned(),
                 )),
+            }
+        }
+        // `D`：删掉轴带上指针下面那个标签（用户口径："d删除标签"）。
+        // 与放置分开写：它不在 Q/W/E/R 那一组里，也不产生草稿。
+        if key_pressed_once(ui, egui::Key::D) {
+            let in_axis_now = ptr.map(|q| in_axis(q)).unwrap_or(false);
+            if in_axis_now {
+                if let Some(i) = ptr.and_then(|q| tag_hit(&st.tags, axis, body, anchor, beats, q)) {
+                    actions.push(OverlayAction::DeleteTag(i));
+                }
             }
         }
     }
@@ -1626,7 +1741,21 @@ pub fn draw(
         let span_rect = |x0: f32, x1: f32, y0: f32, y1: f32| {
             egui::Rect::from_min_max(egui::pos2(x0, y0.min(y1)), egui::pos2(x1, y0.max(y1)))
         };
-        if let Some(h) = st.pending_hold {
+        if let Some(t) = st.pending_tag {
+            // 标签草稿在轴带上（横向 = 它那一列），纵向由拍区间定
+            Some(tag_rect(
+                axis,
+                body,
+                anchor,
+                beats,
+                &opm_app::state::Tag {
+                    start: t.start,
+                    end: t.end,
+                    source: t.source,
+                    color: t.color,
+                },
+            ))
+        } else if let Some(h) = st.pending_hold {
             // hold 在音符区（横向 = 音符宽）
             let x = x_of_lane(h.lane_x);
             Some(span_rect(x - 5.0, x + 5.0, y_of(h.start_beat), y_of(h.end_beat)))
@@ -1639,8 +1768,14 @@ pub fn draw(
             None
         }
     };
+    // 标签草稿的"半区"是**轴带**（它不住在音符区也不住在事件区）——
+    // 漏掉这一条的表现是：草稿能起、控制杆却拖不动（`draft_gesture` 认为指针不在半区里）
     let in_pane = ptr
-        .map(|q| pointer_in_notes(q) || event_col_of(q).is_some())
+        .map(|q| {
+            pointer_in_notes(q)
+                || event_col_of(q).is_some()
+                || (st.pending_tag.is_some() && in_axis(q))
+        })
         .unwrap_or(false);
     draft_gesture(
         ui,
@@ -1827,6 +1962,8 @@ pub fn draw(
             match hit {
                 // 标尺只挪播放头：它和选区没关系，点它不该把选区清掉
                 Some(Hit::Ruler(b)) => actions.push(OverlayAction::SeekBeat(b)),
+                // 轴带上点中一个标签 ⇒ 选中它（属性编辑器据此显示/改颜色）
+                Some(Hit::Axis(Some(i))) => actions.push(OverlayAction::SelectTag(i)),
                 // Ctrl+左键：在"选中 / 未选中"之间切换（用户要求）
                 Some(Hit::Note(i)) => actions.push(if ctrl {
                     OverlayAction::ToggleNote(i)
@@ -2750,19 +2887,44 @@ mod tests {
             (egui::Key::R, NoteKind::Hold),
         ] {
             assert_eq!(
-                quick_key_rule(key, true, false),
+                quick_key_rule(key, true, false, false),
                 QuickKey::Note(want),
                 "{key:?} 在音符区应放 {want:?}"
             );
         }
         // 事件区：只有 R
-        assert_eq!(quick_key_rule(egui::Key::R, false, true), QuickKey::EventDraft);
+        assert_eq!(
+            quick_key_rule(egui::Key::R, false, true, false),
+            QuickKey::EventDraft
+        );
         for key in [egui::Key::Q, egui::Key::W, egui::Key::E] {
-            assert_eq!(quick_key_rule(key, false, true), QuickKey::Nothing, "{key:?} 应无反应");
+            assert_eq!(
+                quick_key_rule(key, false, true, false),
+                QuickKey::Nothing,
+                "{key:?} 应无反应"
+            );
         }
-        // 不在任何半区（标尺/轴带）：说一句话
+        // **中轴标签带**：只有 R 放标签，其余键无反应。
+        // 而且它**优先于**音符/事件两半区 —— 轴带夹在两者之间，不先判就会被顺手吃掉。
+        assert_eq!(
+            quick_key_rule(egui::Key::R, false, false, true),
+            QuickKey::TagDraft
+        );
+        assert_eq!(
+            quick_key_rule(egui::Key::R, true, false, true),
+            QuickKey::TagDraft,
+            "轴带优先：即使指针 x 也落在音符半区，R 仍然是放标签"
+        );
+        for key in [egui::Key::Q, egui::Key::W, egui::Key::E] {
+            assert_eq!(
+                quick_key_rule(key, false, false, true),
+                QuickKey::Nothing,
+                "轴带里 {key:?} 应无反应"
+            );
+        }
+        // 不在任何一栏（标尺）：说一句话
         for key in [egui::Key::Q, egui::Key::R] {
-            assert_eq!(quick_key_rule(key, false, false), QuickKey::Outside);
+            assert_eq!(quick_key_rule(key, false, false, false), QuickKey::Outside);
         }
     }
 
@@ -4394,5 +4556,69 @@ mod tests {
             !all.iter().any(|a| a.starts_with("MaskPlace")),
             "按 R 不该再「就地放一块」：{all:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+    use opm_app::state::{Tag, TagSource};
+
+    fn pane() -> (egui::Rect, egui::Rect) {
+        let body = egui::Rect::from_min_max(egui::pos2(300.0, 40.0), egui::pos2(1300.0, 840.0));
+        let axis = egui::Rect::from_min_max(egui::pos2(783.0, 40.0), egui::pos2(817.0, 840.0));
+        (body, axis)
+    }
+
+    /// **两列的分工就是"来源"**：左 = GUI、右 = CLI。这是用户口径里"分两列"的全部含义 ——
+    /// 颜色不参与分列，它是标签自己的属性。
+    #[test]
+    fn the_two_columns_are_gui_left_and_cli_right() {
+        let (_, axis) = pane();
+        let gui = tag_column_center(axis, TagSource::Gui);
+        let cli = tag_column_center(axis, TagSource::Cli);
+        assert!(gui < axis.center().x, "GUI 列应在左半：{gui} vs 中心 {}", axis.center().x);
+        assert!(cli > axis.center().x, "CLI 列应在右半：{cli} vs 中心 {}", axis.center().x);
+        assert!(gui < cli);
+        // 两列各自居中在半个轴带里（不留偏心）
+        assert!((gui - (axis.min.x + axis.width() * 0.25)).abs() < 1e-3);
+        assert!((cli - (axis.min.x + axis.width() * 0.75)).abs() < 1e-3);
+    }
+
+    /// 命中：**先按列筛、再按拍区间筛**。同一点上两列各有一个标签时，各自只能命中自己那一列。
+    #[test]
+    fn a_tag_is_only_hit_in_its_own_column() {
+        let (body, axis) = pane();
+        let (anchor, beats) = (0.0, 32.0);
+        let tags = vec![
+            Tag { start: 4.0, end: 8.0, source: TagSource::Gui, color: [1, 2, 3] },
+            Tag { start: 4.0, end: 8.0, source: TagSource::Cli, color: [4, 5, 6] },
+        ];
+        let y = beat_y(body, anchor, beats, 6.0); // 落在两个标签的拍区间正中
+        let hit_gui = tag_hit(&tags, axis, body, anchor, beats, egui::pos2(tag_column_center(axis, TagSource::Gui), y));
+        let hit_cli = tag_hit(&tags, axis, body, anchor, beats, egui::pos2(tag_column_center(axis, TagSource::Cli), y));
+        assert_eq!(hit_gui, Some(0), "左列只该命中 GUI 那个");
+        assert_eq!(hit_cli, Some(1), "右列只该命中 CLI 那个");
+        // 拍区间之外不命中
+        let y_out = beat_y(body, anchor, beats, 20.0);
+        assert_eq!(tag_hit(&tags, axis, body, anchor, beats, egui::pos2(tag_column_center(axis, TagSource::Gui), y_out)), None);
+        // 轴带之外不命中（哪怕 y 对）
+        assert_eq!(tag_hit(&tags, axis, body, anchor, beats, egui::pos2(axis.min.x - 20.0, y)), None);
+    }
+
+    /// 标签的矩形覆盖它的**拍区间**，而且同一个标签在窗口滚动后跟着移动
+    /// （`beat_y` 是全局面板映射，标签不该自己再算一套）。
+    #[test]
+    fn a_tag_rect_follows_its_beat_span() {
+        let (body, axis) = pane();
+        let t = Tag { start: 4.0, end: 8.0, source: TagSource::Gui, color: [9, 9, 9] };
+        let r0 = tag_rect(axis, body, 0.0, 32.0, &t);
+        let y4 = beat_y(body, 0.0, 32.0, 4.0);
+        let y8 = beat_y(body, 0.0, 32.0, 8.0);
+        assert!((r0.min.y.min(r0.max.y) - y4.min(y8)).abs() < 1e-3);
+        assert!((r0.min.y.max(r0.max.y) - y4.max(y8)).abs() < 1e-3);
+        // 反向跨度的标签（先拖到上面再拖回来）也要给出同一个矩形
+        let flipped = Tag { start: 8.0, end: 4.0, ..t };
+        assert_eq!(tag_rect(axis, body, 0.0, 32.0, &flipped), r0);
     }
 }

@@ -1655,7 +1655,21 @@ impl App {
                     self.state.resize_pending(edge, beat)
                 }
                 OverlayAction::DraftCommit => {
-                    if let Some(e) = self.state.take_pending_event() {
+                    if let Some(t) = self.state.take_pending_tag() {
+                        // 标签**不进文档**（用户口径："不存储"）—— 它只活在视图状态里，
+                        // 所以这里不 push 命令，只把它落进 `state.tags`。
+                        let (start, end) = t.span();
+                        let i = self.state.add_tag(start, end, t.source, t.color);
+                        self.state.selected_tag = Some(i);
+                        self.insp = self.build_inspector();
+                        self.file_message = Some((
+                            true,
+                            format!(
+                                "放下标签（{}）：{start:.3} → {end:.3} 拍（不写进谱面）",
+                                t.source.key()
+                            ),
+                        ));
+                    } else if let Some(e) = self.state.take_pending_event() {
                         let (start, end) = e.span();
                         let value =
                             opm_app::edit::new_event_value(&self.state, e.track, start);
@@ -1715,6 +1729,35 @@ impl App {
                                 ));
                             }
                         }
+                    }
+                }
+                // ---- 中轴标签（视图状态，不进文档）----
+                OverlayAction::StartTagDraft { beat } => {
+                    self.state.begin_pending_tag(beat);
+                    self.file_message = Some((
+                        true,
+                        "正在放标签：上下移动鼠标定长度，R/回车/左键放下，Esc 取消".to_owned(),
+                    ));
+                }
+                OverlayAction::SelectTag(i) => {
+                    self.state.selected_tag = Some(i);
+                    self.insp = self.build_inspector();
+                    if let Some(t) = self.state.tags.get(i) {
+                        let (a, b) = t.span();
+                        self.file_message = Some((
+                            true,
+                            format!("选中标签（{}）：{a:.3} → {b:.3} 拍", t.source.key()),
+                        ));
+                    }
+                }
+                OverlayAction::DeleteTag(i) => {
+                    let who = self.state.tags.get(i).map(|t| t.source.key());
+                    if self.state.delete_tag(i) {
+                        self.insp = self.build_inspector();
+                        self.file_message = Some((
+                            true,
+                            format!("删除标签（{}）", who.unwrap_or("?")),
+                        ));
                     }
                 }
                 OverlayAction::DraftCancel => {
@@ -2782,6 +2825,58 @@ impl App {
                         self.state.window_offset_x
                     );
                 }
+                // ---- 中轴标签（视图状态，不进文档）----
+                //
+                // agent 用这条路"在谱面上打点"指给用户看。它与 GUI 的 `R` 起稿走的是
+                // **同一个容器**（`state.tags`），差别只有来源：这里一律 `Cli` ⇒ 落在右列、默认黄。
+                control::ViewCmd::Tag(cmd) => {
+                    use opm_app::control::TagCmd;
+                    let src = opm_app::state::TagSource::Cli;
+                    match cmd {
+                        TagCmd::Add { start, end, color } => {
+                            let (a, b) = opm_app::state::tag_span_of(start, end);
+                            // 长度给 0（只写 start）时按最短长度撑开 —— 与 GUI 起稿的保底一致
+                            let b = if (b - a) < opm_app::state::TAG_MIN_BEATS {
+                                a + opm_app::state::TAG_MIN_BEATS
+                            } else {
+                                b
+                            };
+                            let i = self.state.add_tag(
+                                a,
+                                b,
+                                src,
+                                color.unwrap_or_else(|| src.default_color()),
+                            );
+                            self.state.selected_tag = Some(i);
+                            self.insp = self.build_inspector();
+                            self.file_message = Some((
+                                true,
+                                format!("CLI 加了标签 #{i}：{a:.3} → {b:.3} 拍（不写进谱面）"),
+                            ));
+                        }
+                        TagCmd::Del { index } => {
+                            if self.state.delete_tag(index) {
+                                self.insp = self.build_inspector();
+                                self.file_message =
+                                    Some((true, format!("CLI 删了标签 #{index}")));
+                            } else {
+                                self.file_message =
+                                    Some((false, format!("没有下标为 {index} 的标签")));
+                            }
+                        }
+                        TagCmd::Clear => {
+                            let n = self.state.clear_tags();
+                            self.insp = self.build_inspector();
+                            self.file_message =
+                                Some((true, format!("CLI 清空了 {n} 个标签")));
+                        }
+                        TagCmd::Select { index } => {
+                            self.state.selected_tag =
+                                index.filter(|i| *i < self.state.tags.len());
+                            self.insp = self.build_inspector();
+                        }
+                    }
+                }
                 control::ViewCmd::Zoom { factor, beats } => {
                     // 缩放是**纯视图状态**（谱面里没有"可见拍数"这个字段），与 Ctrl+滚轮同一条路径
                     if let Some(b) = beats {
@@ -3389,6 +3484,21 @@ impl App {
         s.builds_notes = self.builds_notes;
         s.builds_tracks = self.builds_tracks;
         s.builds_zones = self.builds_zones;
+        // 标签是视图状态、**不进文档**，所以它是"读完命令之后到底有没有生效"的唯一核对口
+        s.tags = self
+            .state
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(i, t)| opm_app::control::TagStat {
+                index: i,
+                source: t.source.key(),
+                start: t.start,
+                end: t.end,
+                color: t.color,
+            })
+            .collect();
+        s.selected_tag = self.state.selected_tag;
         s.builds_meta = self.builds_meta;
         s.builds_inspector = self.builds_inspector;
         s.skipped_structure = self.skipped_structure;
@@ -4874,6 +4984,20 @@ impl eframe::App for App {
             // 写在"调试工作区"分支里 ⇒ 其它工作区改什么都不生效）。拖动类控件用事务包住
             //（松手才 commit），所以"拖一次 = 一个撤销步"。
             let ins_out = inspector::inspector_ui(ui, &self.state, self.insp.as_mut());
+            // 标签是**视图状态**：面板改的颜色/起止直接写回 `EditorState`，不发命令、不进撤销栈
+            //（与"选中"同一条理由 —— 它压根不在文档里）。
+            if let Some((i, c)) = ins_out.tag_color {
+                if let Some(t) = self.state.tags.get_mut(i) {
+                    t.color = c;
+                }
+            }
+            if let Some((i, a, b)) = ins_out.tag_span {
+                if let Some(t) = self.state.tags.get_mut(i) {
+                    let (s0, s1) = opm_app::state::tag_span_of(a, b);
+                    t.start = s0;
+                    t.end = s1;
+                }
+            }
             // 遮蔽区面板产出的命令：草稿态（还没有区）下要先建区再应用，一个撤销步。
             // **只有这一路**这么包 —— 控制台里手打的命令不该顺手建出一块区来。
             let commands = if ins_out.mask_edits {

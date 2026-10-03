@@ -168,6 +168,11 @@ pub struct InspectorOut {
     /// 而那段包装只有调用方做得到（见 `main.rs` 的 `mask_commands_many`）——
     /// 让面板自己塞 `add_zone` 会把"顺序与事务"这件调用方的事漏进面板。
     pub mask_edits: bool,
+    /// **视图**动作：中轴标签换了颜色（下标 + 新色）。标签不进文档 ⇒ 不走 `commands`，
+    /// 与 `select_channel` 同一条理由。
+    pub tag_color: Option<(usize, [u8; 3])>,
+    /// **视图**动作：中轴标签改了起止拍
+    pub tag_span: Option<(usize, f64, f64)>,
 }
 
 /// 画属性编辑器，返回这一帧的产物（见 [`InspectorOut`]）。
@@ -190,6 +195,40 @@ pub fn inspector_ui(
     }
     match insp {
         Some(v) => {
+            // ---- 中轴标签（视图状态）：只在选中了标签时出现 ----
+            //
+            // 放在最前面：它是"此刻选中的对象"，比线属性更贴近"我正在编辑什么"。
+            // 来源（gui/cli）**只读** —— 它由标签住在哪一列决定，不是可以改的属性。
+            if let Some(t) = v.tag_edit {
+                egui::CollapsingHeader::new(format!("中轴标签 #{}（{}）", t.index, t.source))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.monospace(format!(
+                            "起止  {:.3} → {:.3} 拍（长度 {:.3}）",
+                            t.start,
+                            t.end,
+                            (t.end - t.start).abs()
+                        ));
+                        ui.monospace("来源只决定它在哪一列，改不了");
+                        ui.horizontal(|ui| {
+                            ui.label("颜色 ");
+                            let mut c = t.color;
+                            if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                                out.tag_color = Some((t.index, c));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let mut a = t.start;
+                            let mut b = t.end;
+                            let ca = value_field(ui, &mut a, "起点 ", 0.25, None).changed;
+                            let cb = value_field(ui, &mut b, "终点 ", 0.25, None).changed;
+                            if ca || cb {
+                                out.tag_span = Some((t.index, a, b));
+                            }
+                        });
+                    });
+                ui.separator();
+            }
             // ---- 判定线（当前线）：可编辑 ----
             let line_doc = v.line_index;
             ui.horizontal(|ui| {
