@@ -672,8 +672,26 @@ fn grab_get(ui: &egui::Ui) -> Option<opm_app::edit::Grab> {
         .flatten()
 }
 
-/// 正在拉的**框选**：起点屏幕坐标 + 选哪一类（**起始点定半区**，用户定的规则）
-type BoxSelState = (egui::Pos2, SelKind);
+/// 正在拉的**框选**：起点 + 选哪一类（**起始点定半区**，用户定的规则）。
+///
+/// 起点存的是**内容坐标（拍）**，不是屏幕 y —— 用户要求"框选时可以用滚轮移动"，
+/// 而滚轮动的正是时间轴：屏幕 y 在滚动后会落到别的拍上，框就跟着视图漂，
+/// "从这个音拖到那个音"会变成一个说不清的区间。起点钉在拍上，视图怎么动都不漂。
+#[derive(Clone, Copy, Debug)]
+struct BoxSelState {
+    /// 按下那一刻、按当时的映射算出来的拍
+    beat: f64,
+    /// 起点横向的屏幕 x。时间轴只纵向滚动（没有横向平移），所以它可以原样留着
+    x: f32,
+    kind: SelKind,
+}
+
+impl BoxSelState {
+    /// 起点的**当前**屏幕位置（每帧按当前视图重算 —— 这就是"钉在内容上"的落地）。
+    fn start_pos(&self, y_of: impl Fn(f64) -> f32) -> egui::Pos2 {
+        egui::pos2(self.x, y_of(self.beat))
+    }
+}
 
 /// **遮蔽区编辑模式下正在拖的那一块**（冻结拖拽开始时的跨度）。
 ///
@@ -986,6 +1004,32 @@ pub fn quick_key_rule(key: egui::Key, in_notes: bool, in_events: bool, in_axis: 
 /// "一格"在屏幕上走过的距离都差不多。
 pub fn scroll_delta_to_beats(scroll_y: f32, beats_visible: f64, per_notch: f64) -> f64 {
     (scroll_y as f64 / 50.0) * per_notch * (beats_visible / 32.0).max(0.15)
+}
+
+/// 编辑区里"竖直滚一格"的量 —— **按住 Shift 时 egui 会把滚轮整体折到横轴**。
+///
+/// 这不是猜的：`egui::Options` 里 `horizontal_scroll_modifier` 默认就是 `SHIFT`，
+/// 而 `vertical_scroll_modifier` 默认是 `NONE`；`WheelState` 见到 Shift 就做
+/// `delta = vec2(delta.x + delta.y, 0.0)` —— 于是按住 Shift 滚轮时 `smooth_scroll_delta.y` **恒为 0**。
+/// 编辑区没有横向滚动（时间轴是纵轴），所以两个轴在这里是同一个意思：合并读。
+/// 之前只读 `.y`：Shift 拖框期间滚轮完全没反应（用户报的就是这一条）。
+pub fn wheel_delta_y(delta_x: f32, delta_y: f32, shift: bool) -> f32 {
+    if shift {
+        delta_x + delta_y
+    } else {
+        delta_y
+    }
+}
+
+/// 编辑区读滚轮的**唯一一处**：`(竖直量, 缩放倍率)`。
+/// 两份绘制路径（判定线编辑器 / 遮蔽区编辑器）都用它，免得哪天只修好一边。
+fn overlay_wheel(ui: &egui::Ui) -> (f32, f32) {
+    ui.input(|i| {
+        (
+            wheel_delta_y(i.smooth_scroll_delta.x, i.smooth_scroll_delta.y, i.modifiers.shift),
+            i.zoom_delta(),
+        )
+    })
 }
 
 /// egui 的 `zoom_delta` → **可见拍数倍率**（纯函数，可单测）。
@@ -1950,9 +1994,13 @@ pub fn draw(
 
     // 滚轮：在编辑区里滚动就是**改谱面当前时间**（向上滚 = 往后）。跟随播放头的窗口会把这一变化
     // 直接体现出来，所以"滚动"与"移动播放头"在这里是同一件事（只此一处，别重复写第二份）。
+    //
+    // **Shift 拖框期间滚轮照旧有效**（用户要求）：Shift 会把滚轮折到横轴（见 `wheel_delta_y`），
+    // 所以这里两个轴一起读 —— 只读 `.y` 的话，正是"框选时滚轮没反应"的那条 bug。
+    // 滚轮动的是视图，框的起点钉在拍上（`BoxSelState::start_pos`），于是框跟着内容走。
     if resp.hovered() {
         // `zoom_delta` 里含 Ctrl+滚轮与触控板捏合；按住 Ctrl 时 `smooth_scroll_delta` 恒为 0
-        let (dy, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let (dy, zoom) = overlay_wheel(ui);
         if (zoom - 1.0).abs() > 1e-4 {
             // Ctrl+滚轮 = **缩放时间轴**（标注精度随之变化，见 `axis_ticks`）
             actions.push(OverlayAction::ZoomBeats(zoom_delta_to_beats_factor(zoom)));
@@ -1998,7 +2046,15 @@ pub fn draw(
         });
         if shift {
             if let (Some(pos), Some(k)) = (press, box_kind) {
-                box_set(ui, Some((pos, k)));
+                // 起点存**拍**（不是屏幕 y）：之后滚轮移动视图时，框仍然从同一个音起算
+                box_set(
+                    ui,
+                    Some(BoxSelState {
+                        beat: beat_of(pos.y),
+                        x: pos.x,
+                        kind: k,
+                    }),
+                );
             }
         } else {
             // 用**按下时**的命中（不是当前命中）：拖拽阈值会让指针先移开那 6px 的把手段
@@ -2061,9 +2117,10 @@ pub fn draw(
             }
         }
         // 框选：把框画出来（`drag_started` 那一帧也要画，否则第一帧看不到框）
-        if let (Some((start, kind)), Some(cur)) = (box_get(ui), ptr) {
-            let b = egui::Rect::from_two_pos(start, cur);
-            let col = match kind {
+        // 起点每帧按**当前的拍映射**重算 ⇒ 拖动期间滚轮移动视图时，框跟着内容一起走
+        if let (Some(sel), Some(cur)) = (box_get(ui), ptr) {
+            let b = egui::Rect::from_two_pos(sel.start_pos(&y_of), cur);
+            let col = match sel.kind {
                 SelKind::Notes => egui::Color32::from_rgb(150, 190, 255),
                 SelKind::Events => egui::Color32::from_rgb(255, 200, 120),
             };
@@ -2081,10 +2138,11 @@ pub fn draw(
             actions.push(OverlayAction::GrabEnd);
             grab_set(ui, None);
         }
-        if let Some((start, kind)) = box_get(ui) {
+        if let Some(sel) = box_get(ui) {
             // 框选落地：**只按起始点定下的那一类**算命中（另一类的矩形根本不看）
+            let start = sel.start_pos(&y_of);
             let b = egui::Rect::from_two_pos(start, ptr.unwrap_or(start));
-            match kind {
+            match sel.kind {
                 SelKind::Notes => {
                     actions.push(OverlayAction::SelectNotes(note_box_hits(&note_boxes, b)));
                 }
@@ -2705,7 +2763,7 @@ fn draw_mask_pane(
     // 曾经这里另写了一条 `beats/32*2` 的换算，于是同一个滚轮动作在两个模式下手感不同；
     // 换算只有一份实现（`scroll_delta_to_beats`），参数也只有一处（`OverlayCfg`）。
     if resp.hovered() {
-        let (dy, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let (dy, zoom) = overlay_wheel(ui);
         if (zoom - 1.0).abs() > 1e-4 {
             actions.push(OverlayAction::ZoomBeats(zoom_delta_to_beats_factor(zoom)));
         } else if dy.abs() > 0.01 {
@@ -4725,6 +4783,222 @@ mod tests {
         assert!(
             !all.iter().any(|a| a.starts_with("MaskPlace")),
             "按 R 不该再「就地放一块」：{all:?}"
+        );
+    }
+    /// **Shift 拖框期间滚轮照旧移动视图**（用户要求）。
+    ///
+    /// 这条 bug 藏得比较深：egui 的 `Options::horizontal_scroll_modifier` **默认就是 SHIFT**，
+    /// `WheelState` 见到 Shift 会把滚轮整个折到横轴（`delta = vec2(dx + dy, 0.0)`）——
+    /// 于是按住 Shift 滚轮时 `smooth_scroll_delta.y` **恒为 0**，只读 `.y` 的滚轮处理一个事件都收不到。
+    /// 实测：修复前这一串事件产出 **0 个动作**（连 ScrollBeats 都没有），修复后照常滚。
+    #[test]
+    fn shift_wheel_still_moves_the_timeline() {
+        // 换算：Shift 下滚轮落在横轴里，其余情况取纵轴；没有横轴时不能把纵轴吃掉
+        assert_eq!(wheel_delta_y(50.0, 0.0, true), 50.0, "Shift 下 egui 把滚轮折进横轴");
+        assert_eq!(wheel_delta_y(0.0, 50.0, false), 50.0);
+        assert_eq!(wheel_delta_y(0.0, 50.0, true), 50.0);
+        assert_eq!(wheel_delta_y(-50.0, 0.0, true), -50.0);
+        assert_eq!(wheel_delta_y(0.0, 0.0, true), 0.0);
+
+        let st = state_with_events();
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        let pos = egui::pos2(180.0, 380.0);
+        // 滚轮事件要**多帧**才会从 egui 的平滑器里放出来（见 egui `WheelState::after_events`）
+        let run = |mods: egui::Modifiers, all: &mut Vec<String>| {
+            for _ in 0..8 {
+                let events = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::ModifiersChanged(mods),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 50.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: mods,
+                    },
+                ];
+                let mut acts: Vec<OverlayAction> = Vec::new();
+                let raw = egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    draw(ui, &st, rect, &cfg, true, &mut acts);
+                });
+                out.textures_delta.clear();
+                all.extend(acts.iter().map(|a| format!("{a:?}")));
+            }
+        };
+        let mut plain: Vec<String> = Vec::new();
+        run(egui::Modifiers::NONE, &mut plain);
+        assert!(
+            plain.iter().any(|a| a.starts_with("ScrollBeats(")),
+            "普通滚轮本来就能移动视图：{plain:?}"
+        );
+        let mut shifted: Vec<String> = Vec::new();
+        run(egui::Modifiers::SHIFT, &mut shifted);
+        let scroll: Vec<&String> = shifted
+            .iter()
+            .filter(|a| a.starts_with("ScrollBeats("))
+            .collect();
+        assert!(
+            !scroll.is_empty(),
+            "Shift 按下时 egui 把滚轮折进横轴 —— 编辑区仍要能移动时间轴：{shifted:?}"
+        );
+        // 方向：向上滚（delta.y > 0）= 时间往后 ⇒ 拍增量必须是正的
+        let beats: f64 = scroll[0]
+            .trim_start_matches("ScrollBeats(")
+            .trim_end_matches(')')
+            .parse()
+            .expect("ScrollBeats 里应是拍数");
+        assert!(beats > 0.0, "向上滚 = 时间往后，方向不能反：{scroll:?}");
+
+        // 真正的场景：**框选拖拽正在进行中**滚轮也要照常发 ScrollBeats
+        // （`resp.hovered()` 在自己的拖拽期间保持为真 —— egui 的约定，这里实测钉住它）
+        let ctx2 = egui::Context::default();
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        let from = egui::pos2(180.0, 380.0);
+        let to = egui::pos2(300.0, 300.0);
+        let pass = |events: Vec<egui::Event>, all: &mut Vec<String>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx2.run_ui(raw, |ui| {
+                draw(ui, &st, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            all.extend(acts.iter().map(|a| format!("{a:?}")));
+        };
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 50.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: shift,
+        };
+        let mut dragging: Vec<String> = Vec::new();
+        pass(vec![egui::Event::ModifiersChanged(shift)], &mut dragging);
+        pass(vec![egui::Event::PointerMoved(from)], &mut dragging);
+        pass(
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: shift,
+            }],
+            &mut dragging,
+        );
+        pass(vec![egui::Event::PointerMoved(to)], &mut dragging);
+        for _ in 0..8 {
+            pass(
+                vec![
+                    egui::Event::PointerMoved(to),
+                    egui::Event::ModifiersChanged(shift),
+                    wheel.clone(),
+                ],
+                &mut dragging,
+            );
+        }
+        assert!(
+            dragging.iter().any(|a| a.starts_with("ScrollBeats(")),
+            "框选拖拽进行中，滚轮仍应移动视图：{dragging:?}"
+        );
+    }
+
+    /// **框选的起点钉在"拍"上，不钉在屏幕 y 上** —— 这是"框选时可以用滚轮移动视图"能成立的前提。
+    ///
+    /// 场景（alpha 轨道两个事件：拍 0..16 与拍 16..32）：
+    /// 在**拍 8**的屏幕位置按下 Shift → 往拍 24 拖 → **中途把视图滚 10 拍**（指针停在原屏幕位置）→ 松手。
+    ///
+    /// · 修复后：起点仍锚在拍 8 ⇒ 框从拍 8 一直盖到指针处，**事件 0 与事件 1 都在框里**；
+    /// · 修复前：起点是屏幕 y，视图一滚它就漂到拍 18 上 ⇒ 框只剩拍 18..34 ⇒ **事件 0 掉出选区**。
+    ///
+    /// 断言就钉在这一条上：`event 0` 在不在选区里。
+    #[test]
+    fn box_select_anchor_stays_on_the_beat_when_the_view_scrolls() {
+        let mut st = state_with_events();
+        st.overlay_beats = 32.0;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 400.0));
+        let cfg = OverlayCfg::default();
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, rect.min.y + RULER_H),
+            rect.max,
+        );
+        let beats = 32.0_f64;
+        let anchor_of = |s: &EditorState| s.chart.tmap.beat(s.playhead) - cfg.lead_beats;
+        // 视图 1：拍 8 的屏幕 y 与拍 24 的屏幕 y
+        let a1 = anchor_of(&st);
+        let y8 = beat_y(body, a1, beats, 8.0);
+        let y24 = beat_y(body, a1, beats, 24.0);
+        assert!(y8 > y24, "拍越大越靠上：{y8} vs {y24}");
+
+        // alpha 列（`TrackId::ALL` 里第 4 列）：列宽与起点跟绘制同源
+        let mid_x = rect.center().x;
+        let axis_right = mid_x + AXIS_W * 0.5;
+        let col_w = (rect.max.x - axis_right) / TrackId::ALL.len() as f32;
+        let k = TrackId::ALL.iter().position(|t| *t == TrackId::Alpha).unwrap();
+        let x = axis_right + (k as f32 + 0.5) * col_w;
+
+        // 视图 2：播放头前进 10 拍（= 用滚轮把视图滚了 10 拍）
+        let mut st2 = state_with_events();
+        st2.overlay_beats = 32.0;
+        st2.playhead = st2.chart.tmap.sec(10.0);
+
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        let pass = |s: &EditorState, events: Vec<egui::Event>, all: &mut Vec<String>| {
+            let mut acts: Vec<OverlayAction> = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                draw(ui, s, rect, &cfg, true, &mut acts);
+            });
+            out.textures_delta.clear();
+            all.extend(acts.iter().map(|a| format!("{a:?}")));
+        };
+        let from = egui::pos2(x, y8);
+        let to = egui::pos2(x, y24);
+        let mut all: Vec<String> = Vec::new();
+        pass(&st, vec![egui::Event::ModifiersChanged(shift)], &mut all);
+        pass(&st, vec![egui::Event::PointerMoved(from)], &mut all);
+        pass(
+            &st,
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: shift,
+            }],
+            &mut all,
+        );
+        pass(&st, vec![egui::Event::PointerMoved(to)], &mut all);
+        // 拖框途中滚轮把视图挪走（这里直接换一份"播放头已前进"的状态，等价于滚动生效后的那一帧）
+        pass(&st2, vec![egui::Event::PointerMoved(to)], &mut all);
+        pass(
+            &st2,
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: shift,
+            }],
+            &mut all,
+        );
+        let dropped: Vec<&String> = all.iter().filter(|a| a.starts_with("SelectEvents(")).collect();
+        assert_eq!(dropped.len(), 1, "框选落地要且只要一次 SelectEvents：{all:?}");
+        assert!(dropped[0].contains("Alpha"), "选的是事件：{}", dropped[0]);
+        // 事件 0 的起点（拍 0）已随视图滚到框外，只有"起点锚在拍 8"才会把它框住
+        assert!(
+            dropped[0].contains(", 0)") && dropped[0].contains(", 1)"),
+            "起点必须钉在拍上：视图滚动后事件 0 仍应被框住（只框到事件 1 就是屏幕坐标的旧行为）：{}",
+            dropped[0]
         );
     }
 }
