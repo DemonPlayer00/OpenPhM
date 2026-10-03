@@ -5161,15 +5161,6 @@ impl eframe::App for App {
                 }
             }
 
-            // 判定线位置提示（egui 侧文字，验证与自研渲染的对齐）
-            ui.painter().text(
-                play_rect.center_top() + egui::vec2(0.0, 14.0),
-                egui::Align2::CENTER_TOP,
-                "判定线 y=0（自研渲染）",
-                egui::FontId::monospace(11.0),
-                egui::Color32::from_rgb(140, 150, 190),
-            );
-
             // ---- 时间轴 ----
             //
             // 实现整体在库里（`opm_app::timeline`）：几何与读数都是**纯逻辑**（可单测），
