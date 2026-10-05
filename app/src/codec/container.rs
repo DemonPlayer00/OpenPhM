@@ -277,10 +277,37 @@ pub(crate) fn dir_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+/// 一个缓存目录"最近写过"的时刻：里面每个文件的 mtime 取最大，**没有文件时才退回目录自己的**。
+///
+/// 为什么不只看目录自己的 mtime：**原地改写一个已存在的文件不会改目录的 mtime** ——
+/// 而这条路径上"最近用过"恰恰常常是那种改写（自动保存改写 `opm.json`）。
+/// 只看目录会把"一小时前摊开、刚刚才保存"的缓存判成旧的，当垃圾删掉。
+///
+/// **不能把目录自己的 mtime 也算进这个最大值**：目录是刚建出来的，它的 mtime 就是"现在"，
+/// 一旦参与比较，里面文件的时间永远赢不了 —— 于是函数看着改好了、口径其实没变
+/// （这一条是跑 Windows 用例时露出来的：那边设不动目录的时间，只有文件的时间是真的）。
+pub(crate) fn dir_newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(t) = meta.modified() else { continue };
+            if newest.map(|n| t > n).unwrap_or(true) {
+                newest = Some(t);
+            }
+        }
+    }
+    newest.or_else(|| std::fs::metadata(dir).ok().and_then(|m| m.modified().ok()))
+}
+
 /// 按上限修剪解压缓存：保留**最近写过**的那些，删到总量 ≤ `cap`。返回（删了几个、删了多少字节）。
 ///
 /// 为什么要它：`/tmp` 常是 tmpfs ⇒ 摊出来的是内存。没有上限的话，翻十几个带音频的容器就会
 /// 常驻几百 MB 内存直到重启 —— 而这份缓存本来就是"用完即弃"的东西。
+/// "最近写过"的口径见 [`dir_newest_mtime`]。
 pub fn prune_cache(root: &Path, cap: u64) -> (usize, u64) {
     let Ok(rd) = std::fs::read_dir(root) else { return (0, 0) };
     let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = rd
@@ -291,7 +318,7 @@ pub fn prune_cache(root: &Path, cap: u64) -> (usize, u64) {
             if !m.is_dir() {
                 return None;
             }
-            let when = m.modified().ok()?;
+            let when = dir_newest_mtime(&p)?;
             Some((when, p.clone(), dir_bytes(&p)))
         })
         .collect();

@@ -30,6 +30,27 @@ env_logger = "0.11"
 cpal = "0.18"
 symphonia = { version = "0.6.1", features = ["mp3", "ogg", "flac", "aac", "isomp4", "alac", "pcm", "adpcm", "mp1", "mp2", "vorbis"] }
 
+# —— 仅 Windows 目标（Linux 构建连编译都不编译这两个）——
+#
+# `rfd`：Windows 上的系统文件对话框 —— **Explorer 那个框**（COM `IFileOpenDialog`/`IFileSaveDialog`）。
+# Linux 侧刻意不用它（那边走 kdialog/zenity，理由见 `filedialog.rs` 开头），所以按 target 门控。
+# `default-features = false` 关掉的是 `xdg-portal`/`wayland` 这两个 **Linux 专用**后端；
+# `common-controls-v6` 让对话框用现代外观（comctl32 v6 清单，不开会退回旧样式）。
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
+
+# `windows-sys`：控制通道的命名管道（`CreateNamedPipeW` 那一套，见 `control.rs`）。
+# 版本与依赖树里已有的那份（0.61.2）对齐，不额外拉第二个版本进树。
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Security",
+]
+
 [lib]
 name = "opm_app"
 path = "src/lib.rs"

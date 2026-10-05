@@ -2649,6 +2649,14 @@ wgpu 枚举适配器时，Vulkan loader 会把 ICD 目录里的**所有**驱动�
 
 `main.rs` / `bin/opm_ctl.rs` **一行没改**：它们的调用点本来就在处理 `Result`，桩的 Err 走的是既有路径。
 
+> **2026-10-05 补记（这一节已被推翻一半）**：上面那对"如实报错"的桩**已经换成真的命名管道**了。
+> 传输层的缝留着、协议层一行没动 —— 但 Windows 侧现在真的能用：
+> `CreateNamedPipeW` 建 `\\.\pipe\opm-<pid>`，标记文件写进 `%LOCALAPPDATA%\OpenPhM\control\`
+> 供 `--attach auto` 发现（`WaitNamedPipeW` 验活），`handle_conn` / `attach` 的协议部分
+> 抽成对 `BufRead`+`Write` 泛型，两条平台共用同一份。
+> 为什么不再枚举 `\\.\pipe\`：那是 `FindFirstFile` 在没写进文档的伪路径上，而标记文件是明的、可测的。
+> Wine 11.19 实测：`opm-ctl --attach auto` 连上 `\\.\pipe\opm-32`，`add_note` 让音符 95→96、revision 1→2。
+
 ### 产物
 
 ```sh

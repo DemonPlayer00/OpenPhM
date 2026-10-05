@@ -89,31 +89,26 @@ fn version_1() -> u32 {
 /// （崩溃恢复那一段）—— 两份"现在"不会算出两个时间，但会让"谁的时钟"这个问题有两个答案。
 pub use crate::codec::container::now_secs;
 
-/// 配置文件路径：`$XDG_CONFIG_HOME/OpenPhM/recents.json` →
-/// `~/.config/OpenPhM/recents.json` → `./.opm-recents.json`
+/// 配置文件路径：`<配置目录>/recents.json` → `./.opm-recents.json`
 ///
-/// **缓存**：这行路径每次都要查两个环境变量并拼一次 `PathBuf`，而它会被启动页每帧取用
-/// （"记录存放在 …"那一行）。会话里没人会中途改 `XDG_CONFIG_HOME`，缓存是安全的。
+/// 配置目录**按平台**取（Windows `%APPDATA%\OpenPhM`、Linux `$XDG_CONFIG_HOME` / `~/.config`），
+/// 换算只在 `paths` 一处。以前这里直接读 `XDG_CONFIG_HOME`/`HOME` —— 那两个变量在 Windows 上
+/// 不存在 ⇒ 最近打开列表退化成"当前目录里的 `.opm-recents.json`"（Windows 版实测就是这样，
+/// 启动页那一行显示的是裸文件名）。
+///
+/// **缓存**：这行路径每次都要查环境变量并拼一次 `PathBuf`，而它会被启动页每帧取用
+/// （"记录存放在 …"那一行）。会话里没人会中途改 `APPDATA`/`XDG_CONFIG_HOME`，缓存是安全的。
 pub fn default_path() -> &'static Path {
     static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     CACHE.get_or_init(compute_default_path).as_path()
 }
 
 fn compute_default_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir).join("OpenPhM").join("recents.json");
-        }
+    match crate::paths::config_dir() {
+        Some(dir) => dir.join("recents.json"),
+        // 环境里什么都问不到（被清空的环境/精简容器）⇒ 当前目录；至少有可能是可写的
+        None => PathBuf::from(".opm-recents.json"),
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home)
-                .join(".config")
-                .join("OpenPhM")
-                .join("recents.json");
-        }
-    }
-    PathBuf::from(".opm-recents.json")
 }
 
 /// 配置路径的**显示形式**（同样缓存）：启动页右栏每帧要画它，
@@ -865,19 +860,27 @@ mod tests {
     }
 
     /// 去重 + 最近在前 + 截断
+    ///
+    /// 路径断言**不写字面量**：`add` 会把相对路径绝对化（见它的实现），而 `/tmp/a.json`
+    /// 在 Windows 上不是绝对路径（没有盘符）—— 于是它会被接上工作目录。
+    /// 这里改成"跟第一次存进去的那份比"，两个平台同一个口径。
     #[test]
     fn add_dedupes_and_moves_to_front() {
+        let dir = tmp_dir("dedupe");
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
         let mut r = Recents::default();
-        assert!(r.add(Path::new("/tmp/a.json"), "A", "opm", 100));
-        assert!(r.add(Path::new("/tmp/b.json"), "B", "rpe", 200));
-        assert!(!r.add(Path::new("/tmp/a.json"), "A2", "opm", 300), "已有条目不算新增");
+        assert!(r.add(&a, "A", "opm", 100));
+        assert!(r.add(&b, "B", "rpe", 200));
+        let stored_a = r.entries.iter().find(|e| e.title == "A").unwrap().path.clone();
+        assert!(!r.add(&a, "A2", "opm", 300), "已有条目不算新增");
         assert_eq!(r.entries.len(), 2, "同一条路径只留一条");
-        assert_eq!(r.entries[0].path, PathBuf::from("/tmp/a.json"), "最近打开的在前");
+        assert_eq!(r.entries[0].path, stored_a, "最近打开的在前（同一条目被挪到队首）");
         assert_eq!(r.entries[0].title, "A2", "重复打开要刷新曲名与时刻");
         assert_eq!(r.entries[0].opened_at, 300);
         // 截断
         for i in 0..(MAX_ENTRIES + 5) {
-            r.add(Path::new(&format!("/tmp/c{i}.json")), "C", "opm", 400 + i as u64);
+            r.add(&dir.join(format!("c{i}.json")), "C", "opm", 400 + i as u64);
         }
         assert_eq!(r.entries.len(), MAX_ENTRIES);
     }
@@ -1245,10 +1248,21 @@ mod tests {
     }
 
     /// 默认路径落在配置目录里（不写进工作目录）
+    ///
+    /// 断言按**组件**看，不写字面量：Windows 的路径是 `C:\...\OpenPhM\recents.json`，
+    /// 而"哪个目录"由 `paths` 按平台决定（Windows `%APPDATA%`、Unix `$XDG_CONFIG_HOME`/`~/.config`）。
     #[test]
     fn default_path_is_under_config_dir() {
         let p = default_path();
-        let s = p.display().to_string();
-        assert!(s.ends_with("OpenPhM/recents.json") || s.ends_with(".opm-recents.json"), "{s}");
+        // 分隔符归一化后再比：这条断言要在两个平台上是同一句话
+        let s = p.display().to_string().replace('\\', "/");
+        assert!(s.ends_with("OpenPhM/recents.json"), "要落在我们自己的配置目录里：{s}");
+        #[cfg(windows)]
+        assert!(s.contains("AppData/Roaming/OpenPhM/"), "Windows 该用 %APPDATA%：{s}");
+        #[cfg(unix)]
+        assert!(
+            s.contains("/.config/OpenPhM/") || s.contains("xdg") || s.contains("XDG"),
+            "Unix 该用 XDG/HOME：{s}"
+        );
     }
 }

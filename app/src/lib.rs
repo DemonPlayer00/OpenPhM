@@ -20,7 +20,8 @@
 //! · [`headless`] 无头渲染出图（给 agent 用：改完谱能自己"看"结果）
 //! · [`fonts`]  CJK 字体装载
 //! · [`codec`]  格式编解码（opm 原生 + RPE 导入导出；枚举表以 `spec/*.json` 为单一数据源）
-//! · [`filedialog`] 系统文件对话框（kdialog/zenity）与"在文件管理器中显示"
+//! · [`filedialog`] 系统文件对话框（Windows：系统原生 / Linux：kdialog·zenity）与"在文件管理器中显示"
+//! · [`paths`]   **我们的文件放哪**（配置目录 / 本地数据目录，按平台；纯函数可单测）
 //! · [`keymap`]  快捷键的状态规则（空格＝单点切播 / 长按试听，纯逻辑可单测）
 //! · [`digest`] SHA-256（自研、有官方测试向量）：给缓存目录算一个不会撞的键
 //! · [`dirty`]  广播话题 → 面板脏位（唯一映射表；纯函数，有单测）
@@ -59,6 +60,7 @@ pub mod fps;
 pub mod gpu;
 pub mod headless;
 pub mod perf;
+pub mod paths;
 pub mod recents;
 pub mod render;
 pub mod session;

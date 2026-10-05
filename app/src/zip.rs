@@ -794,6 +794,23 @@ pub fn unpack_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
 mod tests {
     use super::*;
 
+    /// PATH 里找得到这个程序吗（**只给测试用**：环境不具备时用例跳过而不失败）。
+    /// Windows 上还要试 `.exe`（PATH 里写的是 `python3`，装的却是 `python3.exe`）。
+    fn which_program(name: &str) -> Option<PathBuf> {
+        let path = std::env::var("PATH").ok()?;
+        for dir in std::env::split_paths(&path) {
+            let plain = dir.join(name);
+            if plain.is_file() {
+                return Some(plain);
+            }
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        None
+    }
+
     /// Windows 的候选路径（**在 Linux 上也能测**：把"哪个平台 + 环境变量"当输入）
     #[test]
     fn windows_candidates_cover_path_and_install_dirs() {
@@ -823,7 +840,7 @@ mod tests {
             text.iter().any(|p| p.contains("AppData/Local/Programs/7-Zip/7z.exe")),
             "{text:?}"
         );
-        // Unix 侧用 Unix 的 PATH（`:` 分隔），候选里不该出现反斜杠
+        // Unix 侧用 Unix 的 PATH（`:` 分隔）
         let env_u = |k: &str| -> Option<String> {
             match k {
                 "PATH" => Some("/usr/bin:/bin".to_owned()),
@@ -831,11 +848,16 @@ mod tests {
             }
         };
         let cu = seven_zip_candidates(false, &env_u);
-        let textu: Vec<String> = cu.iter().map(|p| p.display().to_string()).collect();
-        assert!(textu.iter().all(|p| !p.contains('\\')), "{textu:?}");
+        // **分隔符按"跑测试的这台机器"来**：`PathBuf` 是平台方言，Windows 上拼出来就是 `\`
+        // （这条断言以前写死 `/`，于是同一个用例在 Windows 构建里必红 —— 实跑抓到的）
+        let textu: Vec<String> =
+            cu.iter().map(|p| p.display().to_string().replace('\\', "/")).collect();
         assert!(textu.iter().any(|p| p.ends_with("/usr/bin/7z")), "{textu:?}");
         assert!(textu.iter().any(|p| p.ends_with("/bin/7za")), "{textu:?}");
         assert!(cu.iter().any(|p| p.ends_with("usr/bin/7z") || p.ends_with("bin/7z")));
+        // "Unix 候选里不该出现反斜杠"这条只在真的跑在 Unix 上时才成立
+        #[cfg(unix)]
+        assert!(textu.iter().all(|p| !p.contains('\\')), "{textu:?}");
     }
 
     /// 显式指定（`OPM_7Z`）优先，且"指了但调不动"就是不可用（不偷偷换别的）
@@ -1026,8 +1048,16 @@ mod tests {
     }
 
     /// **解压别人做的包**：交给 Python 的 zipfile 造 STORE 与 DEFLATE 两种，我们解出来必须一致
+    ///
+    /// 这个用例**要外部的 python3** —— 没有就**跳过并说出来**，不是失败（Wine 里就没有：
+    /// Windows 构建跑测试时它是唯一一条"环境不具备"的红）。跳过要打印一行，
+    /// 否则"悄悄不跑"和"跑了通过"在输出里长得一样。
     #[test]
     fn inflate_reads_python_made_zips() {
+        if which_program("python3").is_none() {
+            eprintln!("跳过 inflate_reads_python_made_zips：PATH 里没有 python3（造不出对照包）");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("opm-zip-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let payload = "谱面测试 payload — 中文与重复片段重复片段重复片段 abcabcabc".repeat(40);

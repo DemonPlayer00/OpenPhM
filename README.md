@@ -19,7 +19,8 @@
 | 读写原生 `opm` | ✅ 单文件、`.opm` 容器（zip）、无压缩文件夹 |
 | 导入 / 导出 RPE 谱面包 | ✅ `.pez` 包、RPE 文件夹、裸 RPE JSON（`info.yml` + `chart.json`） |
 | 官谱（official）格式 | ❌ 未接（只有 opm ↔ RPE 两条路） |
-| 平台 | Linux 主力；Windows 交叉编译出 `.exe` 并在 Wine 上验过 GUI/无头渲染/中文，**真 Windows 机器未验** |
+| 平台 | Linux 主力；Windows 交叉编译出 `.exe`，在 Wine 上验过 GUI/无头渲染/中文/系统文件对话框/控制通道，**真 Windows 机器未验** |
+| Windows 上的系统集成 | ✅ 文件对话框 = **资源管理器**那个框（COM `IFileDialog`）、"在资源管理器中显示" = `explorer /select,`、配置目录 = `%APPDATA%\OpenPhM`、控制通道 = 命名管道（**不再去探 kdialog/zenity**） |
 | agent / 脚本驱动 | ✅ 控制通道 + 无头渲染 + 自截屏（见下） |
 
 ## 30 秒上手

@@ -36,8 +36,9 @@ const USAGE: &str = r#"opm-ctl —— opm 谱面编辑入口（无头 / 附着�
 格式:  `--file`/`convert` 的输入**按内容判格式**（opm 有 `format:"opm"`；RPE 有 `judgeLineList`/`BPMList`），
        不看扩展名 —— 两种都是 `.json`。转换一律打印保真度报告（做了什么、丢了什么）。
 
-附着模式: GUI 用 `opm-app --control auto` 启动后会打印 socket 路径；
-          `--attach auto` 自动发现 $XDG_RUNTIME_DIR 下最新的 opm-*.sock。
+附着模式: GUI 用 `opm-app --control auto` 启动后会打印控制通道路径（Linux：socket；Windows：命名管道）；
+          `--attach auto` 自动发现**最新且还活着**的那一个 —— Linux 扫 $XDG_RUNTIME_DIR 下的
+          opm-*.sock，Windows 扫 %LOCALAPPDATA%\OpenPhM\control\ 下的 opm-*.pipe（WaitNamedPipeW 验活）。
 
 命令（JSON，一次一条；字段语义见 spec/opm-format.md）:
   音符:   add_note / set_note / del_note / move_notes

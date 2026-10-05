@@ -795,6 +795,28 @@ impl EditCore {
     /// 于是 GUI 只会走一次"整表重建"（`structure` 脏位），不需要各面板自己去猜。
     ///
     /// **换谱面时上一份解压目录立刻删掉** ⇒ 一个进程至多留一份（缓存是进程独占的）。
+    /// 把上一份解压缓存删掉 —— **先把自己的锁放掉**。
+    ///
+    /// 顺序不是随手写的：**Windows 上只要还有句柄开着，那个目录就删不掉**
+    /// （Unix 那边 unlink 与打开的文件描述无关，所以这段顺序在 Linux 上怎么写都对，
+    /// 于是这个坑在 Linux 上永远看不见）。锁文件 `lock.pid` 就在缓存目录里，
+    /// 而 `chart_lock` 正拿着它的句柄 ⇒ 不先放锁，`remove_dir_all` 必然失败。
+    ///
+    /// 而失败以前是**静默**的（`let _ =`），后果有两层：
+    /// · 缓存越积越多（本来是"一个进程至多留一份"）；
+    /// · 那份旧的 `session.json` 会被当成"上次没退干净的编辑"，于是下次打开**用户早就关掉的谱面**
+    ///   还会被问"要不要继续上次编辑"。
+    ///
+    /// 这条是 Windows 集成测试抓出来的：
+    /// `creating_a_new_chart_drops_the_previous_container_cache_and_assets`（新建谱面之后旧缓存还在）。
+    fn drop_cache_dir(&mut self, old: &std::path::Path) {
+        self.chart_lock = None; // 放锁 ⇒ 关掉缓存目录里的那个句柄
+        if let Err(e) = std::fs::remove_dir_all(old) {
+            eprintln!("[cache] 删旧的解压缓存失败 {}: {e}", old.display());
+        }
+    }
+
+    /// 见 [`EditCore::drop_cache_dir`]。
     pub fn load_staged(&mut self, staged: Staged) -> Result<codec::Fidelity, String> {
         let Staged { dir, doc, assets, fid, format, target, folder, unsaved, lock } = staged;
         let origin = self.origin;
@@ -804,7 +826,7 @@ impl EditCore {
         self.last_save = None; // 换了文档，上次的保存形态不再适用
         if let Some(old) = self.asset_dir.take() {
             if Some(&old) != dir.as_ref() {
-                let _ = std::fs::remove_dir_all(&old);
+                self.drop_cache_dir(&old);
             }
         }
         self.asset_dir = dir;
@@ -1608,7 +1630,7 @@ impl EditCore {
                 // 里带过去的），而且解压缓存里那份 `opm.json` 还会被当成"这份新谱面的工作副本"。
                 self.assets = Vec::new();
                 if let Some(old) = self.asset_dir.take() {
-                    let _ = std::fs::remove_dir_all(&old);
+                    self.drop_cache_dir(&old);
                 }
                 self.revision += 1;
                 // 新建之后**是脏的**：还没写进任何文件，界面要提示保存

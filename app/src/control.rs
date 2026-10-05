@@ -2,7 +2,7 @@
 // Copyright (C) 2026 DemonPlayer
 //! 控制通道：让 `opm-ctl` **接进正在运行的 GUI 进程**，操作同一个编辑会话。
 //!
-//! 协议极简：Unix socket 上跑**行分隔 JSON**，一问一答。
+//! 协议极简：传输层上跑**行分隔 JSON**，一问一答。
 //! 同一进程内 GUI 与控制线程共享一个 `Arc<Mutex<EditCore>>`；远端命令走的是**和 GUI 完全相同的路径**：
 //! `exec` → EditCore 改动 → **update 广播** → GUI 按话题重建。这条路径上没有任何"文档同步"逻辑，
 //! 也没有谁比谁特殊——区别只是广播里的 `origin` 标记是 `Remote`。
@@ -12,26 +12,24 @@
 //!   被跳过的重建次数暴露出来 —— 这是"无关控件不参与更新"的客观证据；
 //! · `waker`：远端改完之后唤醒 egui 重绘一次，否则空闲心跳下（默认 1 fps）要等一秒才看到变化。
 //!
-//! **平台形态**：Linux/macOS 走 Unix socket（`std::os::unix::net`）；Windows 上这套还没有等价实现
-//! —— 该换命名管道，**协议不变**（行分隔 JSON 与所有视图命令都通用）。所以那里 [`spawn_server`] /
-//! [`attach`] 会**如实返回"未实现"**，不假装启用：GUI 的 `--control` 打一行提示，`opm-ctl attach`
-//! 报同一条。除传输层之外的部分（视图命令队列、`ui_stats`、协议解析、文档命令）平台无关，
-//! Windows 上也编译、也走同一套单测。
+//! **平台形态**：传输层两条路，**协议与上层逐字不变**（行分隔 JSON、所有视图命令、`ui_stats` 通用）：
+//! · Unix ⇒ `std::os::unix::net`，路径 `$XDG_RUNTIME_DIR/opm-<pid>.sock`；
+//! · Windows ⇒ **命名管道** `\\.\pipe\opm-<pid>`（`CreateNamedPipeW` 那一套）。发现方式是把
+//!   `opm-<pid>.pipe` 标记文件写进 `%LOCALAPPDATA%\OpenPhM\control\`，`--attach auto` 扫这个目录、
+//!   挑最新的一个，再用 `WaitNamedPipeW` **验活**。
+//!
+//! 为什么 Windows 不枚举 `\\.\pipe\`：那是 `FindFirstFile` 在一个**没写进文档的伪路径**上；
+//! 标记文件是明面上的东西、可测，而且顺手解决了"上次没退干净留下的死管道"（验活不过就不算）。
 
 use std::collections::VecDeque;
-// `BufRead`/`Write` 只被传输层（Unix socket 那两个函数）用到；Windows 上它们不存在 ⇒ 别引入空警告
-#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
-#[cfg(unix)]
-use serde_json::json;
-use serde_json::Value;
+use serde_json::{json, Value};
 
-#[cfg(unix)]
 use crate::broadcast::Origin;
 use crate::core::SharedCore;
 
@@ -244,9 +242,8 @@ pub fn view_queue() -> ViewQueue {
 /// 报错要指到点子上：`{"op":"tag","action":"add","end":8}` 缺的是 `start`，
 /// 不是"未知命令 tag"。
 ///
-/// `#[cfg(unix)]`：它只被 Unix 那支控制线程用到（Windows 上整个控制通道都还没实现，
-/// 见下面的 `spawn_server`）—— 不门控的话 Windows 构建会报 dead_code。
-#[cfg(unix)]
+/// 曾经它挂着 `#[cfg(unix)]`（那时 Windows 上没有控制通道，不门控会报 dead_code）——
+/// 现在两条传输层共用同一段 `handle_conn`，于是它也**不再分平台**。
 fn view_cmd_hint(op: &str) -> Option<&'static str> {
     match op {
         "tag" => Some(
@@ -354,7 +351,7 @@ pub fn parse_view_cmd(v: &Value) -> Option<ViewCmd> {
     }
 }
 
-/// 自动 socket 路径：`$XDG_RUNTIME_DIR/opm-<pid>.sock`（退回到临时目录）
+/// 自动控制通道路径（本进程）。
 pub fn auto_path() -> PathBuf {
     path_for_pid(std::process::id())
 }
@@ -362,23 +359,182 @@ pub fn auto_path() -> PathBuf {
 /// **某个 pid** 的控制通道路径。
 ///
 /// 为什么要有 pid 版：判"某个谱面缓存的主人还在不在"时要问**那个进程**（见 `session::inspect`），
-/// 而它的 socket 名字里就带 pid —— 于是不需要把 socket 路径也写进锁文件，
+/// 而它的名字里就带 pid —— 于是不需要把路径也写进锁文件，
 /// 少一份"两边不一致"的可能（pid 与路径的换算是纯函数，只有这一处）。
+///
+/// 形态按平台：
+/// · Unix ⇒ `$XDG_RUNTIME_DIR/opm-<pid>.sock`（退回到临时目录）；
+/// · Windows ⇒ `\\.\pipe\opm-<pid>`（命名管道的名字本身就是路径，可以直接交给 `CreateFileW`）。
 pub fn path_for_pid(pid: u32) -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(dir).join(format!("opm-{pid}.sock"))
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\opm-{pid}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
+        PathBuf::from(dir).join(format!("opm-{pid}.sock"))
+    }
+}
+
+// ---------------------------------------------------------------- Windows 命名管道
+
+/// Windows 命名管道的**标记目录**：`%LOCALAPPDATA%\OpenPhM\control\`。
+///
+/// 里面一个进程一个文件（`opm-<pid>.pipe`），内容是人看的说明 —— 发现靠**文件名**，
+/// 不靠内容（内容会被外部改动，文件名不会）。
+#[cfg(windows)]
+pub fn marker_dir() -> Option<PathBuf> {
+    crate::paths::local_data_dir().map(|d| d.join("control"))
+}
+
+/// 某个 pid 的标记文件路径（`%LOCALAPPDATA%\OpenPhM\control\opm-<pid>.pipe`）
+#[cfg(windows)]
+pub fn marker_path(pid: u32) -> Option<PathBuf> {
+    marker_dir().map(|d| d.join(format!("opm-{pid}.pipe")))
+}
+
+/// 从标记文件名反解 pid（`opm-123.pipe` → `123`）；不是这个形状就 `None`。
+///
+/// 纯函数：`--attach auto` 的候选筛选全在它上面，且**两条平台共用同一套文件名规则**
+/// （Unix 那边是 `opm-<pid>.sock`，解析是同一份逻辑，只是后缀不同）。
+pub fn pid_of_marker(name: &str) -> Option<u32> {
+    let stem = name
+        .strip_prefix("opm-")
+        .and_then(|s| s.strip_suffix(".pipe").or_else(|| s.strip_suffix(".sock")))?;
+    stem.parse().ok()
+}
+
+/// 命名管道那一套（`CreateNamedPipeW`/`ConnectNamedPipe`/`WaitNamedPipeW`）。
+///
+/// 单独一个模块：unsafe 集中在一处，上面的连接处理（`handle_conn`）对"这是管道还是 socket"
+/// 一无所知 —— 它只认 `BufRead` + `Write`。这也是"协议与上层逐字不变"在代码上的样子。
+#[cfg(windows)]
+mod pipe {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+
+    /// 宽字符串（以 NUL 结尾）—— 所有 Win32 W 接口都要这个形态
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// 建**一个**管道实例并阻塞等一个客户端连上来，返回服务端这一头。
+    ///
+    /// 一个实例只服务一条连接（`incoming()` 那样）：处理完就丢掉、循环再建一个新的，
+    /// 于是"同时来两个客户端"只是多开一个实例，与 Unix 侧行为一致。
+    pub fn accept_one(name: &Path) -> std::io::Result<File> {
+        let name = wide(&name.to_string_lossy());
+        // 缓冲区给足：一条命令 + 一段 `ui_stats` 都远小于它，省得管道写阻塞在半截 JSON 上
+        const BUF: u32 = 1 << 16;
+        let h = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                BUF,
+                BUF,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            let _ = h;
+            return Err(std::io::Error::last_os_error());
+        }
+        // 客户端可能在 `CreateNamedPipeW` 与这一句之间就连上了：那时 `ConnectNamedPipe`
+        // 返回 0 且 last-error 是 `ERROR_PIPE_CONNECTED` —— **那也是连上了**，不是失败。
+        let ok = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_PIPE_CONNECTED {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+                return Err(std::io::Error::from_raw_os_error(err as i32));
+            }
+        }
+        Ok(unsafe { File::from_raw_handle(h as _) })
+    }
+
+    /// 这个管道名上**现在**有服务端在等连接吗（`--attach auto` 的验活）。
+    ///
+    /// `WaitNamedPipeW(name, 0)`：0 毫秒 = 只看一眼有没有空闲实例，不等。
+    /// 死进程留下的名字会立刻回 `ERROR_FILE_NOT_FOUND` ⇒ 不算候选。
+    pub fn is_live(name: &Path) -> bool {
+        let name = wide(&name.to_string_lossy());
+        unsafe { WaitNamedPipeW(name.as_ptr(), 0) != 0 }
+    }
+
+    /// 带截止时间读一行（**只有客户端用得上**：`ping` 跑在启动路径上，不能被一个只连不答的对端卡住）。
+    ///
+    /// Windows 的管道句柄没有 `set_read_timeout`（Unix 那边有），所以这里的超时是**自己数出来的**：
+    /// 先 `PeekNamedPipe` 问"现在有多少字节可读"，没有就睡 2 ms 再看，直到超过截止时间。
+    /// 有数据才 `read` —— 于是那个 `read` 不会阻塞（这是这一段的关键：直接 `read` 会一直挂着）。
+    pub fn read_line_timeout(mut file: &File, timeout: std::time::Duration) -> std::io::Result<String> {
+        use std::io::Read;
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let handle = std::os::windows::io::AsRawHandle::as_raw_handle(file) as _;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut out = String::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let mut avail: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(handle, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut())
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if avail == 0 {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "等控制通道应答超时",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+            // 至少一个字节可读 ⟹ 这次 read 不会阻塞
+            if file.read(&mut byte)? == 0 {
+                return Ok(out); // 对端关了
+            }
+            if byte[0] == b'\n' {
+                return Ok(out);
+            }
+            out.push(byte[0] as char);
+            // 一行 JSON 不可能有这么大：防的是"对端一直灌数据"把内存吃光
+            if out.len() > 1 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "应答行过长"));
+            }
+        }
+    }
+}
+
+/// 非 Unix ∩ 非 Windows：没有传输层（这套东西目前只支持这/两种平台）
+#[cfg(not(any(unix, windows)))]
+pub fn marker_dir() -> Option<PathBuf> {
+    None
 }
 
 /// **ping 一个正在跑的进程**（连它的控制通道，问一条 `{"op":"ping"}`）。
 ///
-/// 两件事一起核：① 那个 socket 上确实有个 OpenPhM 在应答；② 它自报的 pid 就是我们要找的那个
-/// （socket 文件不会随进程消失，只连上不核对 pid 会把"死进程留下的文件"当成活的）。
+/// 两件事一起核：① 那个名字上确实有个 OpenPhM 在应答；② 它自报的 pid 就是我们要找的那个
+/// （Unix 的 socket 文件不会随进程消失，只连上不核对 pid 会把"死进程留下的文件"当成活的）。
 ///
 /// 返回它的应答（含 `pid`/`revision`/`cacheDir`）。**任何一步失败都算"没应答"**：
 /// 连接被拒、超时、回的不是 JSON、`pong` 不是 true、pid 对不上 —— 调用方按"不通"处理。
 #[cfg(unix)]
 pub fn ping(path: &Path, timeout: std::time::Duration) -> Result<Value, String> {
-    use std::io::{BufRead, BufReader, Write};
     let stream = std::os::unix::net::UnixStream::connect(path)
         .map_err(|e| format!("连接 {} 失败: {e}", path.display()))?;
     stream
@@ -402,22 +558,39 @@ pub fn ping(path: &Path, timeout: std::time::Duration) -> Result<Value, String> 
     reader
         .read_line(&mut line)
         .map_err(|e| format!("读 ping 应答失败: {e}"))?;
-    // 应答前可能还夹着别的行（统计/广播）：往后找第一条能解析的对象
-    for cand in std::iter::once(line.as_str()).chain(hello.lines()) {
-        if let Ok(v) = serde_json::from_str::<Value>(cand.trim()) {
-            if v.get("op").and_then(|o| o.as_str()) == Some("ping") {
-                return Ok(v);
-            }
-        }
-    }
-    Err(format!("{} 没有回应 ping（收到 {line:?}）", path.display()))
+    ping_reply(path, &line, &hello).ok_or_else(|| format!("{} 没有回应 ping（收到 {line:?}）", path.display()))
 }
 
-/// 非 Unix：控制通道本身还不存在（见 `spawn_server`）⇒ ping **不可用**。
+/// Windows：同一件事，走命名管道。
 ///
-/// 调用方必须把"不可用"与"不通"分开：判崩溃的第一判据是**锁没人持**（Unix `flock` /
-/// Windows `LockFileEx`，两边都有），ping 只是补一道核对。
-#[cfg(not(unix))]
+/// 与 Unix 那支的差别只有一处、但是**必须**的一处：管道没有 `set_read_timeout`，
+/// 而 `ping` 会在**启动路径**上被调用（`session::inspect` 判"上次没退干净"）——
+/// 一个只连不答的对端不能把启动卡住。所以这里的读是"先 `PeekNamedPipe` 看有没有数据、
+/// 没有就按截止时间等"（见 [`pipe::read_line_timeout`]）。
+#[cfg(windows)]
+pub fn ping(path: &Path, timeout: std::time::Duration) -> Result<Value, String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("连接 {} 失败: {e}", path.display()))?;
+    let mut writer = file.try_clone().map_err(|e| format!("复制连接失败: {e}"))?;
+    // 连上就先收一条 `hello`（服务端行为），再问 ping —— 顺序由服务端决定，这里照它来
+    let hello = pipe::read_line_timeout(&file, timeout).unwrap_or_default();
+    writer
+        .write_all(b"{\"op\":\"ping\"}\n")
+        .map_err(|e| format!("写 ping 失败: {e}"))?;
+    writer.flush().map_err(|e| format!("刷新 ping 失败: {e}"))?;
+    let line = pipe::read_line_timeout(&file, timeout)
+        .map_err(|e| format!("读 ping 应答失败: {e}"))?;
+    ping_reply(path, &line, &hello).ok_or_else(|| format!("{} 没有回应 ping（收到 {line:?}）", path.display()))
+}
+
+/// 非 Unix ∩ 非 Windows：没有传输层 ⟹ ping 不可用。
+///
+/// 调用方必须把"不可用"与"不通"分开：判崩溃的第一判据是**锁没人持**
+/// （Unix `flock` / Windows `LockFileEx`，两边都有），ping 只是补一道核对。
+#[cfg(not(any(unix, windows)))]
 pub fn ping(path: &Path, _timeout: std::time::Duration) -> Result<Value, String> {
     Err(format!(
         "本平台没有控制通道，无法 ping {}（判据退回到「锁没人持」）",
@@ -425,21 +598,35 @@ pub fn ping(path: &Path, _timeout: std::time::Duration) -> Result<Value, String>
     ))
 }
 
-/// 发现最新的 opm socket（给 `--attach auto` 用）
+/// 从收到的行里找出 `ping` 的应答（两条平台的解析**同一份**）。
+///
+/// 应答前可能还夹着别的行（统计/广播）：所以 hello 与那一行一起看，往后找第一条能解析、
+/// 且 `op == "ping"` 的对象。
+fn ping_reply(_path: &Path, line: &str, hello: &str) -> Option<Value> {
+    for cand in std::iter::once(line).chain(hello.lines()) {
+        if let Ok(v) = serde_json::from_str::<Value>(cand.trim()) {
+            if v.get("op").and_then(|o| o.as_str()) == Some("ping") {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// 发现最新的控制通道（给 `--attach auto` 用）。
+///
+/// · Unix：扫 `$XDG_RUNTIME_DIR` 下的 `opm-*.sock`，按 mtime 取最新；
+///   **先按 `/proc/<pid>` 过滤**（socket 文件不会随进程消失，候选里混进死进程时
+///   `--attach auto` 会连到一个没人监听的文件上）；
+/// · Windows：见 [`find_live_pipe`]。
+#[cfg(unix)]
 pub fn find_socket() -> Option<PathBuf> {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("opm-") && name.ends_with(".sock") {
-            // 文件名里就带 pid —— socket 文件不会随进程消失，候选里混进死进程时
-            // `--attach auto` 会连到一个没人监听的文件上。先按 /proc 过滤掉。
-            let pid: i32 = name
-                .trim_start_matches("opm-")
-                .trim_end_matches(".sock")
-                .parse()
-                .unwrap_or(-1);
+        if let Some(pid) = pid_of_marker(&name) {
             if !Path::new(&format!("/proc/{pid}")).exists() {
                 continue;
             }
@@ -453,6 +640,43 @@ pub fn find_socket() -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// Windows：扫标记目录挑最新的**活着**的管道。
+///
+/// 判活不是猜进程在不在，而是 `WaitNamedPipeW` **真的试一下** —— 死进程留下的标记会被跳过
+/// （顺手删掉：`spawn_server` 那边也会清理，这里再清一次是为了"没人重启过 GUI 也能自愈"）。
+#[cfg(windows)]
+pub fn find_socket() -> Option<PathBuf> {
+    find_live_pipe(&marker_dir()?, pipe::is_live)
+}
+
+/// [`find_socket`] 的实现主体（**纯逻辑，可测**）：目录 + 判活函数 → 最新那个活着的管道。
+///
+/// `is_live` 由调用方给：真身是 `WaitNamedPipeW`，测试里喂一个假的 —— 于是
+/// "取最新的**活着**的那一个"这条规则不开 Wine 也能钉住（本机是 Linux，起不了命名管道）。
+#[cfg(windows)]
+fn find_live_pipe(
+    dir: &Path,
+    is_live: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(pid) = pid_of_marker(&name) else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(t) = meta.modified() else { continue };
+        candidates.push((t, path_for_pid(pid)));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧
+    candidates.into_iter().map(|(_, p)| p).find(|p| is_live(p))
+}
+
+/// 非 Unix ∩ 非 Windows：没有可发现的东西
+#[cfg(not(any(unix, windows)))]
+pub fn find_socket() -> Option<PathBuf> {
+    None
 }
 
 /// 在后台线程起一个监听器；返回实际绑定的路径。
@@ -482,7 +706,10 @@ pub fn spawn_server(
                         let waker = waker.clone();
                         std::thread::Builder::new()
                             .name("opm-control-conn".into())
-                            .spawn(move || handle_conn(core, stats, view, waker, stream))
+                            .spawn(move || {
+                                let Ok(reader) = stream.try_clone() else { return };
+                                handle_conn(core, stats, view, waker, BufReader::new(reader), stream);
+                            })
                             .ok();
                     }
                     Err(e) => eprintln!("[control] 接受连接失败: {e}"),
@@ -494,12 +721,83 @@ pub fn spawn_server(
     Ok(bound)
 }
 
-/// 非 Unix（Windows）：控制通道还没有等价传输层 ⇒ **如实说不支持**。
+/// Windows：控制通道的**服务端**（命名管道）。
 ///
-/// 为什么不做成"静默成功"：GUI 的 `--control` 会据此打一行提示，使用者一眼知道
-/// "这次没起控制通道"，而不是对着一个连不上的路径猜。要做的是把 Unix socket 换成命名管道
-/// （协议与所有视图命令都不用改），那是另一件事。
-#[cfg(not(unix))]
+/// 比 Unix 那支多两件事：
+/// · **写标记文件**（`%LOCALAPPDATA%\OpenPhM\control\opm-<pid>.pipe`）—— `--attach auto` 靠它发现；
+/// · 顺手**清理死标记**：目录里那些"管道已经没人应答"的标记（上次没退干净留下的）先删掉，
+///   否则那个目录只会越积越多。
+/// 有标记 + `WaitNamedPipeW` 验活这套组合，比 Unix 那边"文件名里带 pid 再问 `/proc`"还准 ——
+/// 它是**真的连一下试试**，而不是猜进程在不在。
+#[cfg(windows)]
+pub fn spawn_server(
+    core: SharedCore,
+    stats: UiStatsHandle,
+    view: ViewQueue,
+    waker: RepaintWaker,
+    path: &Path,
+) -> Result<PathBuf, String> {
+    let bound = path.to_path_buf();
+    let me = std::process::id();
+    if let Some(dir) = marker_dir() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("建标记目录失败: {e}"))?;
+        prune_dead_markers(&dir, me);
+        if let Some(marker) = marker_path(me) {
+            let _ = std::fs::write(&marker, format!("{}\n", bound.display()));
+        }
+    }
+
+    let name = bound.clone();
+    std::thread::Builder::new()
+        .name("opm-control".into())
+        .spawn(move || loop {
+            // 一条连接一个实例：处理完就丢掉、再建一个（与 `listener.incoming()` 同形）
+            let handle = match pipe::accept_one(&name) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[control] 建管道/接受连接失败: {e}");
+                    // 名字被占、权限问题这类硬错误重试没意义，但**不能退出**：
+                    // 退出之后就再也接不上了（宁可刷日志也别静默死掉）
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
+                }
+            };
+            let core = core.clone();
+            let stats = stats.clone();
+            let view = view.clone();
+            let waker = waker.clone();
+            std::thread::Builder::new()
+                .name("opm-control-conn".into())
+                .spawn(move || {
+                    let Ok(reader) = handle.try_clone() else { return };
+                    handle_conn(core, stats, view, waker, BufReader::new(reader), handle);
+                })
+                .ok();
+        })
+        .map_err(|e| format!("启动控制线程失败: {e}"))?;
+
+    Ok(bound)
+}
+
+/// 删掉标记目录里**已经没人应答**的标记（`keep` = 自己那个，永远不删）。
+#[cfg(windows)]
+fn prune_dead_markers(dir: &Path, keep: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(pid) = pid_of_marker(&name) else { continue };
+        if pid == keep {
+            continue;
+        }
+        if !pipe::is_live(&path_for_pid(pid)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 非 Unix ∩ 非 Windows：没有传输层，如实说不支持（`--control` 会打一行提示）
+#[cfg(not(any(unix, windows)))]
 pub fn spawn_server(
     _core: SharedCore,
     _stats: UiStatsHandle,
@@ -507,23 +805,20 @@ pub fn spawn_server(
     _waker: RepaintWaker,
     _path: &Path,
 ) -> Result<PathBuf, String> {
-    Err("Windows 上还没有控制通道：Unix socket 换成命名管道这件事还没做（协议不变，见 control.rs 头部）".into())
+    Err("本平台还没有控制通道（只有 Unix socket 与 Windows 命名管道两条路）".into())
 }
 
-#[cfg(unix)]
-fn handle_conn(
+/// 一条连接的处理循环。**与传输层无关**：只认"能按行读、能写"。
+///
+/// 这就是"协议与上层逐字不变"在代码上的样子 —— Unix socket 与命名管道在这里没有任何分支。
+fn handle_conn<R: BufRead, W: Write>(
     core: SharedCore,
     stats: UiStatsHandle,
     view: ViewQueue,
     waker: RepaintWaker,
-    stream: std::os::unix::net::UnixStream,
+    reader: R,
+    mut writer: W,
 ) {
-    let reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-    let mut writer = stream;
-
     // 连接即给一条 hello，便于客户端确认接对了进程
     let hello = {
         let c = core.lock().unwrap();
@@ -614,6 +909,8 @@ fn handle_conn(
 }
 
 /// 客户端：把一批命令发到已运行的进程，逐条打印响应。返回 (失败条数, 校验错误数)
+///
+/// 传输层的差别只有"怎么连上"这一句，`attach_stream` 里是**两条平台逐字共用**的协议部分。
 #[cfg(unix)]
 pub fn attach(
     path: &Path,
@@ -621,12 +918,48 @@ pub fn attach(
     json_out: bool,
     quiet: bool,
 ) -> Result<(usize, usize), String> {
-    use std::os::unix::net::UnixStream;
-    let stream = UnixStream::connect(path)
+    let stream = std::os::unix::net::UnixStream::connect(path)
         .map_err(|e| format!("连接 {} 失败: {e}（GUI 是否带 --control 启动？）", path.display()))?;
-    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream);
+    let writer = stream.try_clone().map_err(|e| e.to_string())?;
+    attach_stream(BufReader::new(stream), writer, cmds, json_out, quiet)
+}
 
+/// Windows：同一件事，走命名管道（写半边要复制一份句柄，与 Unix 那边同形）。
+#[cfg(windows)]
+pub fn attach(
+    path: &Path,
+    cmds: &[Value],
+    json_out: bool,
+    quiet: bool,
+) -> Result<(usize, usize), String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("连接 {} 失败: {e}（GUI 是否带 --control 启动？）", path.display()))?;
+    let writer = file.try_clone().map_err(|e| e.to_string())?;
+    attach_stream(BufReader::new(file), writer, cmds, json_out, quiet)
+}
+
+/// 非 Unix ∩ 非 Windows：没有传输层
+#[cfg(not(any(unix, windows)))]
+pub fn attach(
+    _path: &Path,
+    _cmds: &[Value],
+    _json_out: bool,
+    _quiet: bool,
+) -> Result<(usize, usize), String> {
+    Err("本平台还没有控制通道（只有 Unix socket 与 Windows 命名管道两条路）".into())
+}
+
+/// [`attach`] 的协议部分：**与传输层无关**（只认"能按行读、能写"）。
+fn attach_stream<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    cmds: &[Value],
+    json_out: bool,
+    quiet: bool,
+) -> Result<(usize, usize), String> {
     // 读 hello
     let mut banner = String::new();
     reader
@@ -676,17 +1009,6 @@ pub fn attach(
         }
     }
     Ok((failed, errors))
-}
-
-/// 非 Unix（Windows）：见 [`spawn_server`] —— 没有传输层就连不上，如实报错
-#[cfg(not(unix))]
-pub fn attach(
-    _path: &Path,
-    _cmds: &[Value],
-    _json_out: bool,
-    _quiet: bool,
-) -> Result<(usize, usize), String> {
-    Err("Windows 上还没有控制通道：Unix socket 换成命名管道这件事还没做（协议不变，见 control.rs 头部）".into())
 }
 
 /// 供 GUI 侧调用：把控制通道状态拼成一行摘要
@@ -751,5 +1073,63 @@ mod tag_cmd_tests {
         assert!(parse_view_cmd(&json!({"op": "tag", "action": "del"})).is_none());
         // 未知动作同理
         assert!(parse_view_cmd(&json!({"op": "tag", "action": "??"})).is_none());
+    }
+}
+
+/// 传输层的"发现"那一半：**两条平台共用同一套文件名规则**，所以解析要一起测。
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// 标记文件名 ⇄ pid。两个后缀都认（`.pipe` 是 Windows 的标记、`.sock` 是 Unix 的 socket），
+    /// 别的形状一律 `None` —— `--attach auto` 拿它筛候选，认错一个就会去连一个不存在的东西。
+    #[test]
+    fn marker_names_map_to_pids_on_both_platforms() {
+        assert_eq!(pid_of_marker("opm-1234.pipe"), Some(1234));
+        assert_eq!(pid_of_marker("opm-1234.sock"), Some(1234));
+        assert_eq!(pid_of_marker("opm-1.sock"), Some(1));
+        // 不是我们的东西：别的程序的管道/socket、目录项、备份文件
+        for bad in [
+            "opm-.pipe",
+            "opm-abc.pipe",
+            "opm-12.pipe.bak",
+            "other-12.pipe",
+            "opm-12",
+            ".opm-12.pipe",
+            "opm-99999999999999999999.pipe", // 溢出 u32
+        ] {
+            assert_eq!(pid_of_marker(bad), None, "{bad} 不该被认成控制通道");
+        }
+    }
+
+    /// `--attach auto` 的挑选规则：**新的优先，且只挑活着的**（死的跳过，不是报错）。
+    ///
+    /// 判活函数由调用方注入（Windows 真身是 `WaitNamedPipeW`），所以这条规则**不开 Windows 也能测**。
+    #[cfg(windows)]
+    #[test]
+    fn auto_attach_picks_the_newest_live_pipe() {
+        let dir = std::env::temp_dir().join(format!("opm-markers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 三个标记，mtime 依次拉开（旧 → 新：11 / 22 / 33）
+        for pid in [11u32, 22, 33] {
+            let p = dir.join(format!("opm-{pid}.pipe"));
+            std::fs::write(&p, "x").unwrap();
+            let age = (33 - pid) as u64; // 33 最新
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age * 60);
+            let _ = std::fs::File::options().write(true).open(&p).unwrap().set_modified(when);
+        }
+        // 只有最旧的活着 ⇒ 挑它（跳过两个更新的死的）。
+        // 注意返回的是**管道名**（`\.\pipe\opm-<pid>`），不是标记文件的路径 —— 标记只用来发现。
+        let only_old = find_live_pipe(&dir, |p| p.ends_with("opm-11"));
+        assert!(only_old.as_ref().is_some_and(|p| p.ends_with("opm-11")), "{only_old:?}");
+        // 都活着 ⇒ 挑最新的
+        let newest = find_live_pipe(&dir, |_| true);
+        assert!(newest.as_ref().is_some_and(|p| p.ends_with("opm-33")), "{newest:?}");
+        // 都死了 ⇒ None（不是 panic、也不是随便挑一个）
+        assert_eq!(find_live_pipe(&dir, |_| false), None);
+        // 目录不存在 ⇒ None
+        assert_eq!(find_live_pipe(&dir.join("nope"), |_| true), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

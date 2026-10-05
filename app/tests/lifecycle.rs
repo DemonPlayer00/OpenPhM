@@ -475,6 +475,12 @@ fn a_read_only_stage_leaves_another_sessions_cache_alone() {
 
     // 缓存里那份"别人的未保存改动"要靠用户选「丢弃并重新打开」才会走掉 —— 这一步就是那个选择。
     // 不丢的话，认领会话的装载会**拒绝**（那是刻意的：不能悄悄覆盖别人没保存的编辑）。
+    //
+    // **先 `drop(owner)`**：`owner` 手里还攥着缓存目录里 `lock.pid` 的句柄，而 Windows 上
+    // 句柄开着就删不掉目录（Unix 无所谓）——不放开的话这一步会**静默失败**，
+    // 后面那句 `gui.load_into` 就会撞上"本进程另一个会话占着"。
+    // 语义上也对：那个"别的会话"本来就该是不在了的。
+    drop(owner);
     discard_cache_of(&target);
     // ③ 反之，认领会话的装载（GUI 那条路）会把这一份接管过来
     let mut gui = EditCore::new();
